@@ -52,8 +52,8 @@ struct NetworkDetailView: View {
         switch tab {
         case .overview: overview(txn)
         case .headers:
-            headerSection("Request Headers", txn.requestHeaders)
-            headerSection("Response Headers", txn.responseHeaders)
+            headerSection("Request Headers", txn.displayRequestHeaders)
+            headerSection("Response Headers", txn.displayResponseHeaders)
         case .request:
             bodyView(data: txn.requestBody,
                      contentType: txn.requestHeaders.first { $0.name.lowercased() == "content-type" }?.value)

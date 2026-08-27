@@ -8,6 +8,11 @@ import java.io.ByteArrayOutputStream
 class SqueezeTracker(private val url: String) {
     private val id = SqueezeReporter.nextId()
     @Volatile private var method = "GET"
+    /** Which HTTP stack produced this transaction ("okhttp3", "okhttp2", "urlconnection").
+     *  Capture metadata, not policy: the desktop uses it to tell the user whether a request is
+     *  even *divertible* (only okhttp3 is). It cannot be derived from [callStack], which
+     *  deliberately strips okhttp/okio frames to show app code. */
+    @Volatile private var httpStack: String? = null
     private val startedAtMs = System.currentTimeMillis()
     @Volatile private var responseAtMs = 0L
     @Volatile private var reported = false
@@ -21,6 +26,7 @@ class SqueezeTracker(private val url: String) {
     private val callStack: List<String> = captureStack()
 
     fun setMethod(m: String?) { if (m != null) method = m }
+    fun setHttpStack(s: String?) { if (s != null) httpStack = s }
     fun setRequestHeaders(h: Map<String, List<String>>?) { requestHeaders = h }
 
     fun appendRequestBody(b: ByteArray, off: Int, len: Int) {
@@ -49,6 +55,17 @@ class SqueezeTracker(private val url: String) {
 
     fun setError(e: String?) { error = e }
 
+    /**
+     * Permanently suppresses this transaction.
+     *
+     * Used for exchanges that are Jaca talking to itself rather than traffic the app made — a
+     * retry-direct bounce from the desktop, whose real request is re-sent immediately after and
+     * reported on its own tracker. Marking it reported (rather than adding a second flag) means
+     * a later [report] from the body tee is a no-op too.
+     */
+    @Synchronized
+    fun cancel() { reported = true }
+
     @Synchronized
     fun report() {
         if (reported) return
@@ -58,6 +75,7 @@ class SqueezeTracker(private val url: String) {
             o.put("type", "txn")
             o.put("id", id.toString())
             o.put("method", method)
+            httpStack?.let { o.put("httpStack", it) }
             o.put("url", url)
             o.put("startedAt", startedAtMs / 1000.0)
             if (responseAtMs > 0) o.put("responseAt", responseAtMs / 1000.0)

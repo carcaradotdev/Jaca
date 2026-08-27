@@ -33,13 +33,15 @@ class SqueezeCapture : SqueezeExitHandler {
             if (returnObject is List<*> && methodSignature?.contains("networkInterceptors") == true) {
                 val iface = if (methodSignature.contains("squareup")) "com.squareup.okhttp.Interceptor"
                             else "okhttp3.Interceptor"
-                return OkHttpHook.inject(returnObject, iface)
+                return OkHttpHook.inject(returnObject, iface, OkHttpHook.Role.NETWORK)
             }
             // OkHttpClient.interceptors() → the APPLICATION list. Matching is case-sensitive,
             // so this can't collide with "networkInterceptors" (capital I). Same interceptor
             // object; it detects the layer from chain.connection() and only rewrites here.
+            // Injected LAST on this list so the app's own interceptors (auth, headers) run
+            // against the real URL before we repoint it — see OkHttpHook.inject.
             if (returnObject is List<*> && methodSignature?.contains("interceptors") == true) {
-                return OkHttpHook.inject(returnObject, "okhttp3.Interceptor")
+                return OkHttpHook.inject(returnObject, "okhttp3.Interceptor", OkHttpHook.Role.APPLICATION)
             }
         } catch (t: Throwable) {
             Log.e(TAG, "onExit wrap error", t)

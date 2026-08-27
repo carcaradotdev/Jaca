@@ -13,6 +13,9 @@ class TrackedHttpURLConnection(
     private val tracker: SqueezeTracker,
 ) : HttpURLConnection(d.url) {
 
+    init { tracker.setHttpStack("urlconnection") }
+
+
     private var requestCaptured = false
 
     private fun captureRequest() {

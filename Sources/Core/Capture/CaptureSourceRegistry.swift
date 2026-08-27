@@ -29,7 +29,8 @@ enum CaptureSourceRegistry {
             if ctx.device.platform == .iosSimulator {
                 return IOSSimulatorAgentCaptureSource(device: ctx.device, bundleID: ctx.targetPackage ?? "")
             }
-            return AgentCaptureSource(adbURL: ctx.adbURL, serial: ctx.device.id, package: ctx.targetPackage ?? "")
+            return AgentCaptureSource(adbURL: ctx.adbURL, serial: ctx.device.id,
+                                      package: ctx.targetPackage ?? "", intercept: ctx.intercept)
         },
     )
 

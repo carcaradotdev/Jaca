@@ -43,21 +43,35 @@ object OkHttpHook {
     private val failed = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val handler = Handler()
 
-    /** Returns a list with our interceptor first, or the original on any failure.
-     *  [ifaceName] is the okhttp Interceptor interface (okhttp3 vs squareup). */
-    fun inject(existing: List<*>, ifaceName: String): List<*> {
+    /** Which okhttp interceptor list we're being injected into. The role decides both our
+     *  position in the list and what we're allowed to do (see [Handler.intercept]). */
+    enum class Role { APPLICATION, NETWORK }
+
+    /** Returns a list containing our interceptor, or the original on any failure.
+     *  [ifaceName] is the okhttp Interceptor interface (okhttp3 vs squareup).
+     *
+     *  **Position matters, and differs by role.**
+     *  - [Role.NETWORK] → **prepend**, so capture sees the real wire request/response before any
+     *    of the app's own network interceptors can alter them.
+     *  - [Role.APPLICATION] → **append**, so we rewrite the URL *after* the app's interceptors
+     *    have run. Prepending here would repoint the URL first, and a host-gated auth interceptor
+     *    would then silently stop attaching its token (and the app's own logging would show
+     *    `localhost`). Appending still leaves us ahead of `RetryAndFollowUpInterceptor`, so
+     *    `chain.connection() == null` — and the application-layer invariant — still holds. */
+    fun inject(existing: List<*>, ifaceName: String, role: Role = Role.NETWORK): List<*> {
         val ic = ensureInterceptor(ifaceName) ?: return existing
         if (existing.any { it === ic }) return existing
         // okhttp2's networkInterceptors() returns the live mutable list (add in place);
-        // okhttp3's is immutable, so fall back to a new prepended list.
+        // okhttp3's is immutable, so fall back to a new list.
         return try {
             @Suppress("UNCHECKED_CAST")
-            (existing as MutableList<Any?>).add(0, ic)
+            val live = existing as MutableList<Any?>
+            if (role == Role.APPLICATION) live.add(ic) else live.add(0, ic)
             existing
         } catch (t: Throwable) {
             val out = ArrayList<Any?>(existing.size + 1)
-            out.add(ic)
-            out.addAll(existing)
+            if (role == Role.APPLICATION) { out.addAll(existing); out.add(ic) }
+            else { out.add(ic); out.addAll(existing) }
             out
         }
     }
@@ -170,15 +184,58 @@ object OkHttpHook {
         }
 
         /** Application-interceptor pass: divert a matched request, otherwise stay out of the
-         *  way entirely. No capture here — the network-layer pass records the transaction. */
+         *  way entirely. No capture here — the network-layer pass records the transaction.
+         *
+         *  Two safety nets make a dead desktop harmless, and neither needs Jaca running:
+         *   - **retry-direct**: the desktop bounces anything it isn't mocking with 599, and we
+         *     re-run the original request. Calling `proceed()` more than once is legal *here* —
+         *     that is exactly how okhttp's own retry interceptors work — but would be illegal
+         *     on the network layer.
+         *   - **fail-open**: if the tunnel is gone (ECONNREFUSED and friends), disarm and retry
+         *     the original once, so a SIGKILLed Jaca can't brick the user's app. */
         private fun divertPass(chainCls: Class<*>, chain: Any, request: Any): Any {
             val outbound = divertIfMatched(request)
             val proceed = chainCls.getMethod("proceed", request.javaClass)
             if (outbound === request) return invokeUnwrapped { proceed.invoke(chain, request) }
-            val response = invokeUnwrapped { proceed.invoke(chain, outbound) }
+
+            val response = try {
+                invokeUnwrapped { proceed.invoke(chain, outbound) }
+            } catch (t: Throwable) {
+                // The tunnel died under us. Go read-only and let the app's real request through,
+                // so the only visible effect is that the override stopped applying.
+                Log.e(TAG, "divert: tunnel unreachable, failing open and retrying direct", t)
+                Divert.disarm()
+                return invokeUnwrapped { proceed.invoke(chain, request) }
+            }
+
+            if (isRetryDirect(response)) {
+                closeQuietly(response)
+                return invokeUnwrapped { proceed.invoke(chain, request) }
+            }
             // Put the ORIGINAL request back on the response, so a diverted call still looks
             // like the real URL to the app (cookies, logging, anything reading response.request).
             return restoreRequest(response, request)
+        }
+
+        /** True when the desktop declined to mock this request and wants us to send it directly. */
+        private fun isRetryDirect(response: Any): Boolean = try {
+            val cls = response.javaClass
+            val code = cls.getMethod("code").invoke(response) as Int
+            code == Divert.RETRY_DIRECT_STATUS &&
+                (cls.getMethod("header", String::class.java)
+                    .invoke(response, Divert.DIVERT_HEADER) as? String) == Divert.RETRY_DIRECT
+        } catch (t: Throwable) {
+            false
+        }
+
+        /** Releases a bounced response's connection; a leaked body would starve the pool. */
+        private fun closeQuietly(response: Any) {
+            try { response.javaClass.getMethod("close").invoke(response) } catch (t: Throwable) {
+                try {
+                    val body = response.javaClass.getMethod("body").invoke(response)
+                    body?.javaClass?.getMethod("close")?.invoke(body)
+                } catch (ignored: Throwable) {}
+            }
         }
 
         /** True when this chain is an application interceptor (no connection yet). Defaults to
@@ -189,34 +246,63 @@ object OkHttpHook {
             false
         }
 
-        /** POC divert ([PocDivert]): a copy of [request] pointed at the local mock server when
-         *  the URL matches, otherwise [request] itself. okhttp3 only — okhttp2 keeps the plain
-         *  capture path. Any failure returns the original request unchanged. */
+        /** A copy of [request] pointed at the desktop when [Divert] says this host is routed,
+         *  otherwise [request] itself. okhttp3 only — okhttp2 keeps the plain capture path.
+         *  Any failure returns the original request unchanged. */
         private fun divertIfMatched(request: Any): Any {
-            if (!PocDivert.ENABLED) return request
+            if (!Divert.isArmed) return request
             return try {
                 val reqCls = request.javaClass
                 if (reqCls.name != "okhttp3.Request") return request
-                val url = reqCls.getMethod("url").invoke(request).toString()
-                val target = PocDivert.targetFor(url) ?: return request
+                if (!isDivertEligible(request, reqCls)) return request
+                val httpUrl = reqCls.getMethod("url").invoke(request)
+                val url = httpUrl.toString()
+                val host = (httpUrl.javaClass.getMethod("host").invoke(httpUrl) as? String)
+                    ?.lowercase() ?: return request
+                val target = Divert.targetFor(host, pathAndQuery(url)) ?: return request
                 val builder = reqCls.getMethod("newBuilder").invoke(request)
                 val bCls = builder.javaClass
                 bCls.getMethod("url", String::class.java).invoke(builder, target)
                 bCls.getMethod("header", String::class.java, String::class.java)
-                    .invoke(builder, PocDivert.ORIGINAL_URL_HEADER, url)
+                    .invoke(builder, Divert.ORIGINAL_URL_HEADER, url)
                 val diverted = invokeUnwrapped { bCls.getMethod("build").invoke(builder) }
-                Log.i(TAG, "POC divert: $url -> $target")
+                Log.i(TAG, "divert: $url -> $target")
                 diverted
             } catch (t: Throwable) {
-                Log.e(TAG, "POC divert failed; proceeding with the original request", t)
+                Log.e(TAG, "divert failed; proceeding with the original request", t)
                 request
             }
         }
 
-        /** The [PocDivert.ORIGINAL_URL_HEADER] value, or null when this request wasn't diverted. */
+        /** Everything after the origin — the desktop reconstructs the real URL from the header,
+         *  so the path/query only has to survive the hop intact. */
+        private fun pathAndQuery(url: String): String {
+            val schemeEnd = url.indexOf("://")
+            if (schemeEnd < 0) return "/"
+            val slash = url.indexOf('/', schemeEnd + 3)
+            return if (slash < 0) "/" else url.substring(slash)
+        }
+
+        /** Requests that must never be diverted, because the retry-direct bounce (or a fail-open
+         *  retry) would have to re-send a body that can only be sent once, or would break a
+         *  protocol upgrade that isn't plain HTTP on the other side. */
+        private fun isDivertEligible(request: Any, reqCls: Class<*>): Boolean {
+            try {
+                val body = reqCls.getMethod("body").invoke(request)
+                if (body != null && (boolMethod(body, "isOneShot") || boolMethod(body, "isDuplex"))) return false
+                val upgrade = reqCls.getMethod("header", String::class.java)
+                    .invoke(request, "Connection") as? String
+                if (upgrade != null && upgrade.contains("upgrade", ignoreCase = true)) return false
+            } catch (t: Throwable) {
+                return false   // can't prove it's safe → leave it alone
+            }
+            return true
+        }
+
+        /** The [Divert.ORIGINAL_URL_HEADER] value, or null when this request wasn't diverted. */
         private fun originalUrlHeader(request: Any, reqCls: Class<*>): String? = try {
             reqCls.getMethod("header", String::class.java)
-                .invoke(request, PocDivert.ORIGINAL_URL_HEADER) as? String
+                .invoke(request, Divert.ORIGINAL_URL_HEADER) as? String
         } catch (t: Throwable) {
             null
         }
@@ -252,6 +338,9 @@ object OkHttpHook {
             val url = originalUrlHeader(request, reqCls)
                 ?: reqCls.getMethod("url").invoke(request).toString()
             val tracker = SqueezeTracker(url)
+            // Records which stack this came from, so the desktop can say whether the request is
+            // divertible at all — only okhttp3 requests can be repointed.
+            tracker.setHttpStack(if (reqCls.name.startsWith("okhttp3.")) "okhttp3" else "okhttp2")
             (reqCls.getMethod("method").invoke(request) as? String)?.let { tracker.setMethod(it) }
             tracker.setRequestHeaders(headers(reqCls.getMethod("headers").invoke(request)))
             captureRequestBody(request, tracker)
@@ -292,6 +381,15 @@ object OkHttpHook {
             val respCls = response.javaClass
             val code = respCls.getMethod("code").invoke(response) as Int
             val respHeaders = headers(respCls.getMethod("headers").invoke(response))
+
+            // A retry-direct bounce is Jaca talking to itself, not traffic the app made. Drop it
+            // so the direct retry that follows is the only row the user sees.
+            if (code == Divert.RETRY_DIRECT_STATUS &&
+                header(respHeaders, Divert.DIVERT_HEADER) == Divert.RETRY_DIRECT) {
+                tracker.cancel()
+                return response
+            }
+
             tracker.onResponse(code, respHeaders)
 
             // peeking/teeing a never-ending body (SSE/gRPC/long-poll) would only emit the

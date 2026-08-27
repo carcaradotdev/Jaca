@@ -32,7 +32,19 @@ struct NetworkTransaction: Identifiable, Sendable, Hashable {
     var error: String?
 
     /// Initiating call stack — only the in-process agent can provide this; nil for proxy capture.
+    ///
+    /// EXCLUDES okhttp/okio frames (the agent strips them so the stack starts at app code), so it
+    /// can't identify which HTTP stack made the call — use `httpStack`.
     var callStack: [String]? = nil
+
+    /// The override rule that produced this response. Read from the `X-Jaca-Override` header, not
+    /// by correlating ids: `OverrideServer` mints ids no captured row ever has.
+    var overriddenByRuleID: UUID? = nil
+
+    /// Which HTTP stack produced this transaction ("okhttp3", "okhttp2", "urlconnection"), when
+    /// the agent reported it. Nil for proxy/companion capture and older agents — treat nil as
+    /// "unknown", never "unsupported".
+    var httpStack: String? = nil
 
     /// True once this (older) transaction's bodies have been spilled to the on-disk
     /// cache and cleared from memory; the detail view loads them back on demand.
@@ -57,6 +69,15 @@ struct NetworkTransaction: Identifiable, Sendable, Hashable {
         self.requestBytes = requestBody?.count ?? 0
         self.responseBytes = 0
         self.error = nil
+    }
+
+    /// Headers as the app saw them, minus Jaca's own markers: `X-Jaca-*` is plumbing, and showing
+    /// it in the Headers tab or a HAR export would misrepresent what the server sent.
+    var displayRequestHeaders: [HeaderPair] {
+        requestHeaders.filter { !OverrideHeaders.isJacaInternal($0.name) }
+    }
+    var displayResponseHeaders: [HeaderPair] {
+        responseHeaders.filter { !OverrideHeaders.isJacaInternal($0.name) }
     }
 
     /// Total wall-clock duration once finished, in seconds.

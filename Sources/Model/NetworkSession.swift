@@ -47,6 +47,10 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
     /// companion capture source streams from. Read reactively (via `companions.devices`) — no polling.
     let companions: CompanionRegistry?
     private var companion: CompanionHub? { companions?.hub }
+
+    /// The shared response-override library. A reference to the one owner, never a copy — the
+    /// views read `session.overrides` and re-render whenever it changes.
+    let overrides: OverridesModel?
     private var current: CaptureSource?
     private var indexByID: [UUID: Int] = [:]
     private let bodyCache: NetworkBodyCache?
@@ -171,13 +175,91 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
     }
 
     init(device: Device, ca: CertificateAuthority, adbURL: URL?, displayName: String? = nil,
-         bodyCache: NetworkBodyCache? = nil, companions: CompanionRegistry? = nil) {
+         bodyCache: NetworkBodyCache? = nil, companions: CompanionRegistry? = nil,
+         overrides: OverridesModel? = nil) {
         self.device = device
         self.ca = ca
         self.adbURL = adbURL
         self.displayName = displayName ?? "Network · \(device.displayModel)"
         self.bodyCache = bodyCache
         self.companions = companions
+        self.overrides = overrides
+    }
+
+    /// Restarts the running capture source so it picks up a changed intercept configuration.
+    ///
+    /// `makeContext()` snapshots the override services at launch, so a flag toggled mid-capture
+    /// only takes effect on the next launch. Re-selecting the same source is the cheapest honest
+    /// way to apply it, and it keeps the captured rows.
+    func restartForInterceptChange() {
+        guard isRunning, let descriptor = currentDescriptor else { return }
+        current?.stop()
+        current = nil
+        let source = descriptor.make(makeContext())
+        current = source
+        source.start(into: self)
+    }
+
+    /// Whether this device still has a proxy configured — including the per-network
+    /// `global_http_proxy_*` rows that a crashed session can strand, leaving the device
+    /// "connected, no internet" long after Jaca exited.
+    private(set) var deviceProxyLingers = false
+    private(set) var isRevertingDeviceProxy = false
+
+    /// Checks for a stranded device proxy. Cheap, and only meaningful for an adb device.
+    func refreshDeviceProxyState() async {
+        guard let adbURL, isADBDevice else { deviceProxyLingers = false; return }
+        deviceProxyLingers = await ProxyConfigurator.hasAnyProxyConfigured(
+            adbURL: adbURL, serial: device.id)
+    }
+
+    /// Clears every proxy key and re-validates the network, so a device stranded by a crashed
+    /// session can be recovered without dropping to a shell.
+    func revertDeviceProxy() async {
+        guard let adbURL, isADBDevice, !isRevertingDeviceProxy else { return }
+        isRevertingDeviceProxy = true
+        JacaLog.info("proxy", "reverting device proxy on \(device.id)")
+        await ProxyConfigurator.clearAndroidProxy(adbURL: adbURL, serial: device.id)
+        ProxyCleanup.deregister(adbPath: adbURL.path, serial: device.id)
+        await refreshDeviceProxyState()
+        isRevertingDeviceProxy = false
+        JacaLog.info("proxy",
+            "device proxy revert finished on \(device.id); stillConfigured=\(deviceProxyLingers)")
+    }
+
+    /// This tab's arming target, when it's inspecting one app on one device.
+    var interceptTarget: InterceptTarget? {
+        guard let package = targetPackage, !package.isEmpty else { return nil }
+        return InterceptTarget(deviceID: device.id, package: package)
+    }
+
+    /// Whether this session actually wired up override services when it launched. The toolbar
+    /// must not claim overrides are active when nothing was armed.
+    var interceptWired: Bool { current?.arming != nil }
+
+    /// What the *currently running* capture source can honour when a rule matches. Drives the
+    /// toolbar tint and the "matches but can't run here" badge, using the same clamp the runtime
+    /// uses, so the UI can never promise something the transport won't do.
+    var activeInterceptCapabilities: InterceptCapabilities {
+        current?.interceptCapabilities ?? []
+    }
+
+    /// Whether a capture source is running at all. With none, "this rule can't run here" is
+    /// misleading — the honest message is "start capture".
+    var hasRunningSource: Bool { current != nil }
+
+    /// The interception point this tab is currently capturing through.
+    var interceptTransport: InterceptTransportID {
+        switch captureMode {
+        case .agent:
+            return device.platform == .iosSimulator
+                ? .iosSimulatorDivert(bundleID: targetPackage ?? "")
+                : .agentDivert(package: targetPackage ?? "")
+        case .companion:
+            return .companionMetadata
+        default:
+            return .mitmProxy
+        }
     }
 
     // MARK: - Source selection (generic)
@@ -238,7 +320,8 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
 
     private func makeContext() -> CaptureContext {
         CaptureContext(device: device, adbURL: adbURL, ca: ca, deviceContext: deviceContext,
-                       targetPackage: targetPackage, companion: companion)
+                       targetPackage: targetPackage, companion: companion,
+                       intercept: FeatureFlags.responseOverridesEnabled ? overrides?.services() : nil)
     }
 
     func stop() {
@@ -295,7 +378,12 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
 
     func upsert(_ txn: NetworkTransaction) {
         // First successfully MITM'd HTTPS request confirms the CA is trusted.
-        if txn.scheme == "https", txn.error == nil {
+        //
+        // This is proof only when the bytes actually came back through the proxy: a response an
+        // override fabricated never touched TLS, and the agent doesn't use the CA at all, so
+        // neither says anything about whether the device trusts it. Counting those would dismiss
+        // the CA-setup prompt for a user whose CA isn't installed.
+        if txn.scheme == "https", txn.error == nil, captureMode == .proxy, !wasOverridden(txn) {
             caReady = true
             proxyNeedsSetup = false
             caInstaller?.noteInterceptionConfirmed()
@@ -330,6 +418,38 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
         transactions[idx].requestBody = nil
         transactions[idx].responseBody = nil
         transactions[idx].bodiesEvicted = true
+    }
+
+    /// True when a rule produced this response, so it can't be treated as evidence about the
+    /// network (it never reached one). Read from the stamp the pipeline puts on the response.
+    private func wasOverridden(_ txn: NetworkTransaction) -> Bool {
+        txn.responseHeaders.contains { $0.name.lowercased() == OverrideHeaders.override.lowercased() }
+    }
+
+    /// The currently selected transaction, if any.
+    var selectedTransaction: NetworkTransaction? {
+        guard let selectedID, let idx = indexByID[selectedID] else { return nil }
+        return transactions[idx]
+    }
+
+    /// Loads a transaction's bodies, **awaiting** the spill cache when they've been evicted.
+    ///
+    /// `ensureBodies(for:)` is fire-and-forget (it feeds the detail pane, which can repaint when
+    /// the bodies land). Seeding an override rule can't work that way: the sheet has to copy the
+    /// body at creation time, because `NetworkBodyCache` wipes its directory on every launch, so a
+    /// rule that didn't snapshot its payload could never recover it.
+    func bodies(for id: UUID) async -> (req: Data?, resp: Data?) {
+        guard let idx = indexByID[id] else { return (nil, nil) }
+        let txn = transactions[idx]
+        if !txn.bodiesEvicted || bodyCache == nil { return (txn.requestBody, txn.responseBody) }
+        guard let cache = bodyCache else { return (txn.requestBody, txn.responseBody) }
+        let loaded = await cache.load(id)
+        if let i = indexByID[id] {
+            transactions[i].requestBody = loaded.req
+            transactions[i].responseBody = loaded.resp
+            transactions[i].bodiesEvicted = false
+        }
+        return (loaded.req, loaded.resp)
     }
 
     func ensureBodies(for id: UUID) {

@@ -7,13 +7,22 @@ final class AgentCaptureSource: CaptureSource {
     private let adbURL: URL?
     private let serial: String
     private let package: String
+    private let intercept: InterceptServices?
     private var controller: AgentController?
 
-    init(adbURL: URL?, serial: String, package: String) {
+    init(adbURL: URL?, serial: String, package: String, intercept: InterceptServices? = nil) {
         self.adbURL = adbURL
         self.serial = serial
         self.package = package
+        self.intercept = intercept
     }
+
+    /// The agent terminates the exchange on the desktop, so it can do everything: answer without
+    /// the network, rewrite a real response, delay, and see bodies — **but only when override
+    /// services were actually wired in**. Without them nothing can be honoured here.
+    var interceptCapabilities: InterceptCapabilities { intercept == nil ? [] : .desktopTerminated }
+
+    var arming: AgentDivertCoordinator? { controller?.divert }
 
     func start(into sink: CaptureSink) {
         guard let adbURL, !package.isEmpty,
@@ -27,6 +36,7 @@ final class AgentCaptureSource: CaptureSource {
             soPath: so, bootDexPath: boot, captureDexPath: cap,
             onTransaction: { [weak sink] txn in Task { @MainActor in sink?.capture(didReceive: txn) } },
             onStatus: { [weak sink] s in Task { @MainActor in sink?.capture(didChangeStatus: s) } },
+            intercept: intercept
         )
         self.controller = controller
         controller.start()

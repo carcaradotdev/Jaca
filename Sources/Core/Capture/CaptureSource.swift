@@ -12,6 +12,10 @@ struct CaptureContext {
     let targetPackage: String?
     /// Companion mode: the shared mDNS browse + stream hub.
     let companion: CompanionHub?
+    /// Response overrides: the resolver, reporter and origin client a transport needs to
+    /// participate in interception. Nil disables overriding for this source entirely.
+    /// Threaded exactly like `companion` above — one path, so sources never reach for the model.
+    var intercept: InterceptServices? = nil
 }
 
 /// Callbacks a running source uses to report back to its session. Source-specific
@@ -34,6 +38,18 @@ protocol CaptureSink: AnyObject {
 protocol CaptureSource: AnyObject {
     func start(into sink: CaptureSink)
     func stop()
+    /// What this source can honour when a rule matches. Defaults to nothing, so a transport
+    /// only participates in interception once it deliberately opts in.
+    var interceptCapabilities: InterceptCapabilities { get }
+
+    /// The coordinator arming this source's device, when overrides were actually wired up.
+    /// Nil means nothing is armed — the UI must not claim overrides are active.
+    var arming: AgentDivertCoordinator? { get }
+}
+
+extension CaptureSource {
+    var interceptCapabilities: InterceptCapabilities { [] }
+    var arming: AgentDivertCoordinator? { nil }
 }
 
 /// Static, selectable description of a capture option for a device. Drives the chooser

@@ -28,6 +28,12 @@ enum AgentTransactionParser {
         txn.responseBytes = obj["responseSize"] as? Int ?? (txn.responseBody?.count ?? 0)
         txn.error = obj["error"] as? String
         txn.callStack = (obj["callStack"] as? [Any])?.compactMap { $0 as? String }
+        txn.httpStack = obj["httpStack"] as? String
+        // The agent captures our stamp on the way back, so the row knows it was overridden
+        // without the desktop having to match up ids across two different id spaces.
+        txn.overriddenByRuleID = txn.responseHeaders
+            .first { $0.name.lowercased() == OverrideHeaders.override.lowercased() }
+            .flatMap { UUID(uuidString: $0.value) }
         return txn
     }
 
@@ -60,8 +66,24 @@ final class AgentController: @unchecked Sendable {
     private let onTransaction: @Sendable (NetworkTransaction) -> Void
     private let onStatus: @Sendable (String) -> Void
 
+    /// Owns the override server, the `adb reverse` tunnel and the control frames. Nil when
+    /// response overrides aren't wired up for this session.
+    let divert: AgentDivertCoordinator?
+    private let interceptPipeline: InterceptPipeline?
+    private var interceptServices: InterceptServices?
+    private var interceptTarget: InterceptTarget?
+
     private var forwardedPort: Int32 = 0
-    private var fd: Int32 = -1
+    /// The agent socket. Touched by the reader thread, the control queue and `stop()`, so every
+    /// access goes through `fdLock` — a plain `var` here was a data race on three threads.
+    private let fdLock = NSLock()
+    private var _fd: Int32 = -1
+    private var fd: Int32 {
+        get { fdLock.lock(); defer { fdLock.unlock() }; return _fd }
+        set { fdLock.lock(); _fd = newValue; fdLock.unlock() }
+    }
+    /// Serialises writes to the agent socket so a control frame can't interleave with another.
+    private let controlQueue = DispatchQueue(label: "jaca.agent.control")
     private var readerThread: Thread?
     private var stopped = false
     /// Set once the reader connects to the agent's forwarded socket — i.e. the agent actually
@@ -71,7 +93,8 @@ final class AgentController: @unchecked Sendable {
     init(adbURL: URL, serial: String, package: String, soPath: URL,
          bootDexPath: URL, captureDexPath: URL,
          onTransaction: @escaping @Sendable (NetworkTransaction) -> Void,
-         onStatus: @escaping @Sendable (String) -> Void) {
+         onStatus: @escaping @Sendable (String) -> Void,
+         intercept: InterceptServices? = nil) {
         self.adbURL = adbURL
         self.serial = serial
         self.package = package
@@ -81,6 +104,18 @@ final class AgentController: @unchecked Sendable {
         self.socketName = "squeeze_\(UInt32.random(in: 1...0xFFFFFF))"
         self.onTransaction = onTransaction
         self.onStatus = onStatus
+        self.interceptPipeline = intercept?.pipeline(for: .agentDivert(package: package),
+                                                     deviceID: serial, appID: package)
+        let target = InterceptTarget(deviceID: serial, package: package)
+        self.divert = intercept.map { services in
+            AgentDivertCoordinator(adbPath: adbURL.path, serial: serial, package: package,
+                                   onStatus: onStatus,
+                                   onStateChange: { services.reportArming(target: target, state: $0) })
+        }
+        self.divert?.sendControlFrame = { [weak self] frame in self?.writeControlFrame(frame) }
+        self.interceptServices = intercept
+        self.interceptTarget = target
+        intercept?.register(target: target, coordinator: self.divert)
     }
 
     /// Checks whether `package` is debuggable (run-as succeeds only for debug builds).
@@ -108,6 +143,13 @@ final class AgentController: @unchecked Sendable {
         await pushArtifacts()
         guard await setupForward() else { onStatus("agent: adb forward failed"); return }
         startReaderLoop()
+
+        // Bring the override server + tunnel up before the app is attached, so the port is
+        // stable for the whole session (see AgentDivertCoordinator's note on the re-attach trap).
+        if let divert, let interceptPipeline {
+            await divert.start(pipeline: interceptPipeline)
+            startHeartbeat()
+        }
 
         var lastPid: String?
         var announcedWaiting = false
@@ -197,10 +239,49 @@ final class AgentController: @unchecked Sendable {
         }
     }
 
+    /// Feeds the agent's dead-man switch. If Jaca dies, these stop, and the agent disarms itself
+    /// on its own — which is why a SIGKILL can't leave the user's app pointed at a dead tunnel.
+    private func startHeartbeat() {
+        Task { [weak self] in
+            while let self, !self.stopped {
+                try? await Task.sleep(for: .seconds(5))
+                guard !self.stopped else { return }
+                self.divert?.sendHeartbeat()
+            }
+        }
+    }
+
+    /// Writes one newline-delimited control frame to the agent over the socket it already owns.
+    /// Serialised on `controlQueue` so frames can't interleave.
+    private func writeControlFrame(_ json: String) {
+        controlQueue.async { [weak self] in
+            guard let self else { return }
+            let socket = self.fd
+            guard socket >= 0 else {
+                JacaLog.warn("agent", "control frame dropped — socket closed")
+                return
+            }
+            let data = Array((json + "\n").utf8)
+            var offset = 0
+            while offset < data.count {
+                let written = data.withUnsafeBufferPointer { buffer in
+                    // MSG_NOSIGNAL equivalent: SO_NOSIGPIPE is set on connect, so a write to a
+                    // closed socket returns EPIPE instead of killing the process.
+                    send(socket, buffer.baseAddress! + offset, data.count - offset, 0)
+                }
+                if written <= 0 { return }
+                offset += written
+            }
+        }
+    }
+
     private func setupForward() async -> Bool {
         guard let fwd = await adb(["forward", "tcp:0", "localabstract:\(socketName)"]),
               let port = Int32(fwd.stdout.trimmingCharacters(in: .whitespacesAndNewlines)) else { return false }
         forwardedPort = port
+        // Registered so a quit/^C/crash can't strand it in the adb server, where it would outlive
+        // Jaca itself. This closes a leak that predates response overrides.
+        AdbTunnelCleanup.register(adbPath: adbURL.path, serial: serial, kind: .forward, port: Int(port))
         return true
     }
 
@@ -218,11 +299,17 @@ final class AgentController: @unchecked Sendable {
         while !stopped {
             let s = connect(port: forwardedPort)
             if s < 0 { Thread.sleep(forTimeInterval: 0.3); continue }
-            socketConnected = true   // the agent loaded and opened its socket
+            // NB: connecting proves nothing — `adb forward` accepts the TCP connection whether or
+            // not anything is listening on the device end, so `socketConnected` is set when the
+            // first bytes actually arrive (see streamFrom). Setting it here made the
+            // "attached but never loaded" diagnostic impossible to trigger.
             fd = s
             _ = streamFrom(fd: s)
             if fd >= 0 { close(fd); fd = -1 }
             if stopped { return }
+            // A re-attach re-points the reporter socket, so the endpoint must be re-sent on the
+            // next hello rather than assumed to still be in effect.
+            divert?.agentDidReconnect()
             Thread.sleep(forTimeInterval: 0.3)   // socket closed → retry / await re-attach
         }
     }
@@ -235,14 +322,24 @@ final class AgentController: @unchecked Sendable {
         while !stopped {
             let n = recv(s, &chunk, chunk.count, 0)
             if n <= 0 { break }
-            if firstData { firstData = false; onStatus("agent: in-process (receiving)") }
+            if firstData {
+                firstData = false
+                socketConnected = true     // real bytes from the agent: it genuinely loaded
+                onStatus("agent: in-process (receiving)")
+            }
             buffer.append(contentsOf: chunk[0..<n])
             while let nl = buffer.firstIndex(of: 0x0A) {
                 let lineData = buffer[buffer.startIndex..<nl]
                 buffer.removeSubrange(buffer.startIndex...nl)
-                if let line = String(data: lineData, encoding: .utf8),
-                   let txn = AgentTransactionParser.parse(line) {
-                    onTransaction(txn)
+                if let line = String(data: lineData, encoding: .utf8) {
+                    if let txn = AgentTransactionParser.parse(line) {
+                        onTransaction(txn)
+                    } else if AgentHelloParser.advertisesOverrideSupport(line) {
+                        JacaLog.info("agent", "hello with override/1 from \(package)")
+                        // Only now does the desktop send an endpoint, so an older agent that
+                        // can't read control frames is a no-op rather than a hazard.
+                        divert?.agentDidAdvertiseOverrideSupport()
+                    }
                 }
             }
         }
@@ -262,16 +359,43 @@ final class AgentController: @unchecked Sendable {
             }
         }
         if r != 0 { close(s); return -1 }
+        // Without this, writing a control frame to a socket the agent already closed raises
+        // SIGPIPE and kills Jaca outright.
+        var on: Int32 = 1
+        setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
         return s
     }
 
+    /// Interactive teardown. Stays **asynchronous** on purpose: this runs on the main actor from
+    /// the stop button, a source switch and tab close, and a synchronous `adb` call would block
+    /// the UI for seconds against a wedged or unplugged device. The synchronous path exists only
+    /// for process exit (`AdbTunnelCleanup.revertAll`), where blocking briefly is correct.
+    ///
+    /// Order matters: disarm the agent and drop the reverse tunnel *before* removing the forward,
+    /// so the control channel is still open when the disarm frame is written.
     func stop() {
         stopped = true
-        if fd >= 0 { close(fd); fd = -1 }
+        let coordinator = divert
         let p = forwardedPort
-        if p > 0 {
-            let url = adbURL, serial = serial
-            Task { _ = try? await CommandRunner.run(url, ["-s", serial, "forward", "--remove", "tcp:\(p)"]) }
+        let url = adbURL, serial = serial
+        let socket = fd
+        let services = interceptServices
+        let target = interceptTarget
+
+        // `fd` deliberately stays valid until the coordinator has flushed its disarm frame.
+        // Clearing it here (as this used to) made `writeControlFrame` bail on every teardown, so
+        // the graceful "stop diverting" message was *always* dropped and the device only ever
+        // recovered via the EOF/heartbeat fallbacks.
+        Task {
+            await coordinator?.stop()                       // divert off, reverse removed, server closed
+            self.fd = -1
+            if socket >= 0 { close(socket) }
+            if p > 0 {
+                _ = try? await CommandRunner.run(url, ["-s", serial, "forward", "--remove", "tcp:\(p)"])
+                AdbTunnelCleanup.deregister(adbPath: url.path, serial: serial, kind: .forward, port: Int(p))
+            }
+            // Drop the coordinator so a closed tab stops receiving host-set updates.
+            if let target { services?.register(target: target, coordinator: nil) }
         }
     }
 }

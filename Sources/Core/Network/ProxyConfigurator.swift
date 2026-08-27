@@ -18,10 +18,48 @@ enum ProxyConfigurator {
         )
     }
 
+    /// Every settings key that has to be cleared to truly remove a device proxy. `http_proxy`
+    /// alone is **not enough**: Android also stores the proxy per-network in `global_http_proxy_*`,
+    /// and while those rows survive the network stays unvalidated ("connected, no internet") even
+    /// though `http_proxy` reads `:0`.
+    static let proxySettingsKeys = [
+        "global_http_proxy_host",
+        "global_http_proxy_port",
+        "global_http_proxy_exclusion_list",
+    ]
+
+    /// Clears the device proxy completely and nudges the network back to validated.
     static func clearAndroidProxy(adbURL: URL, serial: String) async {
         _ = try? await CommandRunner.run(
             adbURL, ["-s", serial, "shell", "settings", "put", "global", "http_proxy", ":0"]
         )
+        for key in proxySettingsKeys {
+            _ = try? await CommandRunner.run(
+                adbURL, ["-s", serial, "shell", "settings", "delete", "global", key]
+            )
+        }
+        await revalidateAndroidNetwork(adbURL: adbURL, serial: serial)
+    }
+
+    /// Bounces Wi-Fi so Android re-runs its connectivity check. Proxy config is cached per
+    /// network, so without this the device sits on a stale unvalidated network.
+    static func revalidateAndroidNetwork(adbURL: URL, serial: String) async {
+        _ = try? await CommandRunner.run(adbURL, ["-s", serial, "shell", "svc", "wifi", "disable"])
+        try? await Task.sleep(for: .seconds(2))
+        _ = try? await CommandRunner.run(adbURL, ["-s", serial, "shell", "svc", "wifi", "enable"])
+    }
+
+    /// True when any proxy key is still set — including the per-network rows that
+    /// `currentAndroidProxy` can't see. Drives the "revert" affordance.
+    static func hasAnyProxyConfigured(adbURL: URL, serial: String) async -> Bool {
+        if await currentAndroidProxy(adbURL: adbURL, serial: serial) != nil { return true }
+        for key in proxySettingsKeys {
+            let r = try? await CommandRunner.run(
+                adbURL, ["-s", serial, "shell", "settings", "get", "global", key])
+            let value = (r?.stdout ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !value.isEmpty, value != "null", value != "0" { return true }
+        }
+        return false
     }
 
     /// The device's current global HTTP proxy, or nil when none is set
@@ -110,10 +148,22 @@ enum ProxyCleanup {
         for entry in snapshot { runClear(adbPath: entry.adbPath, serial: entry.serial) }
     }
 
+    /// Clears every proxy key synchronously — the quit and catchable-signal path, so it has to be
+    /// as complete as the async one.
+    ///
+    /// No Wi-Fi bounce here: it needs a sleep between disable and enable, and this runs while the
+    /// process is terminating. The "Revert device proxy" affordance does the full job.
     private static func runClear(adbPath: String, serial: String) {
+        run(adbPath, ["-s", serial, "shell", "settings", "put", "global", "http_proxy", ":0"])
+        for key in ProxyConfigurator.proxySettingsKeys {
+            run(adbPath, ["-s", serial, "shell", "settings", "delete", "global", key])
+        }
+    }
+
+    private static func run(_ adbPath: String, _ arguments: [String]) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: adbPath)
-        process.arguments = ["-s", serial, "shell", "settings", "put", "global", "http_proxy", ":0"]
+        process.arguments = arguments
         process.standardOutput = nil
         process.standardError = nil
         try? process.run()
@@ -123,17 +173,8 @@ enum ProxyCleanup {
     private static func installHandlersLocked() {
         guard !handlersInstalled else { return }
         handlersInstalled = true
-        // The handler captures no context (C function pointer), reverts every
-        // registered proxy, then restores the default disposition and re-raises
-        // so the process still terminates as expected. Spawning adb here isn't
-        // strictly async-signal-safe, but it's the pragmatic choice for a dev
-        // tool and only runs on the way out.
-        for sig in [SIGINT, SIGTERM, SIGHUP] {
-            signal(sig) { received in
-                ProxyCleanup.revertAll()
-                signal(received, SIG_DFL)
-                raise(received)
-            }
-        }
+        // Shared with `AdbTunnelCleanup` (see `TerminationCleanup`): a proxy-only handler here
+        // silently disabled tunnel cleanup.
+        TerminationCleanup.install()
     }
 }

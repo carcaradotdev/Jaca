@@ -14,6 +14,16 @@ enum CaptureMode: Sendable, Equatable {
         case .proxy: return "proxy"
         }
     }
+
+    /// Whether traffic in this mode reaches Jaca by being decrypted with **our CA** — which is
+    /// what makes an `https` transaction proof the device trusts it. `.companion` qualifies (the
+    /// phone tunnels TLS to `ProxyServer`); `.agent` doesn't, as it reads in-process buffers.
+    var decryptsWithOurCA: Bool {
+        switch self {
+        case .proxy, .companion: return true
+        case .agent: return false
+        }
+    }
 }
 
 /// Locates the Android agent artifacts (native .so + dexes) bundled into the app by the build
