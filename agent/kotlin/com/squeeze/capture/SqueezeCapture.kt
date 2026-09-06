@@ -35,6 +35,12 @@ class SqueezeCapture : SqueezeExitHandler {
                             else "okhttp3.Interceptor"
                 return OkHttpHook.inject(returnObject, iface)
             }
+            // OkHttpClient.interceptors() → the APPLICATION list. Matching is case-sensitive,
+            // so this can't collide with "networkInterceptors" (capital I). Same interceptor
+            // object; it detects the layer from chain.connection() and only rewrites here.
+            if (returnObject is List<*> && methodSignature?.contains("interceptors") == true) {
+                return OkHttpHook.inject(returnObject, "okhttp3.Interceptor")
+            }
         } catch (t: Throwable) {
             Log.e(TAG, "onExit wrap error", t)
         }

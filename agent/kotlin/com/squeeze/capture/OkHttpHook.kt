@@ -142,6 +142,16 @@ object OkHttpHook {
         private fun intercept(chain: Any): Any {
             val chainCls = chain.javaClass
             val request = invokeUnwrapped { chainCls.getMethod("request").invoke(chain) }
+
+            // We're injected into BOTH interceptor lists, and the role decides what we do.
+            // An APPLICATION interceptor runs before a connection exists (chain.connection()
+            // == null); that's the only layer where a request's host/port may change. A
+            // NETWORK interceptor runs on an established connection, and okhttp hard-fails
+            // a host/port change there ("must retain the same host and port"), so the POC
+            // divert must happen on the application side — and capture stays on the network
+            // side, where the real wire request/response live.
+            if (isApplicationLayer(chainCls, chain)) return divertPass(chainCls, chain, request)
+
             val tracker = try { startTracker(request) } catch (t: Throwable) { null }
 
             val response: Any
@@ -159,6 +169,70 @@ object OkHttpHook {
             } catch (t: Throwable) { response }
         }
 
+        /** Application-interceptor pass: divert a matched request, otherwise stay out of the
+         *  way entirely. No capture here — the network-layer pass records the transaction. */
+        private fun divertPass(chainCls: Class<*>, chain: Any, request: Any): Any {
+            val outbound = divertIfMatched(request)
+            val proceed = chainCls.getMethod("proceed", request.javaClass)
+            if (outbound === request) return invokeUnwrapped { proceed.invoke(chain, request) }
+            val response = invokeUnwrapped { proceed.invoke(chain, outbound) }
+            // Put the ORIGINAL request back on the response, so a diverted call still looks
+            // like the real URL to the app (cookies, logging, anything reading response.request).
+            return restoreRequest(response, request)
+        }
+
+        /** True when this chain is an application interceptor (no connection yet). Defaults to
+         *  false — if we can't tell, behave as the network layer and never rewrite the URL. */
+        private fun isApplicationLayer(chainCls: Class<*>, chain: Any): Boolean = try {
+            chainCls.getMethod("connection").invoke(chain) == null
+        } catch (t: Throwable) {
+            false
+        }
+
+        /** POC divert ([PocDivert]): a copy of [request] pointed at the local mock server when
+         *  the URL matches, otherwise [request] itself. okhttp3 only — okhttp2 keeps the plain
+         *  capture path. Any failure returns the original request unchanged. */
+        private fun divertIfMatched(request: Any): Any {
+            if (!PocDivert.ENABLED) return request
+            return try {
+                val reqCls = request.javaClass
+                if (reqCls.name != "okhttp3.Request") return request
+                val url = reqCls.getMethod("url").invoke(request).toString()
+                val target = PocDivert.targetFor(url) ?: return request
+                val builder = reqCls.getMethod("newBuilder").invoke(request)
+                val bCls = builder.javaClass
+                bCls.getMethod("url", String::class.java).invoke(builder, target)
+                bCls.getMethod("header", String::class.java, String::class.java)
+                    .invoke(builder, PocDivert.ORIGINAL_URL_HEADER, url)
+                val diverted = invokeUnwrapped { bCls.getMethod("build").invoke(builder) }
+                Log.i(TAG, "POC divert: $url -> $target")
+                diverted
+            } catch (t: Throwable) {
+                Log.e(TAG, "POC divert failed; proceeding with the original request", t)
+                request
+            }
+        }
+
+        /** The [PocDivert.ORIGINAL_URL_HEADER] value, or null when this request wasn't diverted. */
+        private fun originalUrlHeader(request: Any, reqCls: Class<*>): String? = try {
+            reqCls.getMethod("header", String::class.java)
+                .invoke(request, PocDivert.ORIGINAL_URL_HEADER) as? String
+        } catch (t: Throwable) {
+            null
+        }
+
+        /** Rebuilds [response] carrying [original] as its request, hiding the divert from the app. */
+        private fun restoreRequest(response: Any, original: Any): Any {
+            return try {
+                val rb = response.javaClass.getMethod("newBuilder").invoke(response)
+                rb.javaClass.getMethod("request", original.javaClass).invoke(rb, original)
+                invokeUnwrapped { rb.javaClass.getMethod("build").invoke(rb) }
+            } catch (t: Throwable) {
+                Log.e(TAG, "POC divert: couldn't restore the original request", t)
+                response
+            }
+        }
+
         /** Runs a reflective call, rethrowing the real exception instead of the
          *  InvocationTargetException wrapper that Method.invoke would otherwise leak. */
         private inline fun invokeUnwrapped(block: () -> Any?): Any {
@@ -173,7 +247,10 @@ object OkHttpHook {
          *  transaction is emitted even if the call later fails/cancels. */
         private fun startTracker(request: Any): SqueezeTracker {
             val reqCls = request.javaClass
-            val url = reqCls.getMethod("url").invoke(request).toString()
+            // A diverted request carries the URL the app actually asked for, so the captured
+            // transaction still reads as the real endpoint rather than the local mock.
+            val url = originalUrlHeader(request, reqCls)
+                ?: reqCls.getMethod("url").invoke(request).toString()
             val tracker = SqueezeTracker(url)
             (reqCls.getMethod("method").invoke(request) as? String)?.let { tracker.setMethod(it) }
             tracker.setRequestHeaders(headers(reqCls.getMethod("headers").invoke(request)))

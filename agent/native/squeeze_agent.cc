@@ -75,6 +75,12 @@ jint AttachAgent(JavaVM* vm, char* options) {
   // this is where the bulk of modern app traffic (incl. ktor-over-OkHttp) flows.
   squeeze::RegisterExitHookByName(jvmti, jni, "Lokhttp3/OkHttpClient;",
                                   "networkInterceptors", "()Ljava/util/List;");
+  // Also hook the APPLICATION interceptor list. It runs before a connection exists, so it's
+  // the only layer where a request may be repointed at a different host/port (okhttp throws
+  // "must retain the same host and port" if a network interceptor tries). Capture still runs
+  // on the network list; this one exists so the agent can rewrite a request.
+  squeeze::RegisterExitHookByName(jvmti, jni, "Lokhttp3/OkHttpClient;",
+                                  "interceptors", "()Ljava/util/List;");
   // OkHttp2 (com.squareup.okhttp) for older apps/libraries — same hook, the capture
   // routes by the declaring class in the method signature.
   squeeze::RegisterExitHookByName(jvmti, jni, "Lcom/squareup/okhttp/OkHttpClient;",
