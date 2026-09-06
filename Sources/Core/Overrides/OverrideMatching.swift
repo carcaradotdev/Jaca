@@ -79,9 +79,6 @@ enum OverrideMatching {
                         path: path, query: query, normalized: normalized)
     }
 
-    /// Convenience for call sites that also want to filter by method.
-    static func facts(method: String, url: String) -> URLFacts? { facts(url: url) }
-
     // MARK: - Glob compilation
 
     /// Compiles a glob pattern.

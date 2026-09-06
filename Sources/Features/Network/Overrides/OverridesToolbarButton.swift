@@ -1,11 +1,9 @@
 import SwiftUI
 import Lemonade
 
-/// The "Overrides" control in the network toolbar, sitting immediately right of the search field.
-///
-/// This is the entry point that doesn't require a captured request: you can author a rule for an
-/// endpoint the app hasn't called yet. Chrome is copied from `NetworkAppPicker` so it reads as
-/// part of the same toolbar rather than a bolted-on control.
+/// The "Overrides" control in the network toolbar, right of the search field — the entry point
+/// that doesn't need a captured request, so you can write a rule for an endpoint the app hasn't
+/// called yet. Chrome matches `NetworkAppPicker`.
 struct OverridesToolbarButton: View {
     @Bindable var session: NetworkSession
     @State private var showPopover = false
@@ -53,8 +51,7 @@ struct OverridesToolbarButton: View {
 
     // MARK: - Phase
 
-    /// Coarse display state, derived here from the shared model rather than recomputed in each
-    /// view — the single-source-of-truth rule applied to presentation.
+    /// Coarse display state, derived once from the shared model rather than per view.
     private enum Phase: Equatable {
         case none
         case notRunning(Int)
@@ -110,7 +107,7 @@ struct OverridesToolbarButton: View {
             case .armed(let n):      return "\(n) override\(n == 1 ? "" : "s") active on this tab"
             case .blocked(_, _, let reason): return reason
             case .failed(let detail):        return detail
-            case .paused:            return "Overrides paused (⇧⌘O)"
+            case .paused:            return "Overrides paused — resume them in this popover"
             }
         }
     }
@@ -121,15 +118,24 @@ struct OverridesToolbarButton: View {
         guard enabled > 0 else { return .none }
         guard overrides.masterEnabled else { return .paused(enabled) }
 
-        // Don't claim anything is active until it actually is: a stopped tab, or one launched
-        // before the feature flag was on, has nothing armed no matter what the rules say.
+        // A stopped tab, or one launched before the flag was on, has nothing armed whatever the
+        // rules say.
         guard session.hasRunningSource else { return .notRunning(enabled) }
         guard session.interceptWired else { return .notWired(enabled) }
 
-        if case .failed(let detail) = armingState { return .failed(detail) }
+        // Exhaustive on purpose, so adding an arming state forces a presentation for it here.
+        // The wording comes from the state, so tooltip, popover and row badge agree.
+        switch armingState {
+        case .failed, .agentTooOld:
+            return .failed(armingState.blockedMessage ?? "")
+        case .waitingForAgent, .waitingForApp, .detached:
+            return .blocked(0, enabled, armingState.blockedMessage ?? "")
+        case .idle, .active:
+            break
+        }
 
-        // Ask the clamp — the same function the runtime uses — whether this transport can honour
-        // the rules, so the toolbar can never claim an override is active when it isn't.
+        // The same clamp the runtime uses, so the toolbar can't claim an override that won't
+        // run.
         let capabilities = session.activeInterceptCapabilities
         let transport = session.interceptTransport
         let honourable = overrides.rules.filter { rule in
@@ -149,8 +155,5 @@ struct OverridesToolbarButton: View {
         return .armed(enabled)
     }
 
-    private var armingState: AgentDivertCoordinator.State {
-        guard let overrides, let target = session.interceptTarget else { return .idle }
-        return overrides.arming(for: target)
-    }
+    private var armingState: InterceptArmingState { session.armingState }
 }

@@ -12,7 +12,9 @@ enum CaptureSourceRegistry {
     static let agent = CaptureSourceDescriptor(
         id: "agent", kind: .agent,
         title: "In-process agent",
-        detail: "Inspect one debuggable app in-process — no proxy or CA, with call stacks.",
+        // One chooser row, two transports: the copy has to be true on Android *and* on the
+        // Simulator, where NSURLProtocol never sees WKWebView, background sessions or raw sockets.
+        detail: InterceptTransportID.agentChooserDetail,
         // Offered for a debuggable Android device or any iOS Simulator. Whether the agent is
         // actually built/bundled is checked in the precheck, so a missing agent fails with build
         // instructions instead of silently disappearing from the chooser.
@@ -27,7 +29,8 @@ enum CaptureSourceRegistry {
         },
         make: { ctx -> CaptureSource in
             if ctx.device.platform == .iosSimulator {
-                return IOSSimulatorAgentCaptureSource(device: ctx.device, bundleID: ctx.targetPackage ?? "")
+                return IOSSimulatorAgentCaptureSource(device: ctx.device, bundleID: ctx.targetPackage ?? "",
+                                                      intercept: ctx.intercept)
             }
             return AgentCaptureSource(adbURL: ctx.adbURL, serial: ctx.device.id,
                                       package: ctx.targetPackage ?? "", intercept: ctx.intercept)
@@ -37,7 +40,7 @@ enum CaptureSourceRegistry {
     static let companion = CaptureSourceDescriptor(
         id: "companion", kind: .companion,
         title: "Companion stream",
-        detail: "Receive per-app traffic from the Jaca mobile agent over the network.",
+        detail: InterceptTransportID.companionMetadata.captureDetail,
         isAvailable: { device, _ in device.companionID != nil },
         needsPackage: false,
         make: { ctx in CompanionCaptureSource(device: ctx.device, hub: ctx.companion ?? CompanionHub(), ca: ctx.ca) },

@@ -2,21 +2,17 @@ import Foundation
 
 /// The transport-neutral interception seam.
 ///
-/// Every way Jaca can see an HTTP exchange — the in-process Android agent's divert, the MITM
-/// proxy, the iOS Simulator agent, the companion app — asks the *same* question here:
-/// "given this request, what should happen?". The answer is plain data (`InterceptDecision`),
-/// and one shared `InterceptPipeline` executes it. Nothing in this file knows what adb, okhttp,
-/// TLS or gRPC are, and nothing in it imports SwiftUI.
+/// Every way Jaca can see an HTTP exchange asks the same question here — "given this request,
+/// what should happen?" — and one shared `InterceptPipeline` executes the plain-data answer.
+/// Nothing here knows about adb, okhttp, TLS or gRPC, and nothing imports SwiftUI.
 ///
-/// This is what makes response overrides reusable: adding HTTPS-decryption support later means
-/// calling `pipeline.run(_:capabilities:)` from that transport's forwarding point and declaring
-/// what it can honour — not reimplementing matching, precedence, or degradation.
+/// So a new transport joins by calling `pipeline.run(_:capabilities:)` and declaring what it can
+/// honour, rather than reimplementing matching, precedence, or degradation.
 
 // MARK: - Where interception happens
 
-/// Identifies an *interception point*, which is deliberately not the same thing as a capture
-/// source: the companion app both streams flow metadata (which can't be overridden) and, once
-/// decrypting, forwards through the MITM proxy (which can).
+/// An *interception point*, which isn't the same as a capture source: the companion streams
+/// flow metadata (not overridable) *and*, once decrypting, forwards through the proxy (which is).
 enum InterceptTransportID: Sendable, Hashable {
     case agentDivert(package: String)
     case iosSimulatorDivert(bundleID: String)
@@ -49,8 +45,8 @@ struct InterceptedRequest: Sendable {
     var appID: String?
     var startedAt: Date
 
-    /// Parsed once at construction and reused for every rule, so matching N rules doesn't reparse
-    /// the URL N times. Nil when the "URL" isn't one — companion metadata rows are `"host:port"`.
+    /// Parsed once at construction and reused for every rule. Nil when the "URL" isn't one —
+    /// companion metadata rows are `"host:port"`.
     var facts: URLFacts?
 
     init(id: UUID = UUID(), method: String, url: String, headers: [HeaderPair] = [],
@@ -92,8 +88,8 @@ struct InterceptedResponse: Sendable, Equatable {
 
 // MARK: - Capabilities
 
-/// What an interception point can actually do. The resolver *clamps* its decision to these, so a
-/// rule that can't run somewhere degrades identically everywhere instead of silently doing nothing.
+/// What an interception point can do. The resolver clamps its decision to these, so a rule that
+/// can't run somewhere degrades identically everywhere instead of silently doing nothing.
 struct InterceptCapabilities: OptionSet, Sendable, Hashable {
     let rawValue: Int
     init(rawValue: Int) { self.rawValue = rawValue }
@@ -119,8 +115,8 @@ struct InterceptCapabilities: OptionSet, Sendable, Hashable {
 
 // MARK: - Decision
 
-/// What to do with an intercepted request. Deliberately *data*, never a closure, so it is
-/// `Equatable` and the clamp can be exhaustively unit-tested without running a transport.
+/// What to do with an intercepted request. Data, never a closure, so it's `Equatable` and the
+/// clamp is testable without running a transport.
 enum InterceptAction: Sendable, Equatable {
     case proceed
     case respond(InterceptedResponse)
@@ -171,15 +167,14 @@ enum InterceptSkipReason: Sendable, Equatable {
 
 // MARK: - Protocols
 
-/// **The seam.** Pure and synchronous so it can run on a NIO event loop or the agent's reader
-/// thread with no actor hop. Implementations must be thread-safe and must not mutate anything.
+/// **The seam.** Pure and synchronous, so it runs on a NIO event loop or the agent's reader
+/// thread with no actor hop. Implementations must be thread-safe.
 protocol InterceptResolving: Sendable {
     func resolve(_ request: InterceptedRequest,
                  capabilities: InterceptCapabilities) -> (InterceptDecision, InterceptSkipReason?)
 }
 
-/// Who produces real bytes. `OriginClient` wraps `UpstreamClient`; tests inject a stub, which is
-/// how the whole pipeline is tested with no sockets.
+/// Who produces real bytes. `OriginClient` wraps `UpstreamClient`; tests inject a stub.
 protocol OriginRequesting: Sendable {
     func perform(_ request: InterceptedRequest) async -> InterceptedResponse
 }
@@ -189,24 +184,70 @@ protocol InterceptReporting: Sendable {
     func report(requestID: UUID, appliedRuleID: UUID?, skipped: InterceptSkipReason?)
 }
 
-/// Lets the desktop arm/disarm a device-side transport. This single signature is where any
-/// attempt to teach the device about rules would show up in a diff — see `Divert.kt`.
-protocol InterceptArming: AnyObject, Sendable {
-    func arm(_ endpoint: OverrideEndpoint?)
-}
-
 /// The entire vocabulary the device is ever given: where to send traffic, which hosts, and how
-/// long that permission lasts without being renewed. No patterns, payloads, or statuses.
+/// long that permission lasts. No patterns, payloads, statuses or ordering.
+///
+/// **The tripwire for review:** a field added here is a field the device learned about. Teaching
+/// it a path, method, header, body, status, ordering or rule-id crosses the line that keeps the
+/// agent dumb — and shows up in a diff of this struct.
+///
+/// Twins to keep in sync: `agent/iOS/JacaDivert.m`,
+/// `agent/kotlin/com/squeeze/capture/Divert.kt`. See `docs/divert-contract.md`.
 struct OverrideEndpoint: Sendable, Equatable {
-    var origin: String
-    var hosts: Set<String>
-    var heartbeatSeconds: Int = 15
+    /// `nil` means divert **nothing** — never "divert everything".
+    private(set) var origin: String?
+    private(set) var hosts: Set<String>
+    var heartbeatSeconds: Int
+
+    /// Clears `origin` and `hosts` **together**, so an empty host set can never arm the device
+    /// and an absent origin can never leave a stale host list behind.
+    init(origin: String?, hosts: Set<String>, heartbeatSeconds: Int = 15) {
+        let armed = !(origin ?? "").isEmpty && !hosts.isEmpty
+        self.origin = armed ? origin : nil
+        self.hosts = armed ? hosts : []
+        self.heartbeatSeconds = heartbeatSeconds
+    }
+
+    /// The single spelling of "stop". Carries the heartbeat window so the value survives teardown.
+    static func disarmed(heartbeatSeconds: Int = 15) -> OverrideEndpoint {
+        OverrideEndpoint(origin: nil, hosts: [], heartbeatSeconds: heartbeatSeconds)
+    }
+
+    var isArmed: Bool { origin != nil }
+
+    /// The **only** desktop→device frame in the product. Newline-free (the wire is NDJSON), and
+    /// hosts are sorted so an unchanged rule set frames identically every heartbeat.
+    static func divertFrame(_ endpoint: OverrideEndpoint) -> String {
+        let hostList = endpoint.hosts.sorted().map(quoted).joined(separator: ",")
+        let originJSON = endpoint.origin.map(quoted) ?? "null"
+        return "{\"type\":\"divert\",\"origin\":\(originJSON),\"hosts\":[\(hostList)]," +
+               "\"heartbeatSeconds\":\(endpoint.heartbeatSeconds)}"
+    }
+
+    /// Hosts come from user-authored rules, so a stray quote must not produce an unparsable
+    /// frame.
+    private static func quoted(_ value: String) -> String {
+        var out = "\""
+        for scalar in value.unicodeScalars {
+            switch scalar {
+            case "\"":     out += "\\\""
+            case "\\":     out += "\\\\"
+            case "\n":     out += "\\n"
+            case "\r":     out += "\\r"
+            case "\t":     out += "\\t"
+            default:
+                if scalar.value < 0x20 { out += String(format: "\\u%04x", scalar.value) }
+                else { out.unicodeScalars.append(scalar) }
+            }
+        }
+        return out + "\""
+    }
 }
 
 // MARK: - Pipeline
 
 /// Executes an `InterceptDecision`: resolve → delay → (short-circuit | origin → edit) → report.
-/// One implementation, shared by every transport, so behaviour can't drift between them.
+/// One implementation for every transport, so behaviour can't drift.
 struct InterceptPipeline: Sendable {
     struct Result: Sendable {
         var response: InterceptedResponse
@@ -225,18 +266,16 @@ struct InterceptPipeline: Sendable {
         self.reporter = reporter
     }
 
-    /// A pipeline that never overrides anything — the default, so wiring it into an existing
-    /// transport is behaviour-preserving until a resolver is supplied.
+    /// Never overrides anything, so wiring it in is behaviour-preserving until a resolver
+    /// is supplied.
     static let passthrough = InterceptPipeline()
 
     /// What to do when no rule applies.
     enum UnmatchedPolicy: Sendable, Equatable {
-        /// Fetch the real response and return it — correct for the MITM proxy, which *is* the
-        /// only path the request has.
+        /// Fetch the real response — correct for the MITM proxy, the request's only path.
         case fetchFromOrigin
-        /// Don't touch the network: report that nothing applied and let the caller hand the
-        /// request back to the device. Correct for divert, where the device will send it itself —
-        /// fetching here as well would execute every unmatched request **twice**.
+        /// Hand the request back to the device instead. Correct for divert: the device sends it
+        /// itself, so fetching here too would execute every unmatched request **twice**.
         case handBack
     }
 
@@ -252,8 +291,7 @@ struct InterceptPipeline: Sendable {
 
         switch decision.action {
         case .respond(var canned):
-            // Synthesized: it never hit the network, so responseStart stays nil and the UI can
-            // honestly show no time-to-first-byte.
+            // Synthesized: never hit the network, so no time-to-first-byte to show.
             canned.responseEnd = Date()
             reporter?.report(requestID: request.id, appliedRuleID: decision.ruleID, skipped: nil)
             return Result(response: stamp(canned, ruleID: decision.ruleID),
@@ -285,8 +323,8 @@ struct InterceptPipeline: Sendable {
         return await origin.perform(request)
     }
 
-    /// Marks a response as ours so capture can badge the row without guessing. Kept out of the
-    /// Headers tab and out of HAR exports by the UI layer.
+    /// Marks a response as ours so capture can badge the row. Hidden from the Headers tab and
+    /// HAR exports by the UI layer.
     private func stamp(_ response: InterceptedResponse, ruleID: UUID?) -> InterceptedResponse {
         guard let ruleID else { return response }
         var out = response

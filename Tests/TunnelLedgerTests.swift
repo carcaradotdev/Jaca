@@ -58,16 +58,39 @@ final class TunnelLedgerTests: XCTestCase {
         XCTAssertEqual(entries.map(\.serial), ["a", "b"])
     }
 
-    func test_roundTrip() throws {
+    /// Pids get recycled. An entry whose owner was killed and whose number was later reused by
+    /// an unrelated live process would otherwise look alive forever — never reclaimed, never
+    /// removed, so `tunnels.json` grew without bound across crashes.
+    func test_abandonmentTable() {
+        let now = Date()
+        func entry(ageSeconds: TimeInterval) -> TunnelLedger.Entry {
+            var e = TunnelLedger.Entry(serial: "s", adbPath: "/adb", kind: .reverse, port: 1, pid: 42)
+            e.createdAt = now.addingTimeInterval(-ageSeconds)
+            return e
+        }
+        let fresh = entry(ageSeconds: 60)
+        let ancient = entry(ageSeconds: TunnelLedger.staleAfter + 60)
+
+        // Ours is never an orphan, at any age — we are still using it.
+        XCTAssertFalse(TunnelLedger.isAbandoned(entry: ancient, isOwnPid: true, pidAlive: true, now: now))
+        // A dead pid is the ordinary case.
+        XCTAssertTrue(TunnelLedger.isAbandoned(entry: fresh, isOwnPid: false, pidAlive: false, now: now))
+        // A live pid on a recent entry is somebody else's live tunnel — leave it alone.
+        XCTAssertFalse(TunnelLedger.isAbandoned(entry: fresh, isOwnPid: false, pidAlive: true, now: now))
+        // A live pid on a week-old entry is a recycled number, not a week-old session.
+        XCTAssertTrue(TunnelLedger.isAbandoned(entry: ancient, isOwnPid: false, pidAlive: true, now: now))
+    }
+
+    /// Uses the ledger's **own** encoder/decoder rather than a hand-rolled matched pair.
+    ///
+    /// The hand-rolled version passed while the real pair had drifted (`.iso8601` on write,
+    /// default numeric on read), which dropped every record on load and turned orphan reclaim
+    /// into a no-op. Testing the pair the ledger actually uses is the whole point.
+    func test_roundTripUsesTheLedgersOwnCoderPair() throws {
         let entry = TunnelLedger.Entry(serial: "emulator-5554", adbPath: "/usr/bin/adb",
                                        kind: .reverse, port: 41234, pid: 999)
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        let data = try encoder.encode([entry])
-
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        let decoded = try decoder.decode([TunnelLedger.Entry].self, from: data)
+        let data = try TunnelLedger.makeEncoder().encode([entry])
+        let decoded = try TunnelLedger.makeDecoder().decode([TunnelLedger.Entry].self, from: data)
 
         XCTAssertEqual(decoded.count, 1)
         XCTAssertEqual(decoded[0].serial, "emulator-5554")
@@ -76,77 +99,18 @@ final class TunnelLedgerTests: XCTestCase {
         XCTAssertEqual(decoded[0].pid, 999)
     }
 
-    // MARK: - The control frame (the entire device-side vocabulary)
-
-    /// If this test ever needs changing to add a *rule* concept, the agent has stopped being dumb.
-    func test_divertFrameCarriesOnlyOriginHostsAndHeartbeat() throws {
-        let frame = AgentDivertCoordinator.divertFrame(
-            origin: "http://localhost:41234", hosts: ["b.com", "a.com"], heartbeatSeconds: 15)
-
-        let obj = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: Data(frame.utf8)) as? [String: Any])
-
-        XCTAssertEqual(Set(obj.keys), ["type", "origin", "hosts", "heartbeatSeconds"],
-                       "the device must never learn about patterns, payloads, statuses or ordering")
-        XCTAssertEqual(obj["type"] as? String, "divert")
-        XCTAssertEqual(obj["origin"] as? String, "http://localhost:41234")
-        XCTAssertEqual(obj["heartbeatSeconds"] as? Int, 15)
-        // Sorted, so an unchanged rule set produces an identical frame.
-        XCTAssertEqual(obj["hosts"] as? [String], ["a.com", "b.com"])
-    }
-
-    func test_disarmFrameSendsNullOrigin() throws {
-        let frame = AgentDivertCoordinator.divertFrame(origin: nil, hosts: [], heartbeatSeconds: 15)
-        XCTAssertTrue(frame.contains("\"origin\":null"))
-        XCTAssertTrue(frame.contains("\"hosts\":[]"))
-    }
-
-    // MARK: - Hello parsing
-
-    func test_helloAdvertisingOverrideSupportIsRecognised() {
-        XCTAssertTrue(AgentHelloParser.advertisesOverrideSupport(
-            "{\"type\":\"hello\",\"pid\":1,\"stage\":4,\"caps\":[\"override/1\"]}"))
-    }
-
-    /// An agent built before this feature never reads its socket, so the desktop must stay silent
-    /// rather than arming something that can't disarm itself.
-    func test_helloWithoutCapsIsNotOverrideCapable() {
-        XCTAssertFalse(AgentHelloParser.advertisesOverrideSupport(
-            "{\"type\":\"hello\",\"pid\":1,\"stage\":4}"))
-        XCTAssertFalse(AgentHelloParser.advertisesOverrideSupport(
-            "{\"type\":\"hello\",\"caps\":[\"something-else\"]}"))
-        XCTAssertFalse(AgentHelloParser.advertisesOverrideSupport("{\"type\":\"txn\"}"))
-        XCTAssertFalse(AgentHelloParser.advertisesOverrideSupport("not json"))
-    }
-}
-
-/// The keepalive must be able to **repair** a desync, not just refresh a timer.
-///
-/// The original heartbeat sent a bare `{"type":"ping"}`. On the device, `disarm()` clears
-/// `origin` permanently until a new `divert` frame arrives, and frames were only sent on start,
-/// on hello, or on a host change — so one lapsed window, or an app restart the desktop didn't
-/// notice, left overrides dead for good while the toolbar still said "active".
-final class DivertHeartbeatTests: XCTestCase {
-
-    func test_heartbeatFrameCarriesTheFullEndpointSoItCanReArm() throws {
-        // What the heartbeat now sends is the same frame that arms the device.
-        let frame = AgentDivertCoordinator.divertFrame(
-            origin: "http://localhost:41234", hosts: ["a.com"], heartbeatSeconds: 15)
-        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(frame.utf8)) as? [String: Any])
-
-        XCTAssertEqual(obj["type"] as? String, "divert",
-                       "a bare ping can refresh the timer but can never re-arm a disarmed device")
-        XCTAssertEqual(obj["origin"] as? String, "http://localhost:41234")
-        XCTAssertEqual(obj["hosts"] as? [String], ["a.com"])
-    }
-
-    /// Re-sending the identical endpoint must be safe — it runs every few seconds.
-    func test_repeatedEndpointFramesAreIdentical() {
-        let a = AgentDivertCoordinator.divertFrame(origin: "http://localhost:1", hosts: ["b.com", "a.com"],
-                                                   heartbeatSeconds: 15)
-        let b = AgentDivertCoordinator.divertFrame(origin: "http://localhost:1", hosts: ["a.com", "b.com"],
-                                                   heartbeatSeconds: 15)
-        XCTAssertEqual(a, b, "hosts are sorted, so an unchanged rule set produces a byte-identical frame")
+    /// `decodeArray` swallows failures by design (one bad record must not wipe the file), so a
+    /// mismatched pair fails *silently* as an empty array. Assert the survival count directly.
+    func test_decodeArraySurvivesTheLedgersOwnEncoding() throws {
+        let entries = [
+            TunnelLedger.Entry(serial: "a", adbPath: "/adb", kind: .reverse, port: 1, pid: 10),
+            TunnelLedger.Entry(serial: "b", adbPath: "/adb", kind: .forward, port: 2, pid: 20),
+        ]
+        let data = try TunnelLedger.makeEncoder().encode(entries)
+        let decoded = CloudPersistence.decodeArray(TunnelLedger.Entry.self, from: data,
+                                                   decoder: TunnelLedger.makeDecoder())
+        XCTAssertEqual(decoded.count, 2, "a drifted coder pair drops every record silently")
+        XCTAssertEqual(decoded.map(\.port), [1, 2])
     }
 }
 

@@ -49,19 +49,15 @@ enum SimulatorConsoleParser {
 final class SimulatorConsoleLogSource: LogSource {
     private let udid: String
     private let bundleID: String
-    private let process: StreamingProcess
+    private let key: SimulatorAppLauncher.Key
     private let lock = NSLock()
+    private var process: StreamingProcess?
     private var continuation: AsyncStream<LogLine>.Continuation?
 
     init(udid: String, bundleID: String) {
         self.udid = udid
         self.bundleID = bundleID
-        self.process = StreamingProcess(
-            executable: AppleToolchain.xcrun,
-            arguments: ["simctl", "launch", "--console-pty",
-                        "--terminate-running-process", udid, bundleID],
-            environment: AppleToolchain.environment()
-        )
+        self.key = SimulatorAppLauncher.Key(udid: udid, bundleID: bundleID)
     }
 
     func start() throws -> AsyncStream<LogLine> {
@@ -70,6 +66,18 @@ final class SimulatorConsoleLogSource: LogSource {
         var cont: AsyncStream<LogLine>.Continuation!
         let out = AsyncStream<LogLine> { cont = $0 }
         lock.lock(); continuation = cont; lock.unlock()
+
+        // `--terminate-running-process` means this launch decides what the app comes back with,
+        // so carrying the Network tab's claimed `SIMCTL_CHILD_*` brings the injected agent back
+        // instead of evicting it. Read here, not in `init`, so a later claim still counts.
+        let process = StreamingProcess(
+            executable: AppleToolchain.xcrun,
+            arguments: ["simctl", "launch", "--console-pty",
+                        "--terminate-running-process", udid, bundleID],
+            environment: SimulatorAgentLaunch.launchEnvironment(
+                childEnvironment: SimulatorAppLauncher.shared.environment(for: key))
+        )
+        lock.lock(); self.process = process; lock.unlock()
 
         let stdoutLines: AsyncStream<String>
         do {
@@ -82,6 +90,9 @@ final class SimulatorConsoleLogSource: LogSource {
             cont.finish()
             throw error
         }
+        // We launched the app ourselves; the re-attach watchdog reads this to tell an
+        // intentional relaunch from an app the user reopened outside Jaca.
+        SimulatorAppLauncher.shared.noteExternalLaunch(key)
 
         let task = Task { [weak self] in
             for await raw in stdoutLines { self?.emit(raw, isStderr: false) }
@@ -94,7 +105,10 @@ final class SimulatorConsoleLogSource: LogSource {
         return out
     }
 
-    func stop() { process.stop() }
+    func stop() {
+        lock.lock(); let p = process; lock.unlock()
+        p?.stop()
+    }
 
     private func emit(_ raw: String, isStderr: Bool) {
         guard let line = SimulatorConsoleParser.parse(raw, isStderr: isStderr) else { return }

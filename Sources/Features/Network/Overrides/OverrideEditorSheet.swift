@@ -1,45 +1,56 @@
 import SwiftUI
 import Lemonade
 
-/// Create/edit one override rule.
-///
-/// Seeded from a captured transaction when you right-click a row, or blank from the toolbar.
-/// The live match preview at the bottom is the control that makes glob syntax learnable: it
-/// answers "what does this pattern actually match?" while you type, against the requests already
-/// captured in this tab.
+/// Create/edit one override rule — seeded from a captured transaction on right-click, or blank
+/// from the toolbar. The live match preview at the bottom answers "what does this pattern
+/// actually match?" while you type, which is what makes glob syntax learnable.
 struct OverrideEditorSheet: View {
     @Environment(\.dismiss) private var dismiss
+
+    /// One editable header row. `HeaderPair` can't identify one: its `id` is `name + ":" + value`,
+    /// which changes per keystroke and collides for blank rows. Keying on the array offset was
+    /// worse — `TextField` bindings capture it, so a removal left closures indexing out of bounds.
+    private struct HeaderRow: Identifiable {
+        let id = UUID()
+        var name: String
+        var value: String
+    }
 
     @State private var draft: OverrideRule
     @State private var bodyText: String
     @State private var statusText: String
     @State private var delayText: String
-    @State private var headers: [HeaderPair]
+    @State private var headers: [HeaderRow]
+    @State private var showHeaders: Bool
+    @State private var bodyStatus = BodyStatus()
 
     let session: NetworkSession
     let overrides: OverridesModel
+    /// Set when this rule was seeded from a captured response that it can't reproduce exactly.
+    let seedWarning: String?
     let onSave: (OverrideRule) -> Void
 
     private let isNew: Bool
 
     init(rule: OverrideRule, session: NetworkSession, overrides: OverridesModel,
-         isNew: Bool = false, onSave: @escaping (OverrideRule) -> Void) {
+         isNew: Bool = false, seedWarning: String? = nil,
+         onSave: @escaping (OverrideRule) -> Void) {
         _draft = State(initialValue: rule)
         self.session = session
         self.overrides = overrides
+        self.seedWarning = seedWarning
         self.isNew = isNew
         self.onSave = onSave
 
         switch rule.action {
         case .respond(let spec):
             _statusText = State(initialValue: String(spec.statusCode))
-            _headers = State(initialValue: spec.headers)
+            _headers = State(initialValue: spec.headers.map { HeaderRow(name: $0.name, value: $0.value) })
             _bodyText = State(initialValue: Self.text(of: spec.body))
         case .editResponse(let edit):
-            // Empty means "keep the origin's status". Pre-filling 200 would silently turn that
-            // into a hard-coded 200 on the next save.
+            // Empty means "keep the origin's status"; pre-filling 200 would hard-code it.
             _statusText = State(initialValue: edit.statusCode.map(String.init) ?? "")
-            _headers = State(initialValue: edit.headers)
+            _headers = State(initialValue: edit.headers.map { HeaderRow(name: $0.name, value: $0.value) })
             _bodyText = State(initialValue: edit.body.map(Self.text(of:)) ?? "")
         case .mapRemote:
             _statusText = State(initialValue: "200")
@@ -47,6 +58,12 @@ struct OverrideEditorSheet: View {
             _bodyText = State(initialValue: "")
         }
         _delayText = State(initialValue: String(rule.delayMillis))
+        // Expanded only when there's something to see — a rule with no headers opens compact.
+        switch rule.action {
+        case .respond(let spec): _showHeaders = State(initialValue: !spec.headers.isEmpty)
+        case .editResponse(let edit): _showHeaders = State(initialValue: !edit.headers.isEmpty)
+        case .mapRemote: _showHeaders = State(initialValue: false)
+        }
     }
 
     var body: some View {
@@ -71,6 +88,7 @@ struct OverrideEditorSheet: View {
             Divider().overlay(LemonadeTheme.colors.border.borderNeutralLow)
             footer
         }
+        .onAppear { bodyStatus = Self.status(of: bodyText) }
         .padding(LemonadeTheme.spaces.spacing600)
         .frame(width: 720, height: 640)
         .background(LemonadeTheme.colors.background.bgDefault)
@@ -137,8 +155,6 @@ struct OverrideEditorSheet: View {
             if draft.matcher.kind == .glob {
                 HStack(spacing: LemonadeTheme.spaces.spacing200) {
                     if canGeneralize {
-                        // `onChipClicked:` explicitly: a bare trailing closure backward-matches
-                        // `onTrailingIconClick`, which lands on a zero-size button — an inert chip.
                         LemonadeUi.Chip(label: "Generalize", selected: false, leadingIcon: .lightning,
                                         onChipClicked: {
                             withAnimation(.easeInOut(duration: 0.2)) {
@@ -157,9 +173,7 @@ struct OverrideEditorSheet: View {
 
             // Only asked for when the pattern doesn't name a host — we never route "everything".
             if needsExplicitHosts {
-                LemonadeUi.Notice(
-                    content: "This pattern doesn't name a host. Tell Jaca which hosts to route through your Mac — only these leave the device's own network.",
-                    voice: .warning)
+                LemonadeUi.Notice(content: transport.hostsNotice, voice: .warning)
                 LemonadeUi.TextField(input: divertHostsBinding,
                                      label: "Hosts to route",
                                      placeholderText: "api.example.com, auth.example.com")
@@ -192,9 +206,8 @@ struct OverrideEditorSheet: View {
                     if index == 0 {
                         draft.action = .respond(currentResponseSpec())
                     } else {
-                        // Default to .merge when converting from "Don't send": .replace would
-                        // drop every header the real response carries, which is never what
-                        // someone switching to "Send and override" means.
+                        // .merge when converting from "Don't send": .replace would drop every
+                        // header the real response carries.
                         var edit = currentEdit()
                         if case .editResponse = draft.action {} else { edit.headerMode = .merge }
                         draft.action = .editResponse(edit)
@@ -203,23 +216,34 @@ struct OverrideEditorSheet: View {
             )
             .frame(width: 320)
 
-            LemonadeUi.Text(isRespond
-                ? "The request never leaves the device. Jaca answers it."
-                : "Jaca fetches this URL from your Mac, not from the device. Origins reachable only from the device won't work.",
-                textStyle: LemonadeTypography.shared.bodyXSmallRegular,
-                color: isRespond ? LemonadeTheme.colors.content.contentTertiary
-                                 : LemonadeTheme.colors.content.contentCaution,
-                maxLines: 3)
+            // "Send and override" fetches from the Mac, which only matters when the Mac and the
+            // device are on different networks — so the transport writes the caution, and the
+            // Simulator has none.
+            if !actionExplainer.isEmpty {
+                LemonadeUi.Text(actionExplainer,
+                                textStyle: LemonadeTypography.shared.bodyXSmallRegular,
+                                color: isRespond ? LemonadeTheme.colors.content.contentTertiary
+                                                 : LemonadeTheme.colors.content.contentCaution,
+                                maxLines: 3)
+                    .transition(.opacity)
+            }
 
             if draft.matcher.kind == .regex {
                 LemonadeUi.Notice(content: regexTransportWarning, voice: .info)
             }
         }
+        // The caution can appear and disappear, so it fades rather than snapping the section
+        // taller — same 0.2s easeInOut as the chips above.
+        .animation(.easeInOut(duration: 0.2), value: isRespond)
     }
 
     private var responseSection: some View {
         VStack(alignment: .leading, spacing: LemonadeTheme.spaces.spacing200) {
             sectionTitle("Response")
+
+            if let seedWarning {
+                LemonadeUi.Notice(content: seedWarning, voice: .warning)
+            }
 
             HStack(spacing: LemonadeTheme.spaces.spacing200) {
                 LemonadeUi.TextField(input: $statusText, label: "Status")
@@ -243,49 +267,81 @@ struct OverrideEditorSheet: View {
     private var headerEditor: some View {
         VStack(alignment: .leading, spacing: LemonadeTheme.spaces.spacing100) {
             HStack {
-                LemonadeUi.Text("Headers", textStyle: LemonadeTypography.shared.bodyXSmallMedium,
-                                color: LemonadeTheme.colors.content.contentSecondary)
+                // Most rules only touch status and body; the count keeps hidden headers visible.
+                Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showHeaders.toggle() } }) {
+                    HStack(spacing: 5) {
+                        LemonadeUi.Icon(icon: .chevronRight, contentDescription: nil, size: .small,
+                                        tint: LemonadeTheme.colors.content.contentTertiary)
+                            .rotationEffect(.degrees(showHeaders ? 90 : 0))
+                        LemonadeUi.Text(headersLabel,
+                                        textStyle: LemonadeTypography.shared.bodyXSmallMedium,
+                                        color: LemonadeTheme.colors.content.contentSecondary)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(showHeaders ? "Hide headers" : "Show headers")
+
                 Spacer()
-                // Merge only means something when there's a real response to merge into, so the
-                // coupling is enforced here rather than left as a lie in the semantics.
-                LemonadeUi.SegmentedControl(
-                    properties: [.label("Replace"), .label("Merge")],
-                    selectedTab: headerMode == .replace ? 0 : 1,
-                    size: .small,
-                    onTabSelected: { index in
-                        guard !isRespond || index == 0 else { return }
-                        setHeaderMode(index == 0 ? .replace : .merge)
-                    }
-                )
-                .frame(width: 180)
-                .opacity(isRespond ? 0.5 : 1)
-                .help(isRespond ? "Merge needs the real response — choose “Send and override”." : "")
 
-                LemonadeUi.IconButton(icon: .plus, contentDescription: "Add header") {
-                    headers.append(HeaderPair(name: "", value: ""))
-                }
-            }
+                if showHeaders {
+                    // Merge only means something when there's a real response to merge into.
+                    LemonadeUi.SegmentedControl(
+                        properties: [.label("Replace"), .label("Merge")],
+                        selectedTab: headerMode == .replace ? 0 : 1,
+                        size: .small,
+                        onTabSelected: { index in
+                            guard !isRespond || index == 0 else { return }
+                            setHeaderMode(index == 0 ? .replace : .merge)
+                        }
+                    )
+                    .frame(width: 180)
+                    .opacity(isRespond ? 0.5 : 1)
+                    .help(isRespond ? "Merge needs the real response — choose “Send and override”." : "")
 
-            ForEach(Array(headers.enumerated()), id: \.offset) { index, pair in
-                HStack(spacing: LemonadeTheme.spaces.spacing100) {
-                    TextField("Name", text: Binding(
-                        get: { headers[index].name },
-                        set: { headers[index] = HeaderPair(name: $0, value: headers[index].value) }))
-                        .textFieldStyle(.roundedBorder).font(LogLevelStyle.mono(11))
-                    TextField("Value", text: Binding(
-                        get: { headers[index].value },
-                        set: { headers[index] = HeaderPair(name: headers[index].name, value: $0) }))
-                        .textFieldStyle(.roundedBorder).font(LogLevelStyle.mono(11))
-                    LemonadeUi.IconButton(icon: .circleX, contentDescription: "Remove header") {
-                        headers.remove(at: index)
+                    LemonadeUi.IconButton(icon: .plus, contentDescription: "Add header") {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            headers.append(HeaderRow(name: "", value: ""))
+                        }
                     }
                 }
             }
 
-            LemonadeUi.Text("Content-Length and Content-Encoding are managed by Jaca.",
-                            textStyle: LemonadeTypography.shared.bodyXSmallRegular,
-                            color: LemonadeTheme.colors.content.contentTertiary)
+            if showHeaders {
+                ForEach($headers) { $row in
+                    HStack(spacing: LemonadeTheme.spaces.spacing100) {
+                        TextField("Name", text: $row.name)
+                            .textFieldStyle(.roundedBorder).font(LogLevelStyle.mono(11))
+                            .autocorrectionDisabled(true)
+                        TextField("Value", text: $row.value)
+                            .textFieldStyle(.roundedBorder).font(LogLevelStyle.mono(11))
+                            .autocorrectionDisabled(true)
+                        LemonadeUi.IconButton(icon: .circleX, contentDescription: "Remove header") {
+                            let id = row.id
+                            withAnimation(.easeInOut(duration: 0.15)) {
+                                headers.removeAll { $0.id == id }
+                            }
+                        }
+                    }
+                    .transition(.opacity)
+                }
+
+                LemonadeUi.Text("Content-Length and Content-Encoding are managed by Jaca.",
+                                textStyle: LemonadeTypography.shared.bodyXSmallRegular,
+                                color: LemonadeTheme.colors.content.contentTertiary)
+            }
         }
+        .animation(.easeInOut(duration: 0.2), value: showHeaders)
+    }
+
+    /// The rows as the rule stores them — nameless rows are drafts, not headers.
+    private var headerPairs: [HeaderPair] {
+        headers.filter { !$0.name.isEmpty }.map { HeaderPair(name: $0.name, value: $0.value) }
+    }
+
+    private var headersLabel: String {
+        let named = headers.filter { !$0.name.isEmpty }.count
+        return named == 0 ? "Headers" : "Headers (\(named))"
     }
 
     private var bodyEditor: some View {
@@ -297,12 +353,14 @@ struct OverrideEditorSheet: View {
                 LemonadeUi.Button(label: "Format", onClick: formatBody,
                                   variant: .neutral, type: .subtle, size: .small)
             }
-            // Not `TextEditor`: it inherits AppKit's automatic substitutions, so typing `"`
-            // yields a curly quote and silently breaks the JSON body.
             PlainCodeEditor(text: $bodyText)
-                .font(LogLevelStyle.mono(11))
                 .frame(height: 140)
-                .padding(4)
+                .task(id: bodyText) {
+                    // Debounced: typing shouldn't pay for a full parse per character.
+                    try? await Task.sleep(for: .milliseconds(200))
+                    guard !Task.isCancelled else { return }
+                    bodyStatus = Self.status(of: bodyText)
+                }
                 .background(RoundedRectangle(cornerRadius: LemonadeTheme.radius.radius150)
                     .fill(LemonadeTheme.colors.background.bgNeutralSubtle))
                 .overlay(RoundedRectangle(cornerRadius: LemonadeTheme.radius.radius150)
@@ -335,8 +393,8 @@ struct OverrideEditorSheet: View {
         OverrideMatching.generalize(draft.matcher.pattern) != draft.matcher.pattern
     }
 
-    /// A glob whose host is wildcarded (or any regex) can't tell us what to route, so the editor
-    /// has to ask. Empty here means Save is blocked — never "route everything".
+    /// A wildcarded host (or any regex) can't tell us what to route, so the editor asks. Empty
+    /// blocks Save — never "route everything".
     private var needsExplicitHosts: Bool {
         !draft.matcher.pattern.isEmpty
             && OverrideCompiler.derivedDivertHosts(for: draft.matcher).isEmpty
@@ -357,6 +415,14 @@ struct OverrideEditorSheet: View {
         }
     }
 
+    /// The interception point this tab captures through; keys every platform-specific sentence.
+    private var transport: InterceptTransportID { session.interceptTransport }
+
+    private var actionExplainer: String {
+        isRespond ? "The request never leaves the device. Jaca answers it."
+                  : transport.originExplainer
+    }
+
     private var regexTransportWarning: String {
         "Regex matching runs on your Mac. It applies wherever Jaca terminates the request — "
         + "in-process agent capture and HTTPS decryption — but a rule still needs a host to route."
@@ -373,17 +439,29 @@ struct OverrideEditorSheet: View {
         return nil
     }
 
-    private var bodyIsValidJSON: Bool {
-        let trimmed = bodyText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return true }
-        return (try? JSONSerialization.jsonObject(with: Data(trimmed.utf8))) != nil
-    }
+    /// Recomputed off the keystroke path — see `bodyStatus`.
+    private var bodyIsValidJSON: Bool { bodyStatus.isValidJSON }
 
     private var bodyStatusText: String {
-        let bytes = Data(bodyText.utf8).count
-        let size = NetworkFormatting.size(bytes)
-        if bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Empty body" }
-        return bodyIsValidJSON ? "Valid JSON · \(size)" : "Not valid JSON · \(size) — saved anyway"
+        if bodyStatus.isEmpty { return "Empty body" }
+        let size = NetworkFormatting.size(bodyStatus.byteCount)
+        return bodyStatus.isValidJSON ? "Valid JSON · \(size)"
+                                      : "Not valid JSON · \(size) — saved anyway"
+    }
+
+    /// Parses `bodyText` and measures it. Kept out of `body`, where every keystroke re-parsed the
+    /// whole document on the main thread — the status line is advisory, so it can lag the caret.
+    static func status(of text: String) -> BodyStatus {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return BodyStatus(isEmpty: true, isValidJSON: true, byteCount: 0) }
+        let valid = (try? JSONSerialization.jsonObject(with: Data(trimmed.utf8))) != nil
+        return BodyStatus(isEmpty: false, isValidJSON: valid, byteCount: Data(text.utf8).count)
+    }
+
+    struct BodyStatus: Equatable {
+        var isEmpty = true
+        var isValidJSON = true
+        var byteCount = 0
     }
 
     private var divertHostsBinding: Binding<String> {
@@ -399,8 +477,7 @@ struct OverrideEditorSheet: View {
 
     // MARK: - Actions
 
-    /// Keeps the routed-host set in step with a pattern that names a literal host, so the common
-    /// case needs no extra input from the user.
+    /// Keeps the routed-host set in step with a pattern that names a literal host.
     private func syncDivertHosts() {
         let derived = OverrideCompiler.derivedDivertHosts(for: draft.matcher)
         if !derived.isEmpty { draft.divertHosts = derived }
@@ -417,19 +494,17 @@ struct OverrideEditorSheet: View {
 
     private func currentResponseSpec() -> OverrideResponseSpec {
         OverrideResponseSpec(statusCode: Int(statusText) ?? 200,
-                             headers: headers.filter { !$0.name.isEmpty },
+                             headers: headerPairs,
                              body: OverrideRuleStore.makeBodyRef(Data(bodyText.utf8)))
     }
 
-    /// Rebuilds the edit from the form **without losing fields the form doesn't show**.
-    ///
-    /// `removeHeaders` has no UI yet, so it must be carried over from the existing rule rather
-    /// than reconstructed from scratch — otherwise opening and saving a rule silently discards it.
+    /// Rebuilds the edit from the form **without losing fields the form doesn't show**:
+    /// `removeHeaders` has no UI yet, so opening and saving would otherwise discard it.
     private func currentEdit() -> ResponseEdit {
         var edit: ResponseEdit
         if case .editResponse(let existing) = draft.action { edit = existing } else { edit = ResponseEdit() }
         edit.headerMode = headerMode
-        edit.headers = headers.filter { !$0.name.isEmpty }
+        edit.headers = headerPairs
         // An empty status field means "keep the origin's status" (the field is optional), not 200.
         edit.statusCode = statusText.trimmingCharacters(in: .whitespaces).isEmpty ? nil : Int(statusText)
         edit.body = bodyText.isEmpty ? nil : OverrideRuleStore.makeBodyRef(Data(bodyText.utf8))

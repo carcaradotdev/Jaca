@@ -21,7 +21,7 @@ final class AppModel {
     /// (Settings). When off, the companion subsystem is never started and network inspection
     /// offers only Agent mode (per-app, in-process, no CA). Persisted across launches.
     /// Response overrides (answer a matched request from a rule instead of the origin). Off by
-    /// default: arming it routes the rules' hosts through the Mac over an adb tunnel.
+    /// default: arming it routes the rules' hosts through the Mac.
     var responseOverridesEnabled: Bool = FeatureFlags.responseOverridesEnabled {
         didSet {
             guard responseOverridesEnabled != oldValue else { return }
@@ -42,9 +42,8 @@ final class AppModel {
     /// folders, their worktrees, and per-checkout cache cleanup.
     let projects = ProjectsModel()
 
-    /// The single source of truth for response-override rules — the global library, the master
-    /// switch, live hit counts and per-transport arming state. Read by every `NetworkSession`
-    /// and by all the override UI, so two tabs can never disagree about what is mocked.
+    /// The single source of truth for response-override rules, read by every `NetworkSession` and
+    /// all the override UI, so two tabs can never disagree about what is mocked.
     let overrides = OverridesModel()
 
     /// The Gradle daemons area state (lists/kills running Gradle daemons).
@@ -198,11 +197,8 @@ final class AppModel {
         recomputeDevices()
     }
 
-    /// Re-arm (or disarm) running captures when the flag toggles at runtime.
-    ///
-    /// A session wires its intercept services once, in `makeContext()` at launch, so flipping the
-    /// flag mid-capture would otherwise leave the tab permanently un-armed while the toolbar
-    /// claimed overrides were active. Restarting the affected sources re-runs `makeContext()`.
+    /// Re-arm (or disarm) running captures when the flag toggles at runtime. A session wires its
+    /// intercept services once in `makeContext()`, so only a restart re-runs it.
     private func reconfigureOverrides() {
         for session in sessions.compactMap({ $0 as? NetworkSession }) where session.isRunning {
             session.restartForInterceptChange()

@@ -13,7 +13,9 @@ import android.os.SystemClock
  *
  * **The tripwire for review:** any change that adds a path, method, header, body, status, ordering
  * or rule-id concept to this file has crossed the line that keeps the agent dumb. The desktop-side
- * `InterceptArming.arm(_:)` is the single signature where such a change would show up in a diff.
+ * `OverrideEndpoint` (Sources/Core/Intercept/Intercept.swift) is the single type where such a
+ * change would show up in a diff — it is the only producer of the frame this object consumes.
+ * The cross-language contract both sides implement is written down in `docs/divert-contract.md`.
  *
  * [origin] starts `null`, so a freshly attached agent is **read-only by construction**, not by a
  * compile-time flag. (Its predecessor, `PocDivert`, shipped with `ENABLED = true` hard-coded — a

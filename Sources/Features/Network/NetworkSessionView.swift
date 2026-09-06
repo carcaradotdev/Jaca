@@ -10,8 +10,7 @@ struct NetworkSessionView: View {
     @State private var showCAInstall = false
     @State private var showCompanionCA = false
     @State private var searchText = ""
-    /// The rule being created/edited from the row context menu. The draft carries whether this
-    /// is a new rule, so add-vs-update can't disagree with what's on screen.
+    /// The rule being created/edited from the row context menu; the draft carries add-vs-update.
     @State private var editingOverride: OverrideDraft?
 
     var body: some View {
@@ -27,6 +26,9 @@ struct NetworkSessionView: View {
                     .help("Open HTTPS decryption setup")
                 divider
             }
+            // Above the content, so a tab that silently stopped capturing says so where the user
+            // is already looking.
+            AgentAttachBanner(session: session)
             if showCaptureChooser {
                 captureChooser
             } else {
@@ -79,6 +81,7 @@ struct NetworkSessionView: View {
             if let overrides = session.overrides {
                 OverrideEditorSheet(
                     rule: draft.rule, session: session, overrides: overrides, isNew: draft.isNew,
+                    seedWarning: draft.seedWarning,
                     onSave: { saved in
                         withAnimation(.easeInOut(duration: 0.28)) { overrides.save(saved) }
                     }
@@ -353,7 +356,7 @@ struct NetworkSessionView: View {
     // MARK: - Response overrides
 
     /// The row context menu. Items that can't work stay **visible and disabled** with a reason —
-    /// a hidden item teaches the user nothing about why the feature isn't available here.
+    /// a hidden item teaches nothing about why.
     @ViewBuilder
     private func rowMenu(for txn: NetworkTransaction) -> some View {
         let blocked = overrideUnavailableReason(for: txn)
@@ -399,48 +402,27 @@ struct NetworkSessionView: View {
         }
     }
 
-    /// Why this row can't be overridden, or nil when it can.
+    /// Why this row can't be overridden, or nil. The decision is pure and unit-tested
+    /// (`OverrideRowGate`); the view only supplies the state.
     private func overrideUnavailableReason(for txn: NetworkTransaction) -> String? {
-        guard session.overrides != nil else { return "Response overrides aren't available." }
-        guard FeatureFlags.responseOverridesEnabled else {
-            return "Turn on Response overrides in Settings first."
-        }
-        // Companion flow-metadata rows are "host:port", not HTTP requests.
-        if OverrideMatching.facts(url: txn.url) == nil {
-            return "This row is flow metadata, not an HTTP request."
-        }
-        if session.captureMode == .companion {
-            return "Overrides apply to in-process agent capture. Companion capture will follow."
-        }
-        // The agent can only divert okhttp3 calls. `httpStack` is the only reliable signal —
-        // `callStack` deliberately strips okhttp frames, so testing it here disabled every row.
-        // Nil means "unknown" (older agent, or proxy capture), and must never block authoring.
-        if let stack = txn.httpStack, stack != "okhttp3" {
-            return "This request came from \(Self.stackLabel(stack)), not okhttp3 — Jaca can't divert it."
-        }
-        return nil
+        OverrideRowGate.unavailableReason(transport: session.interceptTransport,
+                                          arming: armingState,
+                                          hasRunningSource: session.hasRunningSource,
+                                          overridesAvailable: session.overrides != nil,
+                                          featureEnabled: FeatureFlags.responseOverridesEnabled,
+                                          url: txn.url,
+                                          httpStack: txn.httpStack)
     }
 
-    /// This tab's divert arming state, or `.idle` when it isn't an agent tab.
-    private var armingState: AgentDivertCoordinator.State {
-        guard let overrides = session.overrides, let target = session.interceptTarget else { return .idle }
-        return overrides.arming(for: target)
-    }
-
-    /// Human-readable name for an agent-reported HTTP stack.
-    private static func stackLabel(_ stack: String) -> String {
-        switch stack {
-        case "okhttp2":       return "okhttp2"
-        case "urlconnection": return "HttpURLConnection"
-        default:              return stack
-        }
-    }
+    /// This tab's divert arming state, or `.idle` when it isn't an agent tab. One reader on the
+    /// session, shared with the toolbar, popover, row badges and attach banner.
+    private var armingState: InterceptArmingState { session.armingState }
 
     private func seedOverride(from txn: NetworkTransaction) {
         guard let overrides = session.overrides else { return }
         Task { @MainActor in
             let rule = await overrides.seed(from: txn, session: session)
-            editingOverride = .new(rule)
+            editingOverride = .new(rule, warning: OverrideSeeding.warning(for: txn))
         }
     }
 
@@ -454,13 +436,12 @@ struct NetworkSessionView: View {
               let matching = overrides.matchingRule(forURL: txn.url, method: txn.method)
         else { return .none }
 
-        // A saved rule that matches but isn't armed must not promise "applies on the next
-        // request" — the tunnel may have failed to open, in which case nothing will happen.
-        if case .failed(let detail) = armingState { return .blocked(detail) }
+        // A matching rule that isn't armed must not promise "applies on the next request" —
+        // arming may have failed. Wording is shared with the popover and toolbar.
+        if let blocked = armingState.blockedMessage { return .blocked(blocked) }
 
-        // With no source running there's no transport to judge against — saying "can't run in
-        // in-process agent capture" there is flatly wrong. "Applies on the next request" is the
-        // honest reading of a saved rule.
+        // With no source running there's no transport to judge against, so "applies on the next
+        // request" is the honest reading.
         if session.hasRunningSource,
            let skip = overrides.blockedReason(forURL: txn.url, method: txn.method,
                                               transport: session.interceptTransport,
@@ -688,8 +669,8 @@ private struct NetworkRowView: View {
     let selected: Bool
     var badge: OverrideBadge = .none
 
-    /// Whether an override touched (or would touch) this row. Computed in the model and passed
-    /// in, never derived inside `body` — `filtered` can hold thousands of rows in a LazyVStack.
+    /// Whether an override touched (or would touch) this row. Passed in, never derived inside
+    /// `body` — `filtered` can hold thousands of rows.
     enum OverrideBadge: Equatable {
         case none
         /// A rule produced this response.

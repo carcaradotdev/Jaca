@@ -103,12 +103,15 @@ targets:
       - name: Build iOS Simulator network agent
         basedOnDependencyAnalysis: false
         script: |
-          SRC="$SRCROOT/agent/iOS/JacaNetAgent.m"
+          # Every agent/iOS/*.m: the agent is three files (tap+divert client, transport, and the
+          # Divert.kt twin). The glob is deliberately non-recursive, so a subdirectory can never be
+          # linked into the dylib.
           OUT="$BUILT_PRODUCTS_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/JacaNetAgent.dylib"
           mkdir -p "$(dirname "$OUT")"
           if ! xcrun -sdk iphonesimulator clang -dynamiclib -fobjc-arc \
                -target arm64-apple-ios15.0-simulator -framework Foundation \
-               -o "$OUT" "$SRC"; then
+               -I "$SRCROOT/agent/iOS" \
+               -o "$OUT" "$SRCROOT"/agent/iOS/*.m; then
             echo "error: failed to build the iOS-Simulator network agent (JacaNetAgent.dylib)." >&2
             echo "error: it needs the iOS Simulator SDK — install it in Xcode > Settings > Components (iOS platform), then rebuild." >&2
             exit 1
@@ -130,12 +133,36 @@ targets:
     deploymentTarget: "14.0"
     sources:
       - path: Tests
+        # Tests/ObjC is the agent's own suite (JacaAgentTests): plain Objective-C against
+        # agent/iOS sources, with no Jaca module to import. Compiling it in here too would need a
+        # bridging header and would link the agent into the desktop test bundle.
+        excludes:
+          - ObjC
     dependencies:
       - target: Jaca
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.srsouza.JacaTests
         GENERATE_INFOPLIST_FILE: YES
+
+  # The agent's decisions, tested on the host. agent/iOS/JacaDivert.m uses no iOS-only API for
+  # exactly this reason: the dead-man window, the host match and the 599 bounce pair are the parts
+  # a mistake in makes an app either uncapturable or permanently pointed at a dead port, and
+  # "rebuild the dylib, launch a simulator, launch an app" is far too slow a loop to catch them.
+  JacaAgentTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Tests/ObjC
+      - path: agent/iOS/JacaDivert.h
+      - path: agent/iOS/JacaDivert.m
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.srsouza.JacaAgentTests
+        GENERATE_INFOPLIST_FILE: YES
+        CLANG_ENABLE_OBJC_ARC: YES
+        HEADER_SEARCH_PATHS: $(SRCROOT)/agent/iOS
 
   JacaUITests:
     type: bundle.ui-testing
@@ -157,6 +184,7 @@ schemes:
       targets:
         Jaca: all
         JacaTests: [test]
+        JacaAgentTests: [test]
         JacaUITests: [test]
     run:
       config: Debug
@@ -164,4 +192,5 @@ schemes:
       config: Debug
       targets:
         - JacaTests
+        - JacaAgentTests
         - JacaUITests

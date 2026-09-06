@@ -1,134 +1,265 @@
 import Foundation
 
-/// Drives in-process network capture for a debug app on the iOS **Simulator** — no
-/// proxy, no CA cert. It binds a localhost TCP listener, launches the app via
-/// `simctl launch` with `DYLD_INSERT_LIBRARIES` pointing at the bundled `JacaNetAgent`
-/// dylib (and the listener port), and streams the agent's newline-delimited JSON into
-/// the shared `AgentTransactionParser` — the same wire format as the Android agent.
+/// Composes the in-process capture session for one app on the iOS **Simulator** — no proxy, no
+/// CA. Owns no socket framing and no launch argv (those live in `AgentLineChannel` and
+/// `SimulatorAgentLaunch`/`SimulatorAppLauncher`): it only wires collaborators and forwards
+/// their events.
 ///
-/// The simulator shares the Mac's loopback, so the injected agent simply connects back
-/// to `127.0.0.1:<port>`. If the app relaunches, its fresh agent reconnects and the
-/// accept loop picks it up again.
+/// The simulator shares the Mac's loopback, so there is nothing to tunnel and **no second socket
+/// in either direction**: the injected agent dials `127.0.0.1:<port>` and Jaca writes its divert
+/// frames back down the very connection it already reads transactions from.
 final class IOSSimulatorAgentController: @unchecked Sendable {
     private let udid: String
     private let bundleID: String
     private let agentDylib: URL
     private let onTransaction: @Sendable (NetworkTransaction) -> Void
     private let onStatus: @Sendable (String) -> Void
+    /// Reports "the agent is no longer in the app" independently of the coordinator, because
+    /// losing the agent stops **capture**, not just overrides — and `divert` is nil whenever
+    /// response overrides are off, which is the default.
+    private let onAttach: @Sendable (InterceptArmingState) -> Void
 
-    private var listenFD: Int32 = -1
-    private var connFD: Int32 = -1
-    private var port: UInt16 = 0
-    private var acceptThread: Thread?
+    /// Owns the override server and the control frames; nil when overrides aren't wired. A `let`
+    /// built in `init`: `NetworkSession.interceptWired` is only re-evaluated when `current` is
+    /// assigned, so a later coordinator would leave the toolbar reading as unarmed forever.
+    let divert: DivertCoordinator?
+    private let interceptPipeline: InterceptPipeline?
+    private let intercept: InterceptServices?
+    private let target: InterceptTarget
+
+    /// The socket to the agent, including its lock, `SO_NOSIGPIPE` and the line framing.
+    private let channel: AgentLineChannel
+    /// Notices when the app comes back **without** the agent. Event-driven, so it costs nothing
+    /// while the agent is connected.
+    private let supervisor: SimulatorAttachSupervisor
+    /// The channel has to exist before `self` does — the coordinator takes it as its writer — so
+    /// its callbacks reach back through this box, filled in at the end of `init`.
+    private let weakSelf = WeakSimulatorController()
+
+    /// Distinguishes this session's launch claim from another tab's, so `release` can never drop
+    /// a claim a newer session already took.
+    private let owner = "network-\(UUID().uuidString)"
+    private var launchKey: SimulatorAppLauncher.Key { .init(udid: udid, bundleID: bundleID) }
+    /// Set once the agent's first bytes arrive — i.e. it actually loaded in-process. Drives the
+    /// "launched but never loaded" diagnostic.
+    private let agentLoaded = SimulatorAgentFlag()
     private var stopped = false
 
     init(udid: String, bundleID: String, agentDylib: URL,
+         capabilities: InterceptCapabilities,
          onTransaction: @escaping @Sendable (NetworkTransaction) -> Void,
-         onStatus: @escaping @Sendable (String) -> Void) {
+         onStatus: @escaping @Sendable (String) -> Void,
+         onAttach: @escaping @Sendable (InterceptArmingState) -> Void = { _ in },
+         intercept: InterceptServices? = nil) {
         self.udid = udid
         self.bundleID = bundleID
         self.agentDylib = agentDylib
         self.onTransaction = onTransaction
         self.onStatus = onStatus
+        self.onAttach = onAttach
+        self.interceptPipeline = intercept?.pipeline(for: .iosSimulatorDivert(bundleID: bundleID),
+                                                     deviceID: udid, appID: bundleID)
+        let box = self.weakSelf
+        let channel = AgentLineChannel(name: "ios-\(bundleID)", callbacks: .init(
+            onLine: { box.controller?.handle(line: $0) },
+            onFirstBytes: { box.controller?.noteAgentLoaded() },
+            // On *disconnect*, matching the Android controller: the re-arm rides the next hello
+            // or heartbeat, so a relaunched agent is never spoken to first. The supervisor wakes
+            // here too — a dropped socket is the only event that separates "the user quit the
+            // app" from "capture is quietly working".
+            onDisconnected: {
+                box.controller?.divert?.agentDidReconnect()
+                box.controller?.supervisor.agentDisconnected()
+            }))
+        self.channel = channel
+        self.supervisor = SimulatorAttachSupervisor(
+            key: .init(udid: udid, bundleID: bundleID),
+            relaunch: {
+                guard let controller = box.controller else { return }
+                await controller.relaunchToAttach()
+            },
+            // One vocabulary for "is this transport working": presence maps to the same
+            // `InterceptArmingState` every override surface renders, and is published
+            // unconditionally — the coordinator *also* gets it when overrides are wired.
+            onPresence: { presence, _ in
+                guard let controller = box.controller else { return }
+                controller.onAttach(.forPresence(presence, appID: bundleID))
+                controller.divert?.appPresenceChanged(presence)
+            },
+            onStatus: { onStatus($0) })
+        let target = InterceptTarget(deviceID: udid, package: bundleID)
+        self.divert = intercept.map { services in
+            DivertCoordinator(transport: .iosSimulatorDivert(bundleID: bundleID),
+                              deviceID: udid, appID: bundleID,
+                              capabilities: capabilities,
+                              tunnel: SharedLoopbackTunnel(),
+                              writer: channel,
+                              onStateChange: { services.reportArming(target: target, coordinator: $0, state: $1) })
+        }
+        self.intercept = intercept
+        self.target = target
+        if let divert = self.divert { intercept?.register(target: target, coordinator: divert) }
+        box.controller = self
     }
 
+    // MARK: - Lifecycle
+
+    /// **Load-bearing ordering: arm before launching.** The server and endpoint must exist before
+    /// the app's process does, or the first request — usually the one the user wanted to override
+    /// — goes straight past us. `AgentController.run()` arms before `attach-agent` for the same
+    /// reason.
     func start() {
         stopped = false
-        guard bindListener() else { onStatus("network agent: couldn't open local listener"); return }
-        startAcceptLoop()
-        Task { await launch() }
+        guard let port = channel.listen() else {
+            fail("couldn't open the local listener the agent connects back to")
+            return
+        }
+        Task { await bringUp(port: port) }
     }
 
+    private func bringUp(port: UInt16) async {
+        do {
+            try await SimulatorAppLauncher.shared.claim(
+                launchKey, owner: owner,
+                childEnvironment: SimulatorAgentLaunch.childEnvironment(agentDylib: agentDylib,
+                                                                        port: port))
+        } catch {
+            // Two agents in one app leaves the older tab dialling a dead port, stuck at
+            // "arming…" forever. Fail loudly instead.
+            fail("another Network tab is already capturing \(bundleID) on this simulator")
+            return
+        }
+        // `stop()` hands the claim back synchronously, so a stop landing while this awaited
+        // `claim` released nothing and the claim just taken is an orphan — `\(bundleID)` can't be
+        // captured again until Jaca restarts. Every early return below has to give it back.
+        guard !stopped else { return releaseClaim() }
+
+        if let divert, let interceptPipeline { await divert.start(pipeline: interceptPipeline) }
+        guard !stopped else { return releaseClaim() }
+
+        onStatus("network agent: launching \(bundleID)…")
+        guard await SimulatorAppLauncher.shared.launch(launchKey, terminateRunning: true) else {
+            // Nothing is running, so the exclusive claim only costs other tabs the app.
+            // `release` is owner-checked, so a later `stop()` is a no-op.
+            releaseClaim()
+            fail("couldn't launch \(bundleID)")
+            return
+        }
+        onStatus("network agent: in-process (\(bundleID))")
+        supervisor.noteLaunched()
+        scheduleAgentLoadCheck()
+    }
+
+    /// Gives the launcher claim back. Safe to call when nothing is claimed.
+    private func releaseClaim() {
+        SimulatorAppLauncher.shared.release(launchKey, owner: owner)
+    }
+
+    /// The consented re-attach (the banner's action), relaunching through the same claim so the
+    /// injection environment travels with it. The only path that restarts the user's app.
+    func relaunchToAttach() async {
+        guard !stopped else { return }
+        onStatus("network agent: relaunching \(bundleID) with the agent…")
+        guard await SimulatorAppLauncher.shared.launch(launchKey, terminateRunning: true) else {
+            fail("couldn't relaunch \(bundleID)")
+            return
+        }
+        supervisor.noteLaunched()
+        scheduleAgentLoadCheck()
+    }
+
+    /// Order matters: stop accepting but leave the live fd open, so the disarm frame still
+    /// reaches the agent. Clearing the connection first makes every teardown write bail, leaving
+    /// the device to recover only via the dead-man window.
     func stop() {
         stopped = true
-        if connFD >= 0 { close(connFD); connFD = -1 }
-        if listenFD >= 0 { close(listenFD); listenFD = -1 }
-    }
+        supervisor.stop()
+        let coordinator = divert
+        let services = intercept, target = target
 
-    // MARK: - listener
+        // Synchronously, before the teardown Task: `restartForInterceptChange()` stops and starts
+        // in one straight line, so a deferred release loses to the next controller's `claim` and
+        // the restart dies with "another Network tab is already capturing…".
+        // Both synchronous: a restart builds the replacement in the same main-actor run, so
+        // anything deferred into the teardown Task loses that race.
+        coordinator?.beginStop()
+        releaseClaim()
 
-    /// Binds 127.0.0.1:0 (OS-assigned port) and starts listening; records the port.
-    private func bindListener() -> Bool {
-        let s = socket(AF_INET, SOCK_STREAM, 0)
-        guard s >= 0 else { return false }
-        var yes: Int32 = 1
-        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = 0
-        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr)
-        let bound = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard bound == 0, listen(s, 4) == 0 else { close(s); return false }
-        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        withUnsafeMutablePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { _ = getsockname(s, $0, &len) }
-        }
-        port = UInt16(bigEndian: addr.sin_port)
-        listenFD = s
-        return true
-    }
-
-    private func launch() async {
-        var env = AppleToolchain.environment()
-        // simctl passes SIMCTL_CHILD_-prefixed vars into the launched app's environment.
-        env["SIMCTL_CHILD_DYLD_INSERT_LIBRARIES"] = agentDylib.path
-        env["SIMCTL_CHILD_JACA_NET_PORT"] = String(port)
-        onStatus("network agent: launching \(bundleID)…")
-        let r = try? await CommandRunner.run(
-            AppleToolchain.xcrun,
-            ["simctl", "launch", "--terminate-running-process", udid, bundleID],
-            environment: env
-        )
-        if r?.exitCode == 0 {
-            onStatus("network agent: in-process (\(bundleID))")
-        } else {
-            onStatus("network agent: couldn't launch \(bundleID)")
+        channel.stopAccepting()
+        Task {
+            await coordinator?.stop()          // disarm, then close the override server
+            await self.channel.flush()         // the disarm frame has reached send(2)
+            self.channel.close()
+            // Drop the coordinator so a closed tab stops receiving host-set updates.
+            if let coordinator { services?.deregister(target: target, coordinator: coordinator) }
         }
     }
 
-    // MARK: - reader
+    // MARK: - Events
 
-    private func startAcceptLoop() {
-        let t = Thread { [weak self] in self?.acceptLoop() }
-        t.name = "jaca-net-agent"
-        acceptThread = t
-        t.start()
-    }
-
-    /// Accepts the agent's connection and streams its frames; if the app relaunches
-    /// (re-injected agent → new connection), loops back and accepts again.
-    private func acceptLoop() {
-        while !stopped {
-            let c = accept(listenFD, nil, nil)
-            if c < 0 { if stopped { return }; Thread.sleep(forTimeInterval: 0.2); continue }
-            connFD = c
-            onStatus("network agent: connected")
-            streamFrom(fd: c)
-            close(c); connFD = -1
-            if stopped { return }
+    /// One agent line, routed. Both controllers classify through `AgentFrame`, so their readers
+    /// can't drift apart.
+    private func handle(line: String) {
+        switch AgentFrame.classify(line) {
+        case .transaction(let txn):
+            onTransaction(txn)
+        case .hello(let supportsOverride):
+            // A pre-overrides agent never reads its socket, so reporting it turns an eternal
+            // "arming…" into a sentence that names the fix.
+            guard supportsOverride else { divert?.agentDidAdvertiseWithoutOverrideSupport(); return }
+            JacaLog.info("agent", "hello with override/1 from \(bundleID)")
+            divert?.agentDidAdvertiseOverrideSupport()
+        case .unrecognised:
+            break
         }
     }
 
-    /// Reads newline-delimited JSON, parsing each line via the shared agent parser.
-    private func streamFrom(fd s: Int32) {
-        var buffer = Data()
-        var chunk = [UInt8](repeating: 0, count: 16384)
-        while !stopped {
-            let n = recv(s, &chunk, chunk.count, 0)
-            if n <= 0 { break }
-            buffer.append(contentsOf: chunk[0..<n])
-            while let nl = buffer.firstIndex(of: 0x0A) {
-                let lineData = buffer[buffer.startIndex..<nl]
-                buffer.removeSubrange(buffer.startIndex...nl)
-                if let line = String(data: lineData, encoding: .utf8),
-                   let txn = AgentTransactionParser.parse(line) {
-                    onTransaction(txn)
-                }
-            }
+    private func noteAgentLoaded() {
+        agentLoaded.set()
+        // First bytes, not `accept`: proof the dylib loaded *inside* the app, which is what lets
+        // the supervisor cancel its timers.
+        supervisor.agentConnected()
+        // The agent is back, so clear any detach we reported — otherwise a recovered session
+        // keeps the banner up for life.
+        onAttach(.idle)
+        onStatus("network agent: connected (\(bundleID))")
+    }
+
+    /// Nothing connected after a successful launch means the dylib didn't load — say so, and
+    /// where to look, rather than sitting on "in-process".
+    private func scheduleAgentLoadCheck() {
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(6))
+            guard let self, !self.stopped, !self.agentLoaded.isSet else { return }
+            self.onStatus("network agent: \(self.bundleID) launched but the agent never connected — "
+                + "\(self.agentDylib.lastPathComponent) likely failed to load. It has to be built for "
+                + "the arm64 simulator; check the app's stderr in the Logs tab.")
         }
     }
+
+    /// A failure *before* the coordinator started never reaches it, so it goes straight to the
+    /// same sink — otherwise the toolbar sits on `.idle`, which reads as "nothing is wired here".
+    private func fail(_ message: String) {
+        onStatus("network agent: \(message)")
+        intercept?.reportArming(target: target, coordinator: divert, state: .failed(message))
+    }
+}
+
+/// Lets `AgentLineChannel`'s callbacks reach the controller, which doesn't exist yet when the
+/// channel is built.
+private final class WeakSimulatorController: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var value: IOSSimulatorAgentController?
+    var controller: IOSSimulatorAgentController? {
+        get { lock.lock(); defer { lock.unlock() }; return value }
+        set { lock.lock(); value = newValue; lock.unlock() }
+    }
+}
+
+/// A one-way flag set from the reader thread and read from a `Task`.
+private final class SimulatorAgentFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+    func set() { lock.lock(); flag = true; lock.unlock() }
+    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return flag }
 }

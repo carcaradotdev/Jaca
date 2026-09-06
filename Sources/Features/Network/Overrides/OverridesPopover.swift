@@ -2,11 +2,10 @@ import SwiftUI
 import AppKit
 import Lemonade
 
-/// The override library: a browsing surface, so a popover (like `NetworkAppPicker`) rather than
-/// a sheet.
+/// The override library. A browsing surface, so a popover (like `NetworkAppPicker`), not a sheet.
 ///
-/// Precedence is list order — a firewall table, not a specificity score — because the winner is
-/// then always visible and "move this rule up" is a one-click fix the user can reason about.
+/// Precedence is list order — a firewall table, not a specificity score — so the winner is always
+/// visible and "move this rule up" is a one-click fix.
 struct OverridesPopover: View {
     @Bindable var session: NetworkSession
     @Bindable var overrides: OverridesModel
@@ -36,8 +35,7 @@ struct OverridesPopover: View {
                 session: session,
                 overrides: overrides,
                 isNew: draft.isNew,
-                // `save` adds or updates as appropriate — the popover's "New override" used to
-                // call `update`, which silently discarded every rule created this way.
+                // `save` adds or updates: calling `update` here discarded every new rule.
                 onSave: { saved in
                     withAnimation(.easeInOut(duration: 0.28)) { overrides.save(saved) }
                 }
@@ -52,12 +50,13 @@ struct OverridesPopover: View {
             LemonadeUi.Text("Overrides", textStyle: LemonadeTypography.shared.headingXSmall,
                             color: LemonadeTheme.colors.content.contentPrimary)
             Spacer()
-            // The master switch: "let me see the real thing for a second" without hunting
-            // through every rule.
+            // The master switch: "let me see the real thing for a second".
             LemonadeUi.Switch(checked: overrides.masterEnabled) { newValue in
                 withAnimation(.easeInOut(duration: 0.2)) { overrides.masterEnabled = newValue }
             }
-            .help(overrides.masterEnabled ? "Pause all overrides (⇧⌘O)" : "Resume overrides (⇧⌘O)")
+            .help(overrides.masterEnabled
+                  ? "Pause all overrides — rules stay saved"
+                  : "Resume overrides")
         }
         .padding(.horizontal, LemonadeTheme.spaces.spacing300)
         .padding(.vertical, LemonadeTheme.spaces.spacing200)
@@ -137,6 +136,7 @@ struct OverridesPopover: View {
 
             // The visible teardown + blast-radius contract: exactly what is running, and where.
             statusLine
+                .animation(.easeInOut(duration: 0.2), value: armingState)
 
             deviceNetworkSection
 
@@ -148,7 +148,7 @@ struct OverridesPopover: View {
                 .font(.system(size: 10))
                 .help("Opens ~/.jaca/logs/jaca.log — what Jaca did, and why a rule did or didn't fire")
 
-                if let last = lastOverrideLogLine {
+                if let last = overrides.lastActivity {
                     Text(last)
                         .font(LogLevelStyle.mono(9))
                         .foregroundStyle(LemonadeTheme.colors.content.contentTertiary)
@@ -156,6 +156,7 @@ struct OverridesPopover: View {
                         .help(last)
                 }
             }
+            .animation(.easeInOut(duration: 0.2), value: overrides.lastActivity)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, LemonadeTheme.spaces.spacing300)
@@ -169,11 +170,12 @@ struct OverridesPopover: View {
             let hostText = hosts.isEmpty
                 ? "No hosts routed"
                 : "Diverting \(hosts.count) host\(hosts.count == 1 ? "" : "s"): \(hosts.sorted().joined(separator: ", "))"
-            LemonadeUi.Text("\(hostText) · 127.0.0.1:\(port)",
+            // Both halves are transport-dependent: only Android reaches this port through
+            // `adb reverse`, and only Android has a tunnel to promise the removal of.
+            LemonadeUi.Text("\(hostText) · \(transport.portLabel(port: port))",
                             textStyle: LemonadeTypography.shared.bodyXSmallRegular,
                             color: LemonadeTheme.colors.content.contentTertiary, maxLines: 2)
-                .help("Only these hosts leave the device's own network. Everything else is untouched. "
-                    + "The tunnel is removed when this tab stops, and the agent disarms itself if Jaca goes away.")
+                .help(transport.divertScopeHelp)
         case .failed(let detail):
             VStack(alignment: .leading, spacing: 2) {
                 LemonadeUi.Text("Overrides inactive",
@@ -182,9 +184,14 @@ struct OverridesPopover: View {
                 Text(detail)
                     .font(LogLevelStyle.mono(10))
                     .foregroundStyle(LemonadeTheme.colors.content.contentSecondary)
-                    .textSelection(.enabled)      // it's a dev tool: let them copy the adb error
+                    .textSelection(.enabled)      // it's a dev tool: let them copy the raw error
                     .lineLimit(3)
             }
+        // Same sentence as the row badge and toolbar — one state, one wording.
+        case .waitingForAgent, .agentTooOld, .waitingForApp, .detached:
+            LemonadeUi.Text(armingState.blockedMessage ?? "",
+                            textStyle: LemonadeTypography.shared.bodyXSmallRegular,
+                            color: LemonadeTheme.colors.content.contentCaution, maxLines: 2)
         case .idle:
             LemonadeUi.Text(idleMessage,
                             textStyle: LemonadeTypography.shared.bodyXSmallRegular,
@@ -202,11 +209,9 @@ struct OverridesPopover: View {
         return overrides.rules.isEmpty ? "" : "Start capture to apply these overrides."
     }
 
-    /// Recovery for a device left behind by a crashed capture session.
-    ///
-    /// Clearing `http_proxy` alone isn't enough — Android also keeps `global_http_proxy_*` per
-    /// network, and while those survive the device can sit unvalidated ("connected, no internet").
-    /// This clears all of them and bounces Wi-Fi so the network re-validates.
+    /// Recovery for a device left behind by a crashed capture session. Clearing `http_proxy`
+    /// isn't enough — Android also keeps `global_http_proxy_*` per network, and while those
+    /// survive the device sits unvalidated ("connected, no internet").
     @ViewBuilder
     private var deviceNetworkSection: some View {
         if session.isADBDevice {
@@ -240,19 +245,14 @@ struct OverridesPopover: View {
         }
     }
 
-    /// The most recent override log line, so the popover answers "is anything happening?"
-    /// without the user having to open a file.
-    private var lastOverrideLogLine: String? {
-        JacaLog.tail(1, category: "override").last
-    }
+    /// One reader for the arming state — see `NetworkSession.armingState`.
+    private var armingState: InterceptArmingState { session.armingState }
 
-    private var armingState: AgentDivertCoordinator.State {
-        guard let target = session.interceptTarget else { return .idle }
-        return overrides.arming(for: target)
-    }
+    /// The interception point this tab captures through; keys every transport-dependent
+    /// sentence here.
+    private var transport: InterceptTransportID { session.interceptTransport }
 
-    /// Seeds a from-scratch rule with the host the user is already looking at, so the blank
-    /// editor isn't a guessing game.
+    /// Seeds a from-scratch rule with the host the user is already looking at.
     private var seedHost: String? {
         session.selectedTransaction?.host ?? session.transactions.last?.host
     }
@@ -273,11 +273,8 @@ struct OverridesPopover: View {
 
 // MARK: - Row
 
-/// One rule.
-///
-/// Deliberately has **no whole-row tap gesture**: the name/pattern block is its own button and the
-/// switch is a sibling. A row-level `onTapGesture` wrapping a switch fights the switch for the
-/// click, and there is no precedent in the app for that pattern, so we don't invent one.
+/// One rule. **No whole-row tap gesture**: the name/pattern block is its own button and the
+/// switch is a sibling, because a row-level `onTapGesture` fights the switch for the click.
 private struct OverrideRuleRow: View {
     let rule: OverrideRule
     let hitCount: Int

@@ -3,11 +3,13 @@
 **Status: shipped.** Make a **debuggable Android app** receive a response you control — without a
 proxy, without installing a CA, and **without disabling certificate pinning**.
 
+This page is the Android path and the shared rule engine. The iOS-Simulator path is
+[`response-overrides-ios.md`](response-overrides-ios.md); what the desktop and both agents agree on
+is [`divert-contract.md`](divert-contract.md).
+
 Right-click any captured request → *Override response…*, or add one from the **Overrides** button
 next to the search field. Rules are toggled on/off individually, apply on the app's **next
 request** with no re-attach, and persist across restarts.
-
-Companion doc: [`response-overrides-ios.md`](response-overrides-ios.md) (the same feature on iOS).
 
 ---
 
@@ -81,9 +83,10 @@ precedence, bodies and headers all live desktop-side, which is why editing a rul
 the next request instead of requiring a rebuild and a re-attach.
 
 > **The tripwire for review:** any change that adds a path, method, header, body, status, ordering
-> or rule-id concept to `agent/kotlin/` has crossed that line. In practice it shows up in
-> `AgentDivertCoordinator.divertFrame(origin:hosts:heartbeatSeconds:)` — the one function that
-> builds the desktop→device message, and whose shape is pinned by a test.
+> or rule-id concept to `agent/kotlin/` (or `agent/iOS/`) has crossed that line. In practice it
+> shows up in **`OverrideEndpoint`** (`Sources/Core/Intercept/Intercept.swift`) — the one type that
+> builds the desktop→device message, produced from exactly one call site
+> (`DivertCoordinator.push`), and whose key set is pinned by a test.
 
 `Divert.origin` starts `null`, so a freshly attached agent is **read-only by construction**.
 
@@ -106,19 +109,30 @@ you type* so you're warned before a request ever fails.
 | Interception point | Reaches the desktop via | Capabilities | Status |
 |---|---|---|---|
 | `.agentDivert` | `OverrideServer` on `127.0.0.1:P`, `adb reverse tcp:P tcp:P` | `.desktopTerminated` | **shipped** |
+| `.iosSimulatorDivert` | the same server, plain loopback, no tunnel | `.desktopTerminated` | **shipped** — see the [iOS doc](response-overrides-ios.md) |
 | `.mitmProxy` (HTTPS decryption) | would be `ProxyHandler.forward` | `.desktopTerminated` | **not wired** — no pipeline yet |
-| `.iosSimulatorDivert` | the same server, plain loopback, no tunnel | `.desktopTerminated` | **not wired** — see the iOS doc |
 | `.companionMetadata` | gRPC `StreamFlows` | `.observeOnly` | degrades, explains why |
 
 Adding HTTPS decryption means calling `pipeline.run(_:capabilities:)` from that transport and
 declaring what it supports — not reimplementing matching or precedence.
 
-**Be precise about how much is "in place".** The *resolve/execute* half of the seam is genuinely
-transport-neutral and covered by tests that touch no device. The *arming* half is not: it is
-hard-typed to the adb-specific `AgentDivertCoordinator` (`InterceptServices.onArmingChange`,
-`onRegisterCoordinator`, `CaptureSource.arming`), and the `InterceptArming` protocol in
-`Intercept.swift` is currently **declared but unused**. A second device transport needs that
-generalised first.
+### The arming half
+
+Both halves of the seam are now transport-neutral. **`DivertCoordinator`** (formerly
+`AgentDivertCoordinator`) owns the override server, the control frames and the heartbeat, and knows
+nothing about adb: how the device reaches our loopback port lives behind
+**`protocol DivertTunnel`** — `AdbReverseTunnel` in `Core/Network/` (next to `AdbTunnelCleanup`,
+because opening one creates OS-global state) and `SharedLoopbackTunnel` in `Core/Overrides/` (a
+no-op: the simulator is already on the Mac's loopback, so `needsTunnelLedger` is false and nothing
+is ever written to the ledger).
+
+What every override surface renders is one enum, **`InterceptArmingState`**
+(`Core/Intercept/InterceptArmingState.swift`), with one case per way this can be silently doing
+nothing: `.idle`, `.waitingForAgent`, `.agentTooOld`, `.waitingForApp(appID:)`, `.detached(appID:)`,
+`.active(port:hosts:)`, `.failed`. It replaced a `State` nested inside the coordinator *and* the
+never-implemented `InterceptArming` protocol — a protocol with one conformer and one caller is not a
+seam, and the readers were `if case` checks the compiler could not exhaustively police. They are
+`switch`es now.
 
 ### Blast radius
 
@@ -165,7 +179,7 @@ listener that no longer exists. So teardown does not depend on Jaca being alive:
 
 | # | Mechanism | Survives |
 |---|---|---|
-| L1 | Ordered `stop()`: disarm → `reverse --remove` → close server → `forward --remove` | tab stop/close, source switch |
+| L1 | Ordered `stop()`: disarm (**flushed** to `send(2)`) → close tunnel → close server | tab stop/close, source switch |
 | L2 | `AdbTunnelCleanup.revertAll()` from `applicationWillTerminate` + SIGINT/SIGTERM/SIGHUP | graceful quit, ^C |
 | L3 | **Agent socket-EOF disarm** | SIGKILL, Force Quit, crash, unplug |
 | L4 | **Agent heartbeat expiry**, checked on the match path (not a timer thread, so Doze can't starve it) | Mac asleep, half-open socket |
@@ -251,20 +265,27 @@ how Jaca arms the device.
 
 ## Platform support
 
-Response overrides run on **Android only** today (the in-process agent's okhttp3 divert). The rule
-engine, matcher, clamp, persistence and UI are transport-neutral and shared, but no other transport
-calls into them yet:
+Response overrides run on **Android** (the in-process agent's okhttp3 divert) and on the **iOS
+Simulator** (the injected agent's `NSURLProtocol` divert). The rule engine, matcher, clamp,
+persistence and UI are transport-neutral and shared by both.
 
 | Transport | Seam modelled | Wired |
 |---|---|---|
 | `.agentDivert` (Android) | yes | **yes — shipping** |
+| `.iosSimulatorDivert` | yes | **yes — shipping**, see [`response-overrides-ios.md`](response-overrides-ios.md) |
 | `.mitmProxy` (HTTPS decryption) | yes | no — `ProxyServer` has no pipeline |
-| `.iosSimulatorDivert` | yes | no — see [`response-overrides-ios.md`](response-overrides-ios.md) |
 | `.companionMetadata` | yes | n/a — `.observeOnly`, flow metadata can't be overridden |
 
-**iOS Simulator is feasible and structurally simpler than Android** (no tunnel, no CA, no pinning
-gate); iOS *physical devices* are not, short of the MITM proxy. Feasibility notes and a POC plan:
-[`response-overrides-ios.md`](response-overrides-ios.md).
+The iOS Simulator turned out to be structurally simpler than Android (no tunnel, no CA, no pinning
+gate) but to have one problem Android doesn't: the agent dies with the app process, so an app the
+user reopens outside Jaca comes back uninstrumented. iOS *physical devices* remain out of reach
+short of the MITM proxy — injection needs `simctl`.
+
+Transport-dependent wording lives in one place (`InterceptTransportCopy.swift`) and the "why this
+row can't be overridden" decision in another (`OverrideRowGate`), both pure and unit-tested. The
+reason is a landmine that was live for one commit: `httpStack` is an **Android** concept, and a row
+gate that tested it for `okhttp3.` would disable *Override response…* on every iOS row the day the
+iOS agent started reporting `"urlsession"`.
 
 ## Limitations
 
@@ -327,11 +348,12 @@ The 2026-08-26 verification, against the same pinned app, confirmed:
 
 ## See also
 
-- [`response-overrides-ios.md`](response-overrides-ios.md) — the same feature on iOS
 - `agent/kotlin/com/squeeze/capture/Divert.kt` — the entire on-device surface
 - `agent/kotlin/com/squeeze/capture/OkHttpHook.kt` — layer detection, rewrite, bounce, fail-open
 - `agent/kotlin/com/squeeze/capture/SqueezeReporter.kt` — the bidirectional control channel
 - `Sources/Core/Intercept/` — the transport-neutral seam and pipeline
 - `Sources/Core/Overrides/` — rules, matching, the clamp, the server, the tunnel coordinator
 - `Sources/Model/OverridesModel.swift` — the single observable owner
+- [`divert-contract.md`](divert-contract.md) — the frame, the 599 pair, the dead-man window
+- [`response-overrides-ios.md`](response-overrides-ios.md) — the iOS-Simulator transport
 - `README.md` — how the in-process agent works in general

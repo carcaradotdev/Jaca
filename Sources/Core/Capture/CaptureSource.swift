@@ -12,9 +12,9 @@ struct CaptureContext {
     let targetPackage: String?
     /// Companion mode: the shared mDNS browse + stream hub.
     let companion: CompanionHub?
-    /// Response overrides: the resolver, reporter and origin client a transport needs to
-    /// participate in interception. Nil disables overriding for this source entirely.
-    /// Threaded exactly like `companion` above — one path, so sources never reach for the model.
+    /// The resolver, reporter and origin client a transport needs to participate in interception;
+    /// nil disables overriding here. Threaded like `companion` above, so sources never reach for
+    /// the model.
     var intercept: InterceptServices? = nil
 }
 
@@ -28,6 +28,11 @@ protocol CaptureSink: AnyObject {
     func capture(didBindPort port: Int)
     /// Proxy: started, but no decrypted HTTPS seen yet — guide the user to install/trust the CA.
     func captureNeedsSetup()
+
+    /// The source's in-process agent is no longer in the app (or the app is gone). Separate from
+    /// `arming` because losing the agent stops **capture**, not just overrides, so it must reach
+    /// the UI even when overrides were never wired. Only the iOS-Simulator source detects it.
+    func capture(didChangeAttach state: InterceptArmingState)
 }
 
 /// A pluggable network-capture backend. Add a new way to capture (proxy, in-process
@@ -44,12 +49,16 @@ protocol CaptureSource: AnyObject {
 
     /// The coordinator arming this source's device, when overrides were actually wired up.
     /// Nil means nothing is armed — the UI must not claim overrides are active.
-    var arming: AgentDivertCoordinator? { get }
+    var arming: DivertCoordinator? { get }
+}
+
+extension CaptureSink {
+    func capture(didChangeAttach state: InterceptArmingState) {}
 }
 
 extension CaptureSource {
     var interceptCapabilities: InterceptCapabilities { [] }
-    var arming: AgentDivertCoordinator? { nil }
+    var arming: DivertCoordinator? { nil }
 }
 
 /// Static, selectable description of a capture option for a device. Drives the chooser
