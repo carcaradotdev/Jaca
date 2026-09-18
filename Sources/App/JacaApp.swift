@@ -1,22 +1,63 @@
 import SwiftUI
 import AppKit
 import Lemonade
+import os
+
+private let dockLog = Logger(subsystem: "dev.srsouza.jaca", category: "dock")
 
 /// Owns the menu-bar status item. Left-click opens/focuses the window; right-click (or
-/// control-click) shows a menu (Open / Quit). The app lives in the menu bar only (no Dock
-/// icon) and stays running when the window is closed — closing just hides the window so a
-/// left-click can bring it right back.
+/// control-click) shows a menu (Open / Quit). Menu-bar only by default (`DockVisibility` is
+/// the Dock/⌘-Tab opt-in); closing the window just hides it, so the app stays running.
 final class JacaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem?
     private weak var mainWindow: NSWindow?
+    private var dockPreferenceObservation: NSKeyValueObservation?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)   // menu-bar only, no Dock icon
+        let showInDock = DockVisibility.isEnabled
+        if !NSApp.setActivationPolicy(DockVisibility.policy(showInDock: showInDock)) {
+            dockLog.error("AppKit refused the launch activation policy (showInDock: \(showInDock))")
+        }
+        // React when Settings toggles the preference. KVO, not SwiftUI forwarding: the
+        // delegate owns the side effect, and it fires in the same runloop pass as the write.
+        dockPreferenceObservation = UserDefaults.standard.observe(\.showInDock) { [weak self] _, _ in
+            self?.applyDockVisibility(DockVisibility.isEnabled)
+        }
         installStatusItem()
         adoptMainWindow()
     }
 
+    /// Applies the Dock/⌘-Tab preference live. Changing the policy hides the window and
+    /// deactivates the app, so re-show in the same runloop pass — deferring reads as a blink.
+    func applyDockVisibility(_ showInDock: Bool) {
+        let policy = DockVisibility.policy(showInDock: showInDock)
+        guard NSApp.activationPolicy() != policy else { return }
+        guard NSApp.setActivationPolicy(policy) else {
+            // Roll back the already-written preference so the Toggle matches reality;
+            // the guard above stops the observer re-fire loop.
+            dockLog.error("AppKit refused the activation policy change (showInDock: \(showInDock)) — reverting the preference")
+            DockVisibility.isEnabled = !showInDock
+            return
+        }
+        openWindow()
+
+        // AppKit can settle the transition asynchronously and pull the app back down —
+        // re-assert once, but only if it landed wrong (a redundant re-order flickers).
+        DispatchQueue.main.async { [weak self] in
+            // Not `isKeyWindow`: the Settings sheet holds key, so that would always re-fire.
+            guard let self, let window = self.mainWindow,
+                  !NSApp.isActive || !window.isVisible else { return }
+            self.openWindow()
+        }
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// Closing only hides the window, so a Dock click / ⌘-Tab reopen must re-show it.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { openWindow() }
+        return true
+    }
 
     func applicationWillTerminate(_ notification: Notification) {
         ProxyCleanup.revertAll()

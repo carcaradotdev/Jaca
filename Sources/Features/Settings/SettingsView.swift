@@ -11,6 +11,7 @@ struct SettingsView: View {
     @AppStorage("adbPath") private var adbPath = ""
     @AppStorage("retentionDays") private var retentionDays = 7
     @AppStorage("colorScheme") private var colorScheme = "dark"
+    @AppStorage(DockVisibility.defaultsKey) private var showInDock = false
     @State private var exclusions: [LogExcludeRule] = []
 
     var body: some View {
@@ -51,19 +52,15 @@ struct SettingsView: View {
                                 color: LemonadeTheme.colors.content.contentPrimary
                             )
                         }
-                        LemonadeUi.Text(
+                        caption(
                             "Off by default. Network inspection uses the in-process Agent — per-app, with " +
                             "call stacks, no certificate needed — which covers most debugging.\n\n" +
                             "Turn this on to also capture whole-device traffic via the companion app and " +
                             "decrypt HTTPS. Limitations: it installs a CA on the device; apps that use " +
                             "certificate pinning (many banking and secure apps) won't be decrypted and may " +
                             "stop working; traffic over QUIC (HTTP/3) can't be decrypted. Experimental and " +
-                            "may be unreliable.",
-                            textStyle: LemonadeTypography.shared.bodyXSmallRegular,
-                            color: LemonadeTheme.colors.content.contentTertiary
+                            "may be unreliable."
                         )
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
 
                     section("History") {
@@ -74,6 +71,21 @@ struct SettingsView: View {
                                 color: LemonadeTheme.colors.content.contentPrimary
                             )
                         }
+                    }
+
+                    section("Dock & app switcher") {
+                        Toggle(isOn: $showInDock) {
+                            LemonadeUi.Text(
+                                "Show Jaca in the Dock and ⌘-Tab",
+                                textStyle: LemonadeTypography.shared.bodySmallSemiBold,
+                                color: LemonadeTheme.colors.content.contentPrimary
+                            )
+                        }
+                        caption(
+                            "Off by default: Jaca lives in the menu bar, so it has no Dock icon and doesn't " +
+                            "appear in the ⌘-Tab switcher. macOS ties the two together — turning this on adds " +
+                            "both. The menu-bar icon stays either way."
+                        )
                     }
 
                     section("Appearance") {
@@ -155,6 +167,15 @@ struct SettingsView: View {
 
     private var currentADBPlaceholder: String {
         AndroidToolchain.adbURL()?.path ?? "adb not found"
+    }
+
+    /// Tertiary explainer text under a section's control, wrapping over the full width.
+    private func caption(_ text: String) -> some View {
+        LemonadeUi.Text(text,
+                        textStyle: LemonadeTypography.shared.bodyXSmallRegular,
+                        color: LemonadeTheme.colors.content.contentTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
