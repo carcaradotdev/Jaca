@@ -5,9 +5,14 @@ import AppKit
 /// Right-hand detail for a selected transaction: overview, headers, request and
 /// response bodies, and timing.
 struct NetworkDetailView: View {
-    let transaction: NetworkTransaction?
+    let session: NetworkSession
     @State private var tab: DetailTab = .overview
     @State private var bodyMode: BodyMode = .tree
+    @State private var copiedCurl = false
+
+    /// Read straight from the session so the pane follows the selection (and the bodies
+    /// rehydrated after it) without keeping a second copy of it.
+    private var transaction: NetworkTransaction? { session.selected }
 
     enum DetailTab: String, CaseIterable { case overview = "Overview", headers = "Headers",
         request = "Request", response = "Response", timing = "Timing" }
@@ -40,7 +45,18 @@ struct NetworkDetailView: View {
                 LemonadeUi.Chip(label: item.rawValue, selected: tab == item,
                                 onChipClicked: { tab = item })
             }
-            Spacer()
+            Spacer(minLength: LemonadeTheme.spaces.spacing200)
+            if let txn = transaction {
+                LemonadeUi.Button(
+                    label: copiedCurl ? "Copied" : "Copy cURL",
+                    onClick: { copyCurl(txn) },
+                    leadingIcon: copiedCurl ? .circleCheck : .copy,
+                    variant: .neutral, type: .subtle, size: .xSmall
+                )
+                .fixedSize()
+                .help("Copy this request as a runnable curl command")
+                .animation(.easeInOut(duration: 0.15), value: copiedCurl)
+            }
         }
         .padding(.horizontal, LemonadeTheme.spaces.spacing300)
         .padding(.vertical, LemonadeTheme.spaces.spacing200)
@@ -117,6 +133,19 @@ struct NetworkDetailView: View {
         }
         .padding(.bottom, LemonadeTheme.spaces.spacing300)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func copyCurl(_ txn: NetworkTransaction) {
+        Task { @MainActor in
+            // Ask the session, not CurlExport directly: an older transaction's body lives in
+            // the on-disk cache and has to be loaded back before the command is worth copying.
+            guard let command = await session.curlCommand(for: txn.id) else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(command, forType: .string)
+            withAnimation(.easeInOut(duration: 0.15)) { copiedCurl = true }
+            try? await Task.sleep(for: .seconds(1.2))
+            withAnimation(.easeInOut(duration: 0.15)) { copiedCurl = false }
+        }
     }
 
     private func copyHeaders(_ headers: [HeaderPair]) {

@@ -347,6 +347,17 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
         }
     }
 
+    /// A runnable `curl` for one transaction, rehydrating an evicted request body from the
+    /// on-disk cache first — otherwise an older row would copy a command with its body missing.
+    func curlCommand(for id: UUID) async -> String? {
+        guard let idx = indexByID[id] else { return nil }
+        var txn = transactions[idx]
+        if txn.bodiesEvicted, txn.requestBody == nil, let cache = bodyCache {
+            txn.requestBody = await cache.load(id).req
+        }
+        return CurlExport.command(for: txn)
+    }
+
     // MARK: - CA (proxy mode)
 
     func pushCAToDevice() {
