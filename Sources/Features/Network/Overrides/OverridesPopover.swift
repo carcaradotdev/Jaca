@@ -201,7 +201,7 @@ struct OverridesPopover: View {
 
     private var idleMessage: String {
         if !FeatureFlags.responseOverridesEnabled {
-            return "Turn on Response overrides in Settings to apply these rules."
+            return "Turn on Agent HTTPS debugging in Settings to apply these rules."
         }
         if session.captureMode != .agent {
             return "Overrides apply to in-process agent capture. Other transports will follow."

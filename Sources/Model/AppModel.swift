@@ -17,26 +17,26 @@ final class AppModel {
     /// Top-level area the app is showing: the device/session view or the worktrees area.
     var mode: WorkspaceMode = .devices
 
-    /// Experimental HTTPS decryption + companion capture, OFF by default and fully opt-in
-    /// (Settings). When off, the companion subsystem is never started and network inspection
-    /// offers only Agent mode (per-app, in-process, no CA). Persisted across launches.
-    /// Response overrides (answer a matched request from a rule instead of the origin). Off by
-    /// default: arming it routes the rules' hosts through the Mac.
-    var responseOverridesEnabled: Bool = FeatureFlags.responseOverridesEnabled {
+    /// Agent HTTPS debugging (the default, with response overrides) or HTTPS debugging as a
+    /// man-in-the-middle via the companion app — one or the other; see
+    /// `FeatureFlags.networkInspectionMode`. Persisted across launches.
+    var networkInspectionMode: NetworkInspectionMode = FeatureFlags.networkInspectionMode {
         didSet {
-            guard responseOverridesEnabled != oldValue else { return }
-            FeatureFlags.responseOverridesEnabled = responseOverridesEnabled
-            reconfigureOverrides()
+            guard networkInspectionMode != oldValue else { return }
+            // Persisted first: both reconfigurations read the flags back.
+            FeatureFlags.networkInspectionMode = networkInspectionMode
+            if (oldValue == .httpsDecryption) != httpsDecryptionEnabled { reconfigureCompanion() }
+            if (oldValue == .responseOverrides) != responseOverridesEnabled { reconfigureOverrides() }
         }
     }
 
-    var httpsDecryptionEnabled: Bool = FeatureFlags.httpsDecryptionEnabled {
-        didSet {
-            guard httpsDecryptionEnabled != oldValue else { return }
-            FeatureFlags.httpsDecryptionEnabled = httpsDecryptionEnabled
-            reconfigureCompanion()
-        }
-    }
+    /// Experimental HTTPS decryption + companion capture. When off, the companion subsystem is
+    /// never started and network inspection offers only Agent mode (per-app, in-process, no CA).
+    var httpsDecryptionEnabled: Bool { networkInspectionMode == .httpsDecryption }
+
+    /// Response overrides (answer a matched request from a rule instead of the origin). Arming it
+    /// routes the rules' hosts through the Mac.
+    var responseOverridesEnabled: Bool { networkInspectionMode == .responseOverrides }
 
     /// The unified Projects area state: auto-detected Claude projects + user-added
     /// folders, their worktrees, and per-checkout cache cleanup.

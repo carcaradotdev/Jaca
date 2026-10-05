@@ -18,7 +18,7 @@ enum OverrideRowGate {
                                   /// and must never block authoring.
                                   httpStack: String?) -> String? {
         guard overridesAvailable else { return "Response overrides aren't available." }
-        guard featureEnabled else { return "Turn on Response overrides in Settings first." }
+        guard featureEnabled else { return "Turn on Agent HTTPS debugging in Settings first." }
 
         // Companion flow-metadata rows are "host:port" — no method, path or body to override.
         if OverrideMatching.facts(url: url) == nil {

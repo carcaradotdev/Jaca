@@ -91,7 +91,7 @@ final class OverrideRowGateTests: XCTestCase {
         XCTAssertEqual(reason(transport: .mitmProxy, overridesAvailable: false),
                        "Response overrides aren't available.")
         XCTAssertEqual(reason(transport: .mitmProxy, featureEnabled: false),
-                       "Turn on Response overrides in Settings first.")
+                       "Turn on Agent HTTPS debugging in Settings first.")
     }
 
     /// Companion flow-metadata rows are `"host:port"` — there is no method, path or body to

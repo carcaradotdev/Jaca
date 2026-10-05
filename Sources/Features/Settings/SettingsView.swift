@@ -48,62 +48,30 @@ struct SettingsView: View {
                     }
 
                     section("Network inspection") {
-                        Toggle(isOn: Binding(get: { model.httpsDecryptionEnabled },
-                                             set: { model.httpsDecryptionEnabled = $0 })) {
-                            LemonadeUi.Text(
-                                "HTTPS decryption (experimental)",
-                                textStyle: LemonadeTypography.shared.bodySmallSemiBold,
-                                color: LemonadeTheme.colors.content.contentPrimary
-                            )
-                        }
-                        caption(
-                            "Off by default. Network inspection uses the in-process Agent — per-app, with " +
-                            "call stacks, no certificate needed — which covers most debugging.\n\n" +
-                            "Turn this on to also capture whole-device traffic via the companion app and " +
-                            "decrypt HTTPS. Limitations: it installs a CA on the device; apps that use " +
-                            "certificate pinning (many banking and secure apps) won't be decrypted and may " +
-                            "stop working; traffic over QUIC (HTTP/3) can't be decrypted. Experimental and " +
-                            "may be unreliable."
-                        )
-
-                        Divider().overlay(LemonadeTheme.colors.border.borderNeutralLow)
-
-                        Toggle(isOn: Binding(get: { model.responseOverridesEnabled },
-                                             set: { model.responseOverridesEnabled = $0 })) {
-                            LemonadeUi.Text(
-                                "Response overrides (experimental)",
-                                textStyle: LemonadeTypography.shared.bodySmallSemiBold,
-                                color: LemonadeTheme.colors.content.contentPrimary
-                            )
-                        }
-                        caption(
-                            "Off by default. Lets you answer a matched request from a rule instead of the " +
+                        // One choice rather than two toggles: overrides only run in the in-process
+                        // agent, which the companion capture replaces, so both on was a combination
+                        // where neither worked as described. No "off": the agent captures either way.
+                        modeOption(.responseOverrides, title: "Agent HTTPS debugging", detail:
+                            "Lets you answer a matched request from a rule instead of the " +
                             "real server — right-click any captured request, or use the Overrides button " +
                             "next to the search field.\n\n" +
                             "It works on apps that pin certificates, because the in-process Agent rewrites " +
                             "the request above TLS rather than intercepting the network. While a rule is " +
                             "enabled, only the hosts it names are routed through your Mac; everything else " +
                             "stays on the device's own network. The tunnel is removed when capture stops, " +
-                            "and the agent stops diverting on its own if Jaca goes away."
-                        )
-
-                        Divider().overlay(LemonadeTheme.colors.border.borderNeutralLow)
-
-                        Toggle(isOn: $simulatorAutoReattach) {
-                            LemonadeUi.Text(
-                                "Re-attach to iOS Simulator apps automatically",
-                                textStyle: LemonadeTypography.shared.bodySmallSemiBold,
-                                color: LemonadeTheme.colors.content.contentPrimary
-                            )
+                            "and the agent stops diverting on its own if Jaca goes away.") {
+                            simulatorReattachSetting
                         }
-                        caption(
-                            "Off by default. The agent is injected into the process Jaca launched, so an app " +
-                            "you quit and reopen yourself comes back without it — capture and overrides stop. " +
-                            "Jaca notices and offers a “Relaunch & re-attach” button on the capture tab.\n\n" +
-                            "Turn this on to let it relaunch the app for you instead of asking. It still says so " +
-                            "in the status line, and it never opens an app you closed — only one you reopened " +
-                            "yourself."
-                        )
+                        modeOption(.httpsDecryption, title: "HTTPS debugging", detail:
+                            "Off by default. Network inspection uses the in-process Agent — per-app, with " +
+                            "call stacks, no certificate needed — which covers most debugging.\n\n" +
+                            "Turn this on to also capture whole-device traffic via the companion app and " +
+                            "decrypt HTTPS. It works as a man-in-the-middle (MITM): the companion app routes " +
+                            "the device's traffic through Jaca, which decrypts it and re-encrypts it on its " +
+                            "way to the server. Limitations: it installs a CA on the device; apps that use " +
+                            "certificate pinning (many banking and secure apps) won't be decrypted and may " +
+                            "stop working; traffic over QUIC (HTTP/3) can't be decrypted. Experimental and " +
+                            "may be unreliable.")
 
                         Divider().overlay(LemonadeTheme.colors.border.borderNeutralLow)
 
@@ -229,6 +197,65 @@ struct SettingsView: View {
     }
 
     /// Tertiary explainer text under a section's control, wrapping over the full width.
+    /// One choice of the network-inspection mode: radio, title and description, all one click
+    /// target, so the description isn't dead space next to a small control.
+    private func modeOption(_ mode: NetworkInspectionMode, title: String, detail: String?) -> some View {
+        modeOption(mode, title: title, detail: detail) { EmptyView() }
+    }
+
+    /// `nested` holds settings that only mean something in this mode. It shows under the option
+    /// while it's selected, aligned with the title, so a setting that can't apply is absent rather
+    /// than disabled.
+    private func modeOption<Nested: View>(_ mode: NetworkInspectionMode, title: String, detail: String?,
+                                          @ViewBuilder nested: () -> Nested) -> some View {
+        let selected = model.networkInspectionMode == mode
+        let select = { withAnimation(.easeInOut(duration: 0.2)) { model.networkInspectionMode = mode } }
+        return HStack(alignment: .top, spacing: LemonadeTheme.spaces.spacing300) {
+            LemonadeUi.RadioButton(checked: selected, onRadioButtonClicked: select)
+            VStack(alignment: .leading, spacing: LemonadeTheme.spaces.spacing300) {
+                Button(action: select) {
+                    VStack(alignment: .leading, spacing: LemonadeTheme.spaces.spacing100) {
+                        LemonadeUi.Text(title, textStyle: LemonadeTypography.shared.bodySmallSemiBold,
+                                        color: LemonadeTheme.colors.content.contentPrimary)
+                        if let detail { caption(detail) }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityElement(children: .combine)
+                .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+
+                // Outside the option's button, so its own controls stay clickable.
+                if selected {
+                    nested().transition(.opacity)
+                }
+            }
+        }
+    }
+
+    /// Nested under Agent HTTPS debugging: re-attaching re-injects the agent, so it has no meaning
+    /// in the other mode (where `FeatureFlags` also keeps it off).
+    private var simulatorReattachSetting: some View {
+        VStack(alignment: .leading, spacing: LemonadeTheme.spaces.spacing200) {
+            Toggle(isOn: $simulatorAutoReattach) {
+                LemonadeUi.Text(
+                    "Re-attach to iOS Simulator apps automatically",
+                    textStyle: LemonadeTypography.shared.bodySmallSemiBold,
+                    color: LemonadeTheme.colors.content.contentPrimary
+                )
+            }
+            caption(
+                "Off by default. The agent is injected into the process Jaca launched, so an app " +
+                "you quit and reopen yourself comes back without it — capture and overrides stop. " +
+                "Jaca notices and offers a “Relaunch & re-attach” button on the capture tab.\n\n" +
+                "Turn this on to let it relaunch the app for you instead of asking. It still says so " +
+                "in the status line, and it never opens an app you closed — only one you reopened " +
+                "yourself."
+            )
+        }
+    }
+
     private func caption(_ text: String) -> some View {
         LemonadeUi.Text(text,
                         textStyle: LemonadeTypography.shared.bodyXSmallRegular,
