@@ -10,7 +10,7 @@ class SqueezeTracker(private val url: String) {
     @Volatile private var method = "GET"
     /** Which HTTP stack produced this transaction ("okhttp3", "okhttp2", "urlconnection").
      *  Capture metadata, not policy: the desktop uses it to tell the user whether a request is
-     *  even *divertible* (only okhttp3 is). It cannot be derived from [callStack], which
+     *  even *routable* (only okhttp3 is). It cannot be derived from [callStack], which
      *  deliberately strips okhttp/okio frames to show app code. */
     @Volatile private var httpStack: String? = null
     private val startedAtMs = System.currentTimeMillis()

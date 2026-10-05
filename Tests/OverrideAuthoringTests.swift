@@ -101,12 +101,12 @@ final class OverrideAuthoringTests: XCTestCase {
     /// A rule created by right-clicking must have its routed host derived automatically —
     /// an empty host set arms nothing at all.
     @MainActor
-    func test_savingDerivesTheDivertHostFromThePattern() {
+    func test_savingDerivesTheRoutedHostFromThePattern() {
         let model = OverridesModel()
         let rule = OverrideRule(name: "Derived",
                                 matcher: OverrideMatcher(pattern: "https://api.example.com/v1/**"))
         model.save(rule)
-        XCTAssertEqual(model.rules.first { $0.id == rule.id }?.divertHosts, ["api.example.com"])
+        XCTAssertEqual(model.rules.first { $0.id == rule.id }?.routedHosts, ["api.example.com"])
         model.remove(rule.id)
     }
 
@@ -126,7 +126,7 @@ final class OverrideAuthoringTests: XCTestCase {
             let facts = OverrideMatching.facts(url: "https://delay.example.com/v1")!
             guard let match = model.compiled.firstMatch(facts: facts, method: "GET",
                                                         deviceID: nil, appID: nil) else { return nil }
-            return OverrideMatching.decide(match, transport: .agentDivert(package: "p"),
+            return OverrideMatching.decide(match, transport: .androidAgent(package: "p"),
                                            capabilities: .desktopTerminated,
                                            masterEnabled: true).0.delay
         }
@@ -156,7 +156,7 @@ final class OverrideAuthoringTests: XCTestCase {
         let facts = OverrideMatching.facts(url: "https://other.example.com/v1")!
         XCTAssertNil(model.compiled.firstMatch(facts: facts, method: "GET", deviceID: nil, appID: nil))
 
-        let (decision, _) = OverrideMatching.decide(nil, transport: .agentDivert(package: "p"),
+        let (decision, _) = OverrideMatching.decide(nil, transport: .androidAgent(package: "p"),
                                                     capabilities: .desktopTerminated,
                                                     masterEnabled: true)
         XCTAssertEqual(decision.delay, .zero)
@@ -166,7 +166,7 @@ final class OverrideAuthoringTests: XCTestCase {
     // MARK: - The applied badge
 
     /// The badge is driven by the `X-Jaca-Override` stamp the agent captures on the way back.
-    /// Correlating by id could never work: `OverrideServer` mints its own request id that no
+    /// Correlating by id could never work: `AgentHTTPServer` mints its own request id that no
     /// captured row shares.
     func test_overriddenRuleIDIsRecoveredFromTheResponseStamp() {
         let ruleID = UUID()

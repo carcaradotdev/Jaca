@@ -1,16 +1,16 @@
-# Response overrides on the iOS Simulator
+# Agent HTTPS debugging on the iOS Simulator
 
 **Status: shipped.** Right-click a captured request in an iOS-Simulator agent tab → *Override
 response…*, exactly as on Android. Rules, matching, precedence and payloads are the same
 desktop-side engine; only the transport differs.
 
-Companion docs: [`response-overrides-android.md`](response-overrides-android.md) (the feature and
-its traps) and [`divert-contract.md`](divert-contract.md) (what the desktop and the two agents
+Companion docs: [`agent-https-debugging-android.md`](agent-https-debugging-android.md) (the feature and
+its traps) and [`agent-http-contract.md`](agent-http-contract.md) (what the desktop and the two agents
 agree on).
 
 | Target | Supported | Mechanism |
 |---|---|---|
-| **iOS Simulator** | **yes** | `NSURLProtocol` in the injected agent, diverting to a loopback server on the Mac |
+| **iOS Simulator** | **yes** | `NSURLProtocol` in the injected agent, routing to a loopback server on the Mac |
 | **iOS physical device** | no | Injection needs `simctl`. Only the MITM proxy applies there — which is the thing this feature exists to avoid needing |
 
 ---
@@ -22,14 +22,14 @@ Android spends most of its complexity on things that don't exist here:
 | Android problem | iOS Simulator |
 |---|---|
 | `adb reverse` tunnel to reach the Mac | **nothing to open** — the simulator shares the Mac's loopback (`SharedLoopbackTunnel`) |
-| Tunnel teardown, `TunnelLedger`, orphan reconcile | **not applicable** — nothing is created, so nothing can outlive a `SIGKILL`. Asserted twice: `DivertTunnelTests` and live case 5 |
+| Tunnel teardown, `TunnelLedger`, orphan reconcile | **not applicable** — nothing is created, so nothing can outlive a `SIGKILL`. Asserted twice: `AgentHTTPTunnelTests` and live case 5 |
 | `network_security_config` must permit cleartext to localhost | no such gate |
 | `CertificatePinner` would break a proxy | irrelevant — we're above TLS *and* we own the replay |
 | okhttp3-only (okhttp2 / `HttpURLConnection` / Cronet untouched) | `NSURLProtocol` sees all `URLSession` / `NSURLConnection` traffic |
 | Attach spec frozen per process (`attach()` early-returns) | the agent is re-injected on every launch |
 
 The control channel is also inverted in our favour. On Android the agent *listens*; here it is a
-TCP **client** that dials `127.0.0.1:$JACA_NET_PORT`, so Jaca writes divert frames back down the
+TCP **client** that dials `127.0.0.1:$JACA_NET_PORT`, so Jaca writes route frames back down the
 very connection it already reads transactions from. No new socket, no new port.
 
 What the Simulator has instead is a problem Android doesn't: **the agent lives and dies with the
@@ -44,18 +44,18 @@ below exists for.
 Sources/Core/Capture/IOSSimulatorAgentCaptureSource.swift   the CaptureSource; declares capabilities
 Sources/Core/Network/IOSSimulatorAgentController.swift      composes the session (~200 lines, no sockets)
 Sources/Core/Network/AgentLineChannel.swift                 the socket, framing, SO_NOSIGPIPE, flush
-Sources/Core/Overrides/DivertCoordinator.swift              override server + tunnel + control frames
-Sources/Core/Overrides/DivertTunnel.swift                   SharedLoopbackTunnel (a no-op, by design)
+Sources/Core/AgentHTTP/AgentHTTPCoordinator.swift           override server + tunnel + control frames
+Sources/Core/AgentHTTP/AgentHTTPTunnel.swift                SharedLoopbackTunnel (a no-op, by design)
 Sources/Core/Devices/SimulatorAppLauncher.swift             the single owner of `simctl launch`
 Sources/Core/Network/SimulatorAgentLaunch.swift             the injection env + argv (pure)
 Sources/Core/Network/SimulatorAttachSupervisor.swift        notices an app running without the agent
 Sources/Core/Network/SimulatorReattachPolicy.swift          the three-way decision (pure)
-agent/iOS/JacaNetAgent.m                                    the NSURLProtocol tap + divert client
+agent/iOS/JacaNetAgent.m                                    the NSURLProtocol tap + routing client
 agent/iOS/JacaNetChannel.{h,m}                              transport only: dial, hello, frames, EOF
-agent/iOS/JacaDivert.{h,m}                                  the Divert.kt twin — state, window, targetFor
+agent/iOS/JacaAgentHTTP.{h,m}                               the AgentHttp.kt twin — state, window, targetFor
 ```
 
-Everything above `DivertCoordinator` is shared with Android. The transport-specific parts are the
+Everything above `AgentHTTPCoordinator` is shared with Android. The transport-specific parts are the
 tunnel (which does nothing), the launcher, and the agent itself.
 
 ## The path a request takes
@@ -63,10 +63,10 @@ tunnel (which does nothing), the launcher, and the agent itself.
 ```
 app: GET https://api.example.com/v1/thing
         ↓  NSURLProtocol tap (JacaNetAgent), above TLS, in-process
-        ↓  host is in the routed set and the window is alive?  (JacaDivert)
+        ↓  host is in the routed set and the window is alive?  (JacaAgentHTTP)
    GET http://127.0.0.1:41234/v1/thing        X-Jaca-Original-URL: https://api.example.com/v1/thing
         ↓  plain loopback — the simulator IS on the Mac
-   OverrideServer → InterceptPipeline → the same rules Android uses
+   AgentHTTPServer → InterceptPipeline → the same rules Android uses
         ↓
    a rule matched  → fabricated/edited response, stamped X-Jaca-Override
    nothing matched → 599 + X-Jaca-Divert: retry-direct → the agent re-sends it directly
@@ -74,7 +74,7 @@ app: GET https://api.example.com/v1/thing
    the original URL is restored onto the response before the app sees it
 ```
 
-The captured row reports `self.request` — the app's *original* request — so a diverted exchange is
+The captured row reports `self.request` — the app's *original* request — so a routed exchange is
 still reported as the real `https://` URL, with none of Jaca's headers. Live case 1 asserts both
 halves of that.
 
@@ -89,7 +89,7 @@ Android for the same reason.
 ### One capability constant, two readers
 
 `IOSSimulatorAgentCaptureSource.nativeCapabilities = .desktopTerminated` is threaded down —
-source → controller → `DivertCoordinator` → `OverrideServer` → `pipeline.run(capabilities:)` — with
+source → controller → `AgentHTTPCoordinator` → `AgentHTTPServer` → `pipeline.run(capabilities:)` — with
 no default anywhere on that chain. The value the toolbar shows and the value the clamp applies are
 provably the same constant (`OverrideClampTests`). A source constructed **without** `intercept:`
 declares `[]` and can never arm.
@@ -145,7 +145,7 @@ subsystems want to launch the same app with different environments:
 
 The one property this feature exists for — *the app received a body Jaca fabricated* — is invisible
 from every desktop surface. The toolbar, the popover, the rule list and even the captured rows can
-all look healthy while nothing is being diverted. The only place the truth exists is inside the
+all look healthy while nothing is being routed. The only place the truth exists is inside the
 app's own response.
 
 > **Note — the automated end-to-end proof was removed.** It was a committed Simulator probe app
@@ -160,21 +160,21 @@ app's own response.
 
 What the pure tests still cover:
 
-- `Tests/ObjC/JacaDivertTests.m` — the agent's divert decisions (host match, the dead-man window,
+- `Tests/ObjC/JacaAgentHTTPTests.m` — the agent's route decisions (host match, the dead-man window,
   the 599 retry-direct pair, URL restore), run on the host.
-- `Tests/DivertCoordinatorTests.swift` — arming, the pre-hello silence, teardown order, the
+- `Tests/AgentHTTPCoordinatorTests.swift` — arming, the pre-hello silence, teardown order, the
   start-after-stop guard, presence → state.
 - `Tests/AttachDetectionTests.swift` — a lost agent surfaces even with overrides off.
-- `Tests/OverrideEndpointFrameTests.swift`, `Tests/DivertTunnelTests.swift`,
+- `Tests/AgentHTTPRouteFrameTests.swift`, `Tests/AgentHTTPTunnelTests.swift`,
   `Tests/OverrideClampTests.swift` — the frame contract, the tunnel, the capability clamp.
 
 ### Doing it by hand
 
 ```bash
 ./scripts/all.sh                 # build + launch Jaca
-# Settings → enable "Response overrides"; pick a booted simulator + a debug app → Agent capture
+# Settings → "Agent HTTPS debugging" (the default); pick a booted simulator + a debug app → Agent capture
 # right-click a captured row → Override response…
-grep -E 'divert|answered|bouncing' ~/.jaca/logs/jaca.log
+grep -E 'routing|answered|bouncing' ~/.jaca/logs/jaca.log
 xcrun simctl spawn booted log stream --predicate 'process == "YourApp"'
 ```
 
@@ -191,9 +191,9 @@ xcrun simctl spawn booted log stream --predicate 'process == "YourApp"'
   exists.
 - **Streaming responses aren't overridable.** SSE/gRPC requests are bounced with retry-direct — the
   desktop buffers whole bodies, so a streamed exchange would hang end-to-end.
-- **Request bodies that can't be re-read are never diverted**, because both safety nets re-send the
+- **Request bodies that can't be re-read are never routed**, because both safety nets re-send the
   request.
-- **Diverted traffic is cleartext between app and Mac.** It's loopback, and the server binds
+- **Routed traffic is cleartext between app and Mac.** It's loopback, and the server binds
   `127.0.0.1` only. Fine for a debug session; never for anything else.
 - **Binary bodies are omitted, not fabricated.** The agent drops the body key for non-UTF-8 data and
   reports the true `requestSize`/`responseSize`, so a row says "no body captured" with a correct
@@ -212,7 +212,7 @@ xcrun simctl spawn booted log stream --predicate 'process == "YourApp"'
 
 ## See also
 
-- [`divert-contract.md`](divert-contract.md) — the frame, the 599 pair, the window, host matching
-- [`response-overrides-android.md`](response-overrides-android.md) — the feature, the rule engine,
+- [`agent-http-contract.md`](agent-http-contract.md) — the frame, the 599 pair, the window, host matching
+- [`agent-https-debugging-android.md`](agent-https-debugging-android.md) — the feature, the rule engine,
   and the Android path
-- `Tests/ObjC/JacaDivertTests.m` — the agent's decisions, tested on macOS
+- `Tests/ObjC/JacaAgentHTTPTests.m` — the agent's decisions, tested on macOS

@@ -12,7 +12,7 @@ final class OverrideCompilerTests: XCTestCase {
                              matcher: OverrideMatcher(pattern: pattern, methods: methods),
                              scope: scope)
         r.enabled = enabled
-        r.divertHosts = hosts ?? OverrideCompiler.derivedDivertHosts(for: r.matcher)
+        r.routedHosts = hosts ?? OverrideCompiler.derivedRoutedHosts(for: r.matcher)
         return r
     }
 
@@ -74,42 +74,42 @@ final class OverrideCompilerTests: XCTestCase {
                                        deviceID: "any", appID: "any"))
     }
 
-    // MARK: - Divert hosts (the blast radius)
+    // MARK: - Route hosts (the blast radius)
 
-    func test_divertHostsUnionOnlyEnabledRules() {
+    func test_routedHostsUnionOnlyEnabledRules() {
         let a = rule("https://a.com/**")
         let b = rule("https://b.com/**", enabled: false)
         let set = OverrideCompiler.compile([a, b], masterEnabled: true)
-        XCTAssertEqual(set.divertHosts(deviceID: nil, appID: nil), ["a.com"])
+        XCTAssertEqual(set.routedHosts(deviceID: nil, appID: nil), ["a.com"])
     }
 
     /// Master off must route *nothing*: pausing overrides has to take the device's traffic
     /// completely off the tunnel, not just stop matching.
     func test_masterOffRoutesNoHosts() {
         let set = OverrideCompiler.compile([rule("https://a.com/**")], masterEnabled: false)
-        XCTAssertTrue(set.divertHosts(deviceID: nil, appID: nil).isEmpty)
+        XCTAssertTrue(set.routedHosts(deviceID: nil, appID: nil).isEmpty)
     }
 
-    func test_divertHostsRespectScope() {
+    func test_routedHostsRespectScope() {
         let scoped = rule("https://a.com/**", scope: OverrideScope(appIDs: ["com.example"]))
         let set = OverrideCompiler.compile([scoped], masterEnabled: true)
-        XCTAssertEqual(set.divertHosts(deviceID: nil, appID: "com.example"), ["a.com"])
-        XCTAssertTrue(set.divertHosts(deviceID: nil, appID: "com.other").isEmpty)
+        XCTAssertEqual(set.routedHosts(deviceID: nil, appID: "com.example"), ["a.com"])
+        XCTAssertTrue(set.routedHosts(deviceID: nil, appID: "com.other").isEmpty)
     }
 
     /// The safety property that matters most: a rule that can't name its hosts contributes
     /// nothing, so Jaca can never end up tunnelling an app's entire traffic by accident.
     func test_ruleWithNoDerivableHostContributesNothing() {
         let wildcard = rule("**/product-state")
-        XCTAssertTrue(wildcard.divertHosts.isEmpty)
+        XCTAssertTrue(wildcard.routedHosts.isEmpty)
         let set = OverrideCompiler.compile([wildcard], masterEnabled: true)
-        XCTAssertTrue(set.divertHosts(deviceID: nil, appID: nil).isEmpty)
+        XCTAssertTrue(set.routedHosts(deviceID: nil, appID: nil).isEmpty)
     }
 
     func test_explicitHostsAreHonouredForWildcardPatterns() {
         let wildcard = rule("**/product-state", hosts: ["api.example.com"])
         let set = OverrideCompiler.compile([wildcard], masterEnabled: true)
-        XCTAssertEqual(set.divertHosts(deviceID: nil, appID: nil), ["api.example.com"])
+        XCTAssertEqual(set.routedHosts(deviceID: nil, appID: nil), ["api.example.com"])
     }
 
     // MARK: - Diagnostics

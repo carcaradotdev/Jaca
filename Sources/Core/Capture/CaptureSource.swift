@@ -49,7 +49,7 @@ protocol CaptureSource: AnyObject {
 
     /// The coordinator arming this source's device, when overrides were actually wired up.
     /// Nil means nothing is armed — the UI must not claim overrides are active.
-    var arming: DivertCoordinator? { get }
+    var arming: AgentHTTPCoordinator? { get }
 }
 
 extension CaptureSink {
@@ -58,7 +58,7 @@ extension CaptureSink {
 
 extension CaptureSource {
     var interceptCapabilities: InterceptCapabilities { [] }
-    var arming: DivertCoordinator? { nil }
+    var arming: AgentHTTPCoordinator? { nil }
 }
 
 /// Static, selectable description of a capture option for a device. Drives the chooser

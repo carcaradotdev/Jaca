@@ -15,7 +15,7 @@ final class OverrideCoordinatorRegistryTests: XCTestCase {
         func flush(timeout: Duration) async {}
     }
 
-    private final class NoopTunnel: DivertTunnel, @unchecked Sendable {
+    private final class NoopTunnel: AgentHTTPTunnel, @unchecked Sendable {
         func origin(forLocalPort port: Int) -> String { "http://stub:\(port)" }
         func open(localPort port: Int) async throws {}
         func close(localPort port: Int) async {}
@@ -24,8 +24,8 @@ final class OverrideCoordinatorRegistryTests: XCTestCase {
 
     private let target = InterceptTarget(deviceID: "sim-1", package: "com.example.app")
 
-    private func makeCoordinator(_ services: InterceptServices) -> DivertCoordinator {
-        DivertCoordinator(transport: .iosSimulatorDivert(bundleID: "com.example.app"),
+    private func makeCoordinator(_ services: InterceptServices) -> AgentHTTPCoordinator {
+        AgentHTTPCoordinator(transport: .iosSimulatorAgent(bundleID: "com.example.app"),
                           deviceID: target.deviceID,
                           appID: target.package,
                           capabilities: .desktopTerminated,

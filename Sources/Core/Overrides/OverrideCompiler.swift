@@ -28,12 +28,12 @@ struct OverrideRuleSet: Sendable {
     }
 
     /// The hosts device transports must route through the Mac. The feature's blast radius, so
-    /// it's derived from **enabled** rules only, and empty means "divert nothing".
-    func divertHosts(deviceID: String?, appID: String?) -> Set<String> {
+    /// it's derived from **enabled** rules only, and empty means "route nothing".
+    func routedHosts(deviceID: String?, appID: String?) -> Set<String> {
         guard masterEnabled else { return [] }
         var hosts: Set<String> = []
         for compiled in rules where compiled.rule.scope.matches(deviceID: deviceID, appID: appID) {
-            hosts.formUnion(compiled.rule.divertHosts)
+            hosts.formUnion(compiled.rule.routedHosts)
         }
         return hosts
     }
@@ -77,9 +77,9 @@ enum OverrideCompiler {
         return p
     }
 
-    /// The divert hosts a pattern implies, or empty when the host is wildcarded — which makes
+    /// The routed hosts a pattern implies, or empty when the host is wildcarded — which makes
     /// the editor *ask*, so Jaca never silently tunnels an app's whole traffic through the Mac.
-    static func derivedDivertHosts(for matcher: OverrideMatcher) -> Set<String> {
+    static func derivedRoutedHosts(for matcher: OverrideMatcher) -> Set<String> {
         guard matcher.kind == .glob else { return [] }
         guard let host = OverrideMatching.literalHost(ofPattern: matcher.pattern) else { return [] }
         return [host]

@@ -162,9 +162,9 @@ object OkHttpHook {
             // == null); that's the only layer where a request's host/port may change. A
             // NETWORK interceptor runs on an established connection, and okhttp hard-fails
             // a host/port change there ("must retain the same host and port"), so the POC
-            // divert must happen on the application side — and capture stays on the network
+            // routing must happen on the application side — and capture stays on the network
             // side, where the real wire request/response live.
-            if (isApplicationLayer(chainCls, chain)) return divertPass(chainCls, chain, request)
+            if (isApplicationLayer(chainCls, chain)) return routePass(chainCls, chain, request)
 
             val tracker = try { startTracker(request) } catch (t: Throwable) { null }
 
@@ -183,7 +183,7 @@ object OkHttpHook {
             } catch (t: Throwable) { response }
         }
 
-        /** Application-interceptor pass: divert a matched request, otherwise stay out of the
+        /** Application-interceptor pass: route a matched request, otherwise stay out of the
          *  way entirely. No capture here — the network-layer pass records the transaction.
          *
          *  Two safety nets make a dead desktop harmless, and neither needs Jaca running:
@@ -193,8 +193,8 @@ object OkHttpHook {
          *     on the network layer.
          *   - **fail-open**: if the tunnel is gone (ECONNREFUSED and friends), disarm and retry
          *     the original once, so a SIGKILLed Jaca can't brick the user's app. */
-        private fun divertPass(chainCls: Class<*>, chain: Any, request: Any): Any {
-            val outbound = divertIfMatched(request)
+        private fun routePass(chainCls: Class<*>, chain: Any, request: Any): Any {
+            val outbound = routeIfMatched(request)
             val proceed = chainCls.getMethod("proceed", request.javaClass)
             if (outbound === request) return invokeUnwrapped { proceed.invoke(chain, request) }
 
@@ -203,8 +203,8 @@ object OkHttpHook {
             } catch (t: Throwable) {
                 // The tunnel died under us. Go read-only and let the app's real request through,
                 // so the only visible effect is that the override stopped applying.
-                Log.e(TAG, "divert: tunnel unreachable, failing open and retrying direct", t)
-                Divert.disarm()
+                Log.e(TAG, "route: tunnel unreachable, failing open and retrying direct", t)
+                AgentHttp.disarm()
                 return invokeUnwrapped { proceed.invoke(chain, request) }
             }
 
@@ -212,7 +212,7 @@ object OkHttpHook {
                 closeQuietly(response)
                 return invokeUnwrapped { proceed.invoke(chain, request) }
             }
-            // Put the ORIGINAL request back on the response, so a diverted call still looks
+            // Put the ORIGINAL request back on the response, so a routed call still looks
             // like the real URL to the app (cookies, logging, anything reading response.request).
             return restoreRequest(response, request)
         }
@@ -221,9 +221,9 @@ object OkHttpHook {
         private fun isRetryDirect(response: Any): Boolean = try {
             val cls = response.javaClass
             val code = cls.getMethod("code").invoke(response) as Int
-            code == Divert.RETRY_DIRECT_STATUS &&
+            code == AgentHttp.RETRY_DIRECT_STATUS &&
                 (cls.getMethod("header", String::class.java)
-                    .invoke(response, Divert.DIVERT_HEADER) as? String) == Divert.RETRY_DIRECT
+                    .invoke(response, AgentHttp.RETRY_DIRECT_HEADER) as? String) == AgentHttp.RETRY_DIRECT
         } catch (t: Throwable) {
             false
         }
@@ -246,30 +246,30 @@ object OkHttpHook {
             false
         }
 
-        /** A copy of [request] pointed at the desktop when [Divert] says this host is routed,
+        /** A copy of [request] pointed at the desktop when [AgentHttp] says this host is routed,
          *  otherwise [request] itself. okhttp3 only — okhttp2 keeps the plain capture path.
          *  Any failure returns the original request unchanged. */
-        private fun divertIfMatched(request: Any): Any {
-            if (!Divert.isArmed) return request
+        private fun routeIfMatched(request: Any): Any {
+            if (!AgentHttp.isArmed) return request
             return try {
                 val reqCls = request.javaClass
                 if (reqCls.name != "okhttp3.Request") return request
-                if (!isDivertEligible(request, reqCls)) return request
+                if (!isRoutable(request, reqCls)) return request
                 val httpUrl = reqCls.getMethod("url").invoke(request)
                 val url = httpUrl.toString()
                 val host = (httpUrl.javaClass.getMethod("host").invoke(httpUrl) as? String)
                     ?.lowercase() ?: return request
-                val target = Divert.targetFor(host, pathAndQuery(url)) ?: return request
+                val target = AgentHttp.targetFor(host, pathAndQuery(url)) ?: return request
                 val builder = reqCls.getMethod("newBuilder").invoke(request)
                 val bCls = builder.javaClass
                 bCls.getMethod("url", String::class.java).invoke(builder, target)
                 bCls.getMethod("header", String::class.java, String::class.java)
-                    .invoke(builder, Divert.ORIGINAL_URL_HEADER, url)
-                val diverted = invokeUnwrapped { bCls.getMethod("build").invoke(builder) }
-                Log.d(TAG, "divert: $url -> $target")
-                diverted
+                    .invoke(builder, AgentHttp.ORIGINAL_URL_HEADER, url)
+                val routed = invokeUnwrapped { bCls.getMethod("build").invoke(builder) }
+                Log.d(TAG, "route: $url -> $target")
+                routed
             } catch (t: Throwable) {
-                Log.e(TAG, "divert failed; proceeding with the original request", t)
+                Log.e(TAG, "route failed; proceeding with the original request", t)
                 request
             }
         }
@@ -283,10 +283,10 @@ object OkHttpHook {
             return if (slash < 0) "/" else url.substring(slash)
         }
 
-        /** Requests that must never be diverted, because the retry-direct bounce (or a fail-open
+        /** Requests that must never be routed, because the retry-direct bounce (or a fail-open
          *  retry) would have to re-send a body that can only be sent once, or would break a
          *  protocol upgrade that isn't plain HTTP on the other side. */
-        private fun isDivertEligible(request: Any, reqCls: Class<*>): Boolean {
+        private fun isRoutable(request: Any, reqCls: Class<*>): Boolean {
             try {
                 val body = reqCls.getMethod("body").invoke(request)
                 if (body != null && (boolMethod(body, "isOneShot") || boolMethod(body, "isDuplex"))) return false
@@ -299,22 +299,22 @@ object OkHttpHook {
             return true
         }
 
-        /** The [Divert.ORIGINAL_URL_HEADER] value, or null when this request wasn't diverted. */
+        /** The [AgentHttp.ORIGINAL_URL_HEADER] value, or null when this request wasn't routed. */
         private fun originalUrlHeader(request: Any, reqCls: Class<*>): String? = try {
             reqCls.getMethod("header", String::class.java)
-                .invoke(request, Divert.ORIGINAL_URL_HEADER) as? String
+                .invoke(request, AgentHttp.ORIGINAL_URL_HEADER) as? String
         } catch (t: Throwable) {
             null
         }
 
-        /** Rebuilds [response] carrying [original] as its request, hiding the divert from the app. */
+        /** Rebuilds [response] carrying [original] as its request, hiding the routing from the app. */
         private fun restoreRequest(response: Any, original: Any): Any {
             return try {
                 val rb = response.javaClass.getMethod("newBuilder").invoke(response)
                 rb.javaClass.getMethod("request", original.javaClass).invoke(rb, original)
                 invokeUnwrapped { rb.javaClass.getMethod("build").invoke(rb) }
             } catch (t: Throwable) {
-                Log.e(TAG, "POC divert: couldn't restore the original request", t)
+                Log.e(TAG, "route: couldn't restore the original request", t)
                 response
             }
         }
@@ -333,13 +333,13 @@ object OkHttpHook {
          *  transaction is emitted even if the call later fails/cancels. */
         private fun startTracker(request: Any): SqueezeTracker {
             val reqCls = request.javaClass
-            // A diverted request carries the URL the app actually asked for, so the captured
+            // A routed request carries the URL the app actually asked for, so the captured
             // transaction still reads as the real endpoint rather than the local mock.
             val url = originalUrlHeader(request, reqCls)
                 ?: reqCls.getMethod("url").invoke(request).toString()
             val tracker = SqueezeTracker(url)
             // Records which stack this came from, so the desktop can say whether the request is
-            // divertible at all — only okhttp3 requests can be repointed.
+            // routable at all — only okhttp3 requests can be repointed.
             tracker.setHttpStack(if (reqCls.name.startsWith("okhttp3.")) "okhttp3" else "okhttp2")
             (reqCls.getMethod("method").invoke(request) as? String)?.let { tracker.setMethod(it) }
             tracker.setRequestHeaders(headers(reqCls.getMethod("headers").invoke(request)))
@@ -384,8 +384,8 @@ object OkHttpHook {
 
             // A retry-direct bounce is Jaca talking to itself, not traffic the app made. Drop it
             // so the direct retry that follows is the only row the user sees.
-            if (code == Divert.RETRY_DIRECT_STATUS &&
-                header(respHeaders, Divert.DIVERT_HEADER) == Divert.RETRY_DIRECT) {
+            if (code == AgentHttp.RETRY_DIRECT_STATUS &&
+                header(respHeaders, AgentHttp.RETRY_DIRECT_HEADER) == AgentHttp.RETRY_DIRECT) {
                 tracker.cancel()
                 return response
             }

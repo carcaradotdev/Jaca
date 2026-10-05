@@ -10,7 +10,7 @@ final class OverrideMigrationTests: XCTestCase {
 
     private let id = "3F2504E0-4F89-11D3-9A0C-0305E82C3301"
 
-    /// The regression that matters: a rules.json written before `divertHosts`/`scope`/`delayMillis`
+    /// The regression that matters: a rules.json written before the routed hosts (`divertHosts` on disk)/`scope`/`delayMillis`
     /// existed must still load, with those fields defaulted rather than the record dropped.
     func test_decodeOldSchemaMissingNewerFields_defaultsRatherThanDropping() {
         let old = """
@@ -22,7 +22,7 @@ final class OverrideMigrationTests: XCTestCase {
 
         XCTAssertEqual(rules.count, 1, "the record must survive, not be skipped")
         XCTAssertEqual(rules[0].name, "Stub")
-        XCTAssertEqual(rules[0].divertHosts, [])
+        XCTAssertEqual(rules[0].routedHosts, [])
         XCTAssertEqual(rules[0].scope, OverrideScope())
         XCTAssertEqual(rules[0].delayMillis, 0)
         XCTAssertEqual(rules[0].matcher.methods, [])
@@ -114,7 +114,7 @@ final class OverrideMigrationTests: XCTestCase {
                                                removeHeaders: ["Set-Cookie"],
                                                body: .inline("{}"))),
             delayMillis: 750,
-            divertHosts: ["a.com", "b.com"]
+            routedHosts: ["a.com", "b.com"]
         )
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -133,7 +133,7 @@ final class OverrideMigrationTests: XCTestCase {
         XCTAssertEqual(r.scope, original.scope)
         XCTAssertEqual(r.action, original.action)
         XCTAssertEqual(r.delayMillis, 750)
-        XCTAssertEqual(r.divertHosts, ["a.com", "b.com"])
+        XCTAssertEqual(r.routedHosts, ["a.com", "b.com"])
     }
 }
 
@@ -157,7 +157,7 @@ final class OverrideStoreRoundTripTests: XCTestCase {
     func test_savedRulesSurviveAReload() throws {
         let rule = OverrideRule(name: "persisted",
                                 matcher: OverrideMatcher(pattern: "https://a.com/**"),
-                                divertHosts: ["a.com"])
+                                routedHosts: ["a.com"])
         let data = try encodeLikeStore([rule])
 
         let loaded = CloudPersistence.decodeArray(OverrideRule.self, from: data,
@@ -166,7 +166,24 @@ final class OverrideStoreRoundTripTests: XCTestCase {
         XCTAssertEqual(loaded.count, 1, "a saved rule must still be there on the next launch")
         XCTAssertEqual(loaded.first?.id, rule.id)
         XCTAssertEqual(loaded.first?.name, "persisted")
-        XCTAssertEqual(loaded.first?.divertHosts, ["a.com"])
+        XCTAssertEqual(loaded.first?.routedHosts, ["a.com"])
+    }
+
+    /// The on-disk key is `divertHosts`, not the property's name: `OverrideRule.CodingKeys` spells
+    /// it out. Dropping or changing that raw value would make every saved rule decode with no
+    /// hosts, and the next save would write that loss back. Nothing else pins the literal.
+    func test_routedHostsKeyIsPinnedOnDisk() throws {
+        let json = """
+        [{"id":"3F2504E0-4F89-11D3-9A0C-0305E82C3302","name":"Routed","enabled":true,
+          "matcher":{"pattern":"https://*.example.com/**","kind":"glob"},
+          "divertHosts":["api.example.com"],
+          "action":{"kind":"respond","respond":{"statusCode":200}}}]
+        """
+        let loaded = CloudPersistence.decodeArray(OverrideRule.self, from: Data(json.utf8))
+        XCTAssertEqual(loaded.first?.routedHosts, ["api.example.com"], "reads the key it always wrote")
+
+        let text = String(data: try encodeLikeStore(loaded), encoding: .utf8) ?? ""
+        XCTAssertTrue(text.contains("\"divertHosts\""), "and writes the same key back")
     }
 
     func test_createdAtIsWrittenAsAStringAndReadBack() throws {

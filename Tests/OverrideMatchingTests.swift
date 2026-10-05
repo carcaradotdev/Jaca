@@ -167,23 +167,23 @@ final class OverrideMatchingTests: XCTestCase {
         XCTAssertNotNil(set.diagnostics[r.id])
     }
 
-    // MARK: - Divert-host derivation
+    // MARK: - Route-host derivation
 
     func test_literalHostIsDerivedFromPattern() {
-        XCTAssertEqual(OverrideCompiler.derivedDivertHosts(
+        XCTAssertEqual(OverrideCompiler.derivedRoutedHosts(
             for: OverrideMatcher(pattern: "https://api.teya.xyz/lending/**")), ["api.teya.xyz"])
-        XCTAssertEqual(OverrideCompiler.derivedDivertHosts(
+        XCTAssertEqual(OverrideCompiler.derivedRoutedHosts(
             for: OverrideMatcher(pattern: "api.teya.xyz/lending/**")), ["api.teya.xyz"])
     }
 
     /// A wildcarded host must yield **empty**, never "all hosts" — that emptiness is what makes
     /// the editor ask the user which hosts to route, so Jaca never tunnels everything by accident.
-    func test_wildcardHostDerivesNoDivertHosts() {
-        XCTAssertTrue(OverrideCompiler.derivedDivertHosts(
+    func test_wildcardHostDerivesNoRoutedHosts() {
+        XCTAssertTrue(OverrideCompiler.derivedRoutedHosts(
             for: OverrideMatcher(pattern: "**/product-state")).isEmpty)
-        XCTAssertTrue(OverrideCompiler.derivedDivertHosts(
+        XCTAssertTrue(OverrideCompiler.derivedRoutedHosts(
             for: OverrideMatcher(pattern: "*.teya.xyz/v1/**")).isEmpty)
-        XCTAssertTrue(OverrideCompiler.derivedDivertHosts(
+        XCTAssertTrue(OverrideCompiler.derivedRoutedHosts(
             for: OverrideMatcher(pattern: ".*", kind: .regex)).isEmpty)
     }
 

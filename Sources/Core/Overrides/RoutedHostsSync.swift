@@ -2,14 +2,17 @@ import Foundation
 
 /// Keeps a rule's routed hosts in step with its match pattern while it's being edited.
 ///
-/// `divertHosts` is the blast radius: every host in it is sent through the Mac. When the pattern
+/// Lives with the rules rather than in `Core/AgentHTTP/`: it edits a rule's `routedHosts` field, and
+/// knows nothing about the server, tunnel or frames that act on it.
+///
+/// `routedHosts` is the blast radius: every host in it is sent through the Mac. When the pattern
 /// names a literal host the set is derived from it; when it doesn't (a wildcarded host, any regex)
 /// the user types it. The editor used to only ever *add* derived hosts, so changing
 /// `https://api.example.com/*` to `https://*.other.com/*` left `api.example.com` in the hosts field.
 /// That satisfied the "at least one host" check, and the rule saved routing traffic it could never
 /// match. Remembering whether the current set was derived is what lets a stale one be dropped
 /// without discarding hosts the user typed.
-enum DivertHostSync {
+enum RoutedHostsSync {
     struct State: Equatable {
         var hosts: Set<String>
         /// The hosts came from the pattern rather than from the user.

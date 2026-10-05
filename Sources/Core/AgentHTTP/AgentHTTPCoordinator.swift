@@ -1,12 +1,12 @@
 import Foundation
 
-/// Owns everything a diverted request needs to reach Jaca: the loopback `OverrideServer`, the
+/// Owns everything a routed request needs to reach Jaca: the loopback `AgentHTTPServer`, the
 /// tunnel (if the transport needs one), and the control frames naming the hosts to route.
 ///
 /// The port is allocated once and never changes: `SqueezeAgent.attach()` early-returns when
 /// capture is already loaded, so anything in the attach spec is frozen until a force-stop. Rules
 /// change behind the stable port instead, which is what makes "applies on the next request" true.
-final class DivertCoordinator: @unchecked Sendable {
+final class AgentHTTPCoordinator: @unchecked Sendable {
 
     private let transport: InterceptTransportID
     private let deviceID: String
@@ -16,15 +16,15 @@ final class DivertCoordinator: @unchecked Sendable {
     private let capabilities: InterceptCapabilities
     /// How the device reaches our loopback port: `SharedLoopbackTunnel` (Simulator, nothing to
     /// open) or `AdbReverseTunnel` (Android).
-    private let tunnel: any DivertTunnel
+    private let tunnel: any AgentHTTPTunnel
     /// Where control frames go. Injected, so this class never owns an fd.
     private let writer: any AgentControlWriter
     private let heartbeatSeconds: Int
-    private let onStateChange: @Sendable (DivertCoordinator, InterceptArmingState) -> Void
+    private let onStateChange: @Sendable (AgentHTTPCoordinator, InterceptArmingState) -> Void
 
     private let lock = NSLock()
-    private var server: OverrideServer?
-    /// The port `OverrideServer` bound. The tunnel maps it 1:1, so it's the device-side port too.
+    private var server: AgentHTTPServer?
+    /// The port `AgentHTTPServer` bound. The tunnel maps it 1:1, so it's the device-side port too.
     private var serverPort: Int?
     private var desiredHosts: Set<String> = []
     private var agentSupportsOverride = false
@@ -42,17 +42,17 @@ final class DivertCoordinator: @unchecked Sendable {
     private var heartbeatTask: Task<Void, Never>?
     /// Terminal once `stop()` has run; a coordinator is one-shot. Refusing a late `start()`
     /// closes a leak: teardown can land while the controller is mid-bring-up, and the resumed
-    /// `start()` would bind a second `OverrideServer` plus a heartbeat nothing is left to cancel.
+    /// `start()` would bind a second `AgentHTTPServer` plus a heartbeat nothing is left to cancel.
     private var stopped = false
 
     init(transport: InterceptTransportID,
          deviceID: String,
          appID: String,
          capabilities: InterceptCapabilities,
-         tunnel: any DivertTunnel,
+         tunnel: any AgentHTTPTunnel,
          writer: any AgentControlWriter,
          heartbeatSeconds: Int = 15,
-         onStateChange: @escaping @Sendable (DivertCoordinator, InterceptArmingState) -> Void = { _, _ in }) {
+         onStateChange: @escaping @Sendable (AgentHTTPCoordinator, InterceptArmingState) -> Void = { _, _ in }) {
         self.transport = transport
         self.deviceID = deviceID
         self.appID = appID
@@ -93,7 +93,7 @@ final class DivertCoordinator: @unchecked Sendable {
     /// `claimStart()` only tests `stopped` on entry, and a `stop()` inside that window sees no
     /// server to take down, so without this check the resumed `start` publishes an unstoppable
     /// listener + heartbeat while the toolbar sits on "Arming" forever.
-    private func finishStart(server newServer: OverrideServer, port: Int) -> Bool {
+    private func finishStart(server newServer: AgentHTTPServer, port: Int) -> Bool {
         withLock {
             guard !stopped else { return false }
             server = newServer
@@ -103,7 +103,7 @@ final class DivertCoordinator: @unchecked Sendable {
         }
     }
 
-    private func takeDownState() -> (server: OverrideServer?, port: Int?) {
+    private func takeDownState() -> (server: AgentHTTPServer?, port: Int?) {
         withLock {
             let s = server
             let p = serverPort
@@ -118,20 +118,22 @@ final class DivertCoordinator: @unchecked Sendable {
 
     /// Binds the server and opens the tunnel. Idempotent — a second call is a no-op.
     ///
-    /// Publishes `.waitingForAgent` on success, never `.active`: nothing is diverted until the
+    /// Publishes `.waitingForAgent` on success, never `.active`: nothing is routed until the
     /// agent has said hello, and the toolbar renders `.active` as a live green bolt.
     func start(pipeline: InterceptPipeline) async {
         guard claimStart() else { return }
 
-        let newServer = OverrideServer(pipeline: pipeline, transport: transport,
-                                       deviceID: deviceID, appID: appID,
-                                       capabilities: capabilities)
+        let newServer = AgentHTTPServer(pipeline: pipeline, transport: transport,
+                                     deviceID: deviceID, appID: appID,
+                                     capabilities: capabilities)
         do {
             try newServer.start()
         } catch {
             // A stop() after `claimStart()` already published `.idle`; `refreshStateLocked`
             // needs a `server`, so it could never clear a `.failed` written over it.
             if !isStopped {
+                // The UI says "override server" for `AgentHTTPServer`. That copy is owned by the
+                // product, so the word stays even though the type was renamed.
                 setState(.failed("Couldn't start the override server: \(error.localizedDescription)"))
             }
             return
@@ -150,7 +152,7 @@ final class DivertCoordinator: @unchecked Sendable {
             // As above: don't overwrite the `.idle` a concurrent stop() published.
             guard !isStopped else { return }
             // The transport that knows what failed is the one that words it.
-            let message = (error as? DivertTunnelError)?.userMessage ?? error.localizedDescription
+            let message = (error as? AgentHTTPTunnelError)?.userMessage ?? error.localizedDescription
             setState(.failed(message))
             return
         }
@@ -182,7 +184,7 @@ final class DivertCoordinator: @unchecked Sendable {
         beginStop()
         let (currentServer, port) = takeDownState()
 
-        // (a) Tell the agent to stop diverting, and flush before anything else goes away —
+        // (a) Tell the agent to stop routing, and flush before anything else goes away —
         // without the flush the ordering only held by accident, via the `adb` spawn below.
         push(.disarmed(heartbeatSeconds: heartbeatSeconds))
         await writer.flush()
@@ -191,7 +193,7 @@ final class DivertCoordinator: @unchecked Sendable {
         if let port { await tunnel.close(localPort: port) }
         // (c) Close the listener.
         currentServer?.stop()
-        JacaLog.info("override", "divert torn down (\(appID))")
+        JacaLog.info("override", "routing torn down (\(appID))")
         setState(.idle)
     }
 
@@ -288,8 +290,8 @@ final class DivertCoordinator: @unchecked Sendable {
 
     /// Re-states the endpoint rather than pinging, so any desync repairs itself within one
     /// heartbeat. A bare ping can only refresh the timer: the device's `disarm()` clears `origin`
-    /// until a new `divert` frame arrives, so a missed socket drop or a lapsed window would kill
-    /// overrides for good. `Divert.configure` is idempotent, so this is keepalive and repair.
+    /// until a new route frame arrives, so a missed socket drop or a lapsed window would kill
+    /// overrides for good. `AgentHttp.configure` is idempotent, so this is keepalive and repair.
     private func sendHeartbeat() {
         let armed = withLock { agentSupportsOverride && server != nil }
         guard armed else { return }
@@ -306,16 +308,16 @@ final class DivertCoordinator: @unchecked Sendable {
                 "endpoint not pushed (agentSupportsOverride=\(supported), port=\(String(describing: port)))")
             return
         }
-        // `OverrideEndpoint`'s init clears origin and hosts together, so an empty host set here
-        // disarms the device rather than diverting everything.
-        push(OverrideEndpoint(origin: tunnel.origin(forLocalPort: port), hosts: hosts,
-                              heartbeatSeconds: heartbeatSeconds))
+        // `AgentHTTPRoute`'s init clears origin and hosts together, so an empty host set here
+        // disarms the device rather than routing everything.
+        push(AgentHTTPRoute(origin: tunnel.origin(forLocalPort: port), hosts: hosts,
+                            heartbeatSeconds: heartbeatSeconds))
     }
 
-    /// The single funnel: `OverrideEndpoint.divertFrame` is called from nowhere else, because a
+    /// The single funnel: `AgentHTTPRoute.routeFrame` is called from nowhere else, because a
     /// second encoder is how the two device-side twins drift out of sync with the desktop.
-    private func push(_ endpoint: OverrideEndpoint) {
-        writer.write(OverrideEndpoint.divertFrame(endpoint))
+    private func push(_ endpoint: AgentHTTPRoute) {
+        writer.write(AgentHTTPRoute.routeFrame(endpoint))
         JacaLog.debug("override",
             "endpoint -> origin=\(endpoint.origin ?? "nil") hosts=\(endpoint.hosts.sorted())")
     }

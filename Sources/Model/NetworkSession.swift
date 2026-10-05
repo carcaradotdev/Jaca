@@ -315,7 +315,7 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
     }
 
     /// What the running source last reported about its agent. Separate from the coordinator's
-    /// arming state because it must survive response overrides being off, which is the default.
+    /// arming state because it must survive response overrides being off (HTTPS debugging mode).
     private(set) var attachState: InterceptArmingState = .idle
 
     /// Whether to show the pane-top attach notice: the agent is gone but the tab still believes
@@ -341,9 +341,13 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
     var interceptTransport: InterceptTransportID {
         switch captureMode {
         case .agent:
-            return device.platform == .iosSimulator
-                ? .iosSimulatorDivert(bundleID: targetPackage ?? "")
-                : .agentDivert(package: targetPackage ?? "")
+            // Per platform, not a two-way ternary: a physical iOS device has no agent transport,
+            // and the ternary would have reported it as the Android agent.
+            switch device.platform {
+            case .android:      return .androidAgent(package: targetPackage ?? "")
+            case .iosSimulator: return .iosSimulatorAgent(bundleID: targetPackage ?? "")
+            case .iosDevice:    return .mitmProxy
+            }
         case .companion:
             return .companionMetadata
         default:
@@ -591,7 +595,7 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
     /// True when a rule produced this response, so it says nothing about the network it never
     /// reached. Read from the stamp the pipeline leaves.
     private func wasOverridden(_ txn: NetworkTransaction) -> Bool {
-        txn.responseHeaders.contains { $0.name.lowercased() == OverrideHeaders.override.lowercased() }
+        txn.responseHeaders.contains { $0.name.lowercased() == JacaHeaders.override.lowercased() }
     }
 
     /// The currently selected transaction, if any.

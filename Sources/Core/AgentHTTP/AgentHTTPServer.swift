@@ -3,15 +3,15 @@ import NIOCore
 import NIOPosix
 import NIOHTTP1
 
-/// The loopback HTTP server a diverted device request lands on.
+/// The loopback HTTP server a routed device request lands on.
 ///
-/// `ProxyServer`'s non-CONNECT branch without the TLS: divert traffic always arrives as cleartext
+/// `ProxyServer`'s non-CONNECT branch without the TLS: routed traffic always arrives as cleartext
 /// origin-form HTTP. That's also why it beats a MITM proxy on a pinned app — no TLS happens
 /// app-side, so `CertificatePinner` never engages.
 ///
 /// Bound to **127.0.0.1 only** (`ProxyServer` binds `0.0.0.0` for LAN devices): `adb reverse`
 /// delivers on loopback, which is safer for a channel that is cleartext by construction.
-final class OverrideServer: @unchecked Sendable {
+final class AgentHTTPServer: @unchecked Sendable {
     private let pipeline: InterceptPipeline
     private let transport: InterceptTransportID
     private let deviceID: String?
@@ -57,9 +57,9 @@ final class OverrideServer: @unchecked Sendable {
                         name: "decoder")
                 }.flatMap {
                     channel.pipeline.addHandler(
-                        OverrideHandler(pipeline: pipeline, transport: transport,
-                                        deviceID: deviceID, appID: appID,
-                                        capabilities: capabilities),
+                        AgentHTTPRequestHandler(pipeline: pipeline, transport: transport,
+                                             deviceID: deviceID, appID: appID,
+                                             capabilities: capabilities),
                         name: "override")
                 }
             }
@@ -103,7 +103,7 @@ final class OverrideServer: @unchecked Sendable {
 
 // MARK: - Handler
 
-private final class OverrideHandler: ChannelInboundHandler, @unchecked Sendable {
+private final class AgentHTTPRequestHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
@@ -118,7 +118,7 @@ private final class OverrideHandler: ChannelInboundHandler, @unchecked Sendable 
     /// Set once `body` would exceed `maxBodyBytes`; the request is bounced instead of buffered.
     private var bodyOverflowed = false
 
-    /// A divert routes a *whole host*, so a multipart upload would otherwise buffer in full in
+    /// Routing covers a *whole host*, so a multipart upload would otherwise buffer in full in
     /// Jaca's memory on an event-loop thread. Past this we bounce it and let the agent go direct.
     private static let maxBodyBytes = 8 * 1024 * 1024
 
@@ -195,7 +195,7 @@ private final class OverrideHandler: ChannelInboundHandler, @unchecked Sendable 
                                             unmatched: .handBack)
 
             // Nothing matched — hand it back, keeping VPN, cookies, HTTP/2 and DNS intact for
-            // everything we aren't mocking. That's what makes diverting a whole host safe.
+            // everything we aren't mocking. That's what makes routing a whole host safe.
             guard result.appliedRuleID != nil else {
                 // The single most useful line when a rule "should have" fired.
                 JacaLog.debug("override",
@@ -223,8 +223,8 @@ private final class OverrideHandler: ChannelInboundHandler, @unchecked Sendable 
     /// capture and re-sends the original request itself.
     static func writeRetryDirect(channel: Channel) {
         HTTPWireFormat.writeResponse(channel: channel, response: InterceptedResponse(
-            statusCode: OverrideHeaders.retryDirectStatus,
-            headers: [HeaderPair(name: OverrideHeaders.divert, value: OverrideHeaders.retryDirect)],
+            statusCode: JacaHeaders.retryDirectStatus,
+            headers: [HeaderPair(name: JacaHeaders.retryDirectHeader, value: JacaHeaders.retryDirect)],
             body: Data()
         ))
     }

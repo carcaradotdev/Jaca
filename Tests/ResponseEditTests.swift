@@ -72,9 +72,9 @@ final class ResponseEditTests: XCTestCase {
     /// `X-Jaca-Original-URL` is not a hop-by-hop header, so without an explicit rule it would be
     /// forwarded to the real origin — leaking Jaca's presence and the app's URL structure.
     func test_jacaInternalHeadersNeverReachTheOrigin() {
-        XCTAssertTrue(HTTPWireFormat.shouldDropFromOutbound(OverrideHeaders.originalURL))
-        XCTAssertTrue(HTTPWireFormat.shouldDropFromOutbound(OverrideHeaders.divert))
-        XCTAssertTrue(HTTPWireFormat.shouldDropFromOutbound(OverrideHeaders.override))
+        XCTAssertTrue(HTTPWireFormat.shouldDropFromOutbound(JacaHeaders.originalURL))
+        XCTAssertTrue(HTTPWireFormat.shouldDropFromOutbound(JacaHeaders.retryDirectHeader))
+        XCTAssertTrue(HTTPWireFormat.shouldDropFromOutbound(JacaHeaders.override))
         XCTAssertTrue(HTTPWireFormat.shouldDropFromOutbound("x-jaca-anything-future"))
     }
 
@@ -89,12 +89,12 @@ final class ResponseEditTests: XCTestCase {
 
 /// URL recovery: matching must always run against the URL the app *meant* to call, never the
 /// rewritten one on the wire.
-final class OverrideURLTests: XCTestCase {
+final class OriginalURLTests: XCTestCase {
 
     func test_agentPrefersTheOriginalURLHeader() {
         let headers = [
             HeaderPair(name: "Host", value: "localhost:41234"),
-            HeaderPair(name: OverrideHeaders.originalURL, value: "https://api.teya.xyz/v1/state"),
+            HeaderPair(name: JacaHeaders.originalURL, value: "https://api.teya.xyz/v1/state"),
         ]
         XCTAssertEqual(AgentOriginalURL.recover(headers: headers, uri: "/v1/state"),
                        "https://api.teya.xyz/v1/state")
@@ -109,7 +109,7 @@ final class OverrideURLTests: XCTestCase {
     func test_agentIgnoresAMalformedOriginalURLHeader() {
         let headers = [
             HeaderPair(name: "Host", value: "api.example.com"),
-            HeaderPair(name: OverrideHeaders.originalURL, value: "not a url"),
+            HeaderPair(name: JacaHeaders.originalURL, value: "not a url"),
         ]
         XCTAssertEqual(AgentOriginalURL.recover(headers: headers, uri: "/v1/state"),
                        "http://api.example.com/v1/state")
@@ -131,7 +131,7 @@ final class OverrideURLTests: XCTestCase {
                        "http://api.example.com/v1")
     }
 
-    // MARK: - Redirect resolution (divert must follow; the proxy must not)
+    // MARK: - Redirect resolution (route must follow; the proxy must not)
 
     func test_relativeRedirectsResolveAgainstTheCurrentURL() {
         XCTAssertEqual(OriginClient.resolve(location: "/v2/state", against: "https://a.com/v1/state"),
@@ -147,14 +147,14 @@ final class OverrideURLTests: XCTestCase {
             headers: [
                 HeaderPair(name: "Authorization", value: "Bearer t"),
                 HeaderPair(name: "Host", value: "localhost:41234"),
-                HeaderPair(name: OverrideHeaders.originalURL, value: "https://api.example.com/v1"),
+                HeaderPair(name: JacaHeaders.originalURL, value: "https://api.example.com/v1"),
             ],
             body: Data("{}".utf8),
-            transport: .agentDivert(package: "com.example"))
+            transport: .androidAgent(package: "com.example"))
 
         let urlRequest = try XCTUnwrap(OriginClient.makeURLRequest(from: request))
         XCTAssertEqual(urlRequest.value(forHTTPHeaderField: "Authorization"), "Bearer t")
-        XCTAssertNil(urlRequest.value(forHTTPHeaderField: OverrideHeaders.originalURL))
+        XCTAssertNil(urlRequest.value(forHTTPHeaderField: JacaHeaders.originalURL))
         XCTAssertEqual(urlRequest.httpMethod, "POST")
         XCTAssertEqual(urlRequest.httpBody, Data("{}".utf8))
     }

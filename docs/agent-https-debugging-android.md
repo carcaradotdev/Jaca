@@ -1,11 +1,11 @@
-# Response overrides on Android
+# Agent HTTPS debugging on Android
 
 **Status: shipped.** Make a **debuggable Android app** receive a response you control — without a
 proxy, without installing a CA, and **without disabling certificate pinning**.
 
 This page is the Android path and the shared rule engine. The iOS-Simulator path is
-[`response-overrides-ios.md`](response-overrides-ios.md); what the desktop and both agents agree on
-is [`divert-contract.md`](divert-contract.md).
+[`agent-https-debugging-ios.md`](agent-https-debugging-ios.md); what the desktop and both agents agree on
+is [`agent-http-contract.md`](agent-http-contract.md).
 
 Right-click any captured request → *Override response…*, or add one from the **Overrides** button
 next to the search field. Rules are toggled on/off individually, apply on the app's **next
@@ -74,7 +74,7 @@ a host-gated auth interceptor silently stop attaching its token.
 The device is deliberately kept dumb. Its **entire** override vocabulary is:
 
 ```kotlin
-Divert.configure(origin: String?, hosts: Set<String>, heartbeatSeconds: Int)
+AgentHttp.configure(origin: String?, hosts: Set<String>, heartbeatSeconds: Int)
 ```
 
 An origin, a set of hostnames, and how long that permission lasts. There are **no patterns, no
@@ -84,11 +84,11 @@ the next request instead of requiring a rebuild and a re-attach.
 
 > **The tripwire for review:** any change that adds a path, method, header, body, status, ordering
 > or rule-id concept to `agent/kotlin/` (or `agent/iOS/`) has crossed that line. In practice it
-> shows up in **`OverrideEndpoint`** (`Sources/Core/Intercept/Intercept.swift`) — the one type that
+> shows up in **`AgentHTTPRoute`** (`Sources/Core/AgentHTTP/AgentHTTPRoute.swift`) — the one type that
 > builds the desktop→device message, produced from exactly one call site
-> (`DivertCoordinator.push`), and whose key set is pinned by a test.
+> (`AgentHTTPCoordinator.push`), and whose key set is pinned by a test.
 
-`Divert.origin` starts `null`, so a freshly attached agent is **read-only by construction**.
+`AgentHttp.origin` starts `null`, so a freshly attached agent is **read-only by construction**.
 
 ### The interception seam (reusable by design)
 
@@ -108,8 +108,8 @@ you type* so you're warned before a request ever fails.
 
 | Interception point | Reaches the desktop via | Capabilities | Status |
 |---|---|---|---|
-| `.agentDivert` | `OverrideServer` on `127.0.0.1:P`, `adb reverse tcp:P tcp:P` | `.desktopTerminated` | **shipped** |
-| `.iosSimulatorDivert` | the same server, plain loopback, no tunnel | `.desktopTerminated` | **shipped** — see the [iOS doc](response-overrides-ios.md) |
+| `.androidAgent` | `AgentHTTPServer` on `127.0.0.1:P`, `adb reverse tcp:P tcp:P` | `.desktopTerminated` | **shipped** |
+| `.iosSimulatorAgent` | the same server, plain loopback, no tunnel | `.desktopTerminated` | **shipped** — see the [iOS doc](agent-https-debugging-ios.md) |
 | `.mitmProxy` (HTTPS decryption) | would be `ProxyHandler.forward` | `.desktopTerminated` | **not wired** — no pipeline yet |
 | `.companionMetadata` | gRPC `StreamFlows` | `.observeOnly` | degrades, explains why |
 
@@ -118,11 +118,10 @@ declaring what it supports — not reimplementing matching or precedence.
 
 ### The arming half
 
-Both halves of the seam are now transport-neutral. **`DivertCoordinator`** (formerly
-`AgentDivertCoordinator`) owns the override server, the control frames and the heartbeat, and knows
+Both halves of the seam are now transport-neutral. **`AgentHTTPCoordinator`** owns the override server, the control frames and the heartbeat, and knows
 nothing about adb: how the device reaches our loopback port lives behind
-**`protocol DivertTunnel`** — `AdbReverseTunnel` in `Core/Network/` (next to `AdbTunnelCleanup`,
-because opening one creates OS-global state) and `SharedLoopbackTunnel` in `Core/Overrides/` (a
+**`protocol AgentHTTPTunnel`** — `AdbReverseTunnel` in `Core/Network/` (next to `AdbTunnelCleanup`,
+because opening one creates OS-global state) and `SharedLoopbackTunnel` in `Core/AgentHTTP/` (a
 no-op: the simulator is already on the Mac's loopback, so `needsTunnelLedger` is false and nothing
 is ever written to the ledger).
 
@@ -220,7 +219,7 @@ disable a MITM proxy would demand.
 
 The okhttp layer split, the retry-direct bounce and the fail-open path can't be unit-tested (they
 only exist inside a real app process), and getting them wrong kills the user's app. Verify them by
-hand after touching `OkHttpHook.kt`, `Divert.kt` or `SqueezeReporter.kt`:
+hand after touching `OkHttpHook.kt`, `AgentHttp.kt` or `SqueezeReporter.kt`:
 
 ```bash
 ./scripts/all.sh                       # agent + app + launch
@@ -235,8 +234,8 @@ Instrumented Lokhttp3/OkHttpClient;.networkInterceptors()Ljava/util/List;
 Instrumented Lokhttp3/OkHttpClient;.interceptors()Ljava/util/List;
 Kotlin capture loaded on isolated loader; handler installed
 reporter listening on localabstract:squeeze_…
-divert configured: origin=http://localhost:… hosts=[…]
-divert: https://…real-host… -> http://localhost:…
+route configured: origin=http://localhost:… hosts=[…]
+route: https://…real-host… -> http://localhost:…
 ```
 
 Then check, in order:
@@ -244,7 +243,7 @@ Then check, in order:
 1. the overridden endpoint returns your payload, and the row is badged in the list;
 2. **editing the rule applies on the next request** — no force-stop, no re-attach;
 3. an unmatched request on the same host still succeeds (599 bounce → direct retry, **one** row);
-4. `kill -9` Jaca → the app keeps working (`host disconnected — divert disarmed`);
+4. `kill -9` Jaca → the app keeps working (`host disconnected — routing disarmed`);
 5. after a normal quit, `adb forward --list` and `adb reverse --list` are both empty.
 
 **Zero app crashes is a release blocker.**
@@ -265,14 +264,14 @@ how Jaca arms the device.
 
 ## Platform support
 
-Response overrides run on **Android** (the in-process agent's okhttp3 divert) and on the **iOS
-Simulator** (the injected agent's `NSURLProtocol` divert). The rule engine, matcher, clamp,
+Response overrides run on **Android** (the in-process agent's okhttp3 route) and on the **iOS
+Simulator** (the injected agent's `NSURLProtocol` route). The rule engine, matcher, clamp,
 persistence and UI are transport-neutral and shared by both.
 
 | Transport | Seam modelled | Wired |
 |---|---|---|
-| `.agentDivert` (Android) | yes | **yes — shipping** |
-| `.iosSimulatorDivert` | yes | **yes — shipping**, see [`response-overrides-ios.md`](response-overrides-ios.md) |
+| `.androidAgent` (Android) | yes | **yes — shipping** |
+| `.iosSimulatorAgent` | yes | **yes — shipping**, see [`agent-https-debugging-ios.md`](agent-https-debugging-ios.md) |
 | `.mitmProxy` (HTTPS decryption) | yes | no — `ProxyServer` has no pipeline |
 | `.companionMetadata` | yes | n/a — `.observeOnly`, flow metadata can't be overridden |
 
@@ -290,14 +289,14 @@ iOS agent started reporting `"urlsession"`.
 ## Limitations
 
 - **Only okhttp3.** okhttp2, `HttpURLConnection`, Cronet and HTTP/3 keep the read-only capture path.
-- **Cookie-jar auth is lost on diverted requests.** okhttp's `BridgeInterceptor` runs after all
+- **Cookie-jar auth is lost on routed requests.** okhttp's `BridgeInterceptor` runs after all
   application interceptors and loads cookies for the *rewritten* URL. Host-scoping is what makes
   this survivable.
 - **Streaming responses aren't overridable.** SSE/gRPC requests are bounced with retry-direct: the
   desktop buffers whole bodies, so a streamed exchange would hang end-to-end.
-- **One-shot/duplex request bodies are never diverted** — they can't be re-sent, so they must not
+- **One-shot/duplex request bodies are never routed** — they can't be re-sent, so they must not
   be eligible for the bounce.
-- **Diverted traffic is cleartext between app and Mac.** It's loopback over the adb tunnel, and the
+- **Routed traffic is cleartext between app and Mac.** It's loopback over the adb tunnel, and the
   server binds `127.0.0.1` only. Fine for a debug session; never for anything else.
 - **"Send and override" fetches from your Mac**, not the device, so origins reachable only from the
   device won't work. The editor says so.
@@ -314,21 +313,22 @@ re-verified end to end.
 | Original POC session | `1307b816-35a3-4b4f-9ff7-868913d43fac`, 2026-08-25 |
 | Device | `emulator-5554`, `sdk_gphone16k_arm64`, Android 17 (SDK 37), arm64-v8a, 16 KB pages |
 | App | `com.teya.ac.dev` 3.0.0 — `debuggable=true`, `targetSdk 36`, **5 hard-coded cert pins** |
-| POC result | 3/3 requests diverted and served from a mock, 0 crashes |
+| POC result | 3/3 requests routed and served from a mock, 0 crashes |
 | Productised + verified | 2026-08-26 |
 
-The 2026-08-26 verification, against the same pinned app, confirmed:
+The 2026-08-26 verification, against the same pinned app, confirmed the following (log lines are
+quoted as the agent prints them today):
 
-- the agent advertises `override/1` in its hello frame, and applies a `divert` control frame live
-  (`divert configured: origin=http://localhost:41234 hosts=[id.teya.xyz, private-api.teya.xyz]`);
-- two pinned hosts were diverted with their original URLs preserved;
+- the agent advertises `override/1` in its hello frame, and applies a route control frame live
+  (`route configured: origin=http://localhost:41234 hosts=[id.teya.xyz, private-api.teya.xyz]`);
+- two pinned hosts were routed with their original URLs preserved;
 - **the app received a fabricated `299` response with our body at the real
   `https://id.teya.xyz/authn/anonymous/api/auth_requests`** — and the captured row reported that
   real HTTPS URL, not `localhost`;
 - an unmatched request was bounced `599 retry-direct`;
-- killing the desktop server produced `divert: tunnel unreachable, failing open and retrying direct`
+- killing the desktop server produced `route: tunnel unreachable, failing open and retrying direct`
   and the app kept working;
-- closing the socket produced `host disconnected — divert disarmed`;
+- closing the socket produced `host disconnected — routing disarmed`;
 - **zero crashes**, and no `adb reverse` entries left behind.
 
 ### Dead ends worth remembering
@@ -338,7 +338,7 @@ The 2026-08-26 verification, against the same pinned app, confirmed:
   `-Wl,-z,max-page-size=16384` in `agent/native/CMakeLists.txt`. **This regressed once** — the
   original POC documented the fix but it was never committed, and it resurfaced during
   productisation. The flag is now in the file with a comment explaining why it isn't optional.
-- The first divert attempt ran on the **network** interceptor and crashed the app with
+- The first route attempt ran on the **network** interceptor and crashed the app with
   *"must retain the same host and port"*. That is what forced the application/network split above.
 - A fourth comma-separated field in the `attach-agent` spec would **silently break capture** on an
   older `.so`: `squeeze_agent.cc` assigns `socketName = opts.substr(c2 + 1)` — the entire remainder
@@ -348,12 +348,13 @@ The 2026-08-26 verification, against the same pinned app, confirmed:
 
 ## See also
 
-- `agent/kotlin/com/squeeze/capture/Divert.kt` — the entire on-device surface
+- `agent/kotlin/com/squeeze/capture/AgentHttp.kt` — the entire on-device surface
 - `agent/kotlin/com/squeeze/capture/OkHttpHook.kt` — layer detection, rewrite, bounce, fail-open
 - `agent/kotlin/com/squeeze/capture/SqueezeReporter.kt` — the bidirectional control channel
 - `Sources/Core/Intercept/` — the transport-neutral seam and pipeline
-- `Sources/Core/Overrides/` — rules, matching, the clamp, the server, the tunnel coordinator
+- `Sources/Core/Overrides/` — rules, matching, the clamp
+- `Sources/Core/AgentHTTP/` — the server, the tunnel, the coordinator and the route frame (`AgentHTTPRoute`)
 - `Sources/Model/OverridesModel.swift` — the single observable owner
-- [`divert-contract.md`](divert-contract.md) — the frame, the 599 pair, the dead-man window
-- [`response-overrides-ios.md`](response-overrides-ios.md) — the iOS-Simulator transport
+- [`agent-http-contract.md`](agent-http-contract.md) — the frame, the 599 pair, the dead-man window
+- [`agent-https-debugging-ios.md`](agent-https-debugging-ios.md) — the iOS-Simulator transport
 - `README.md` — how the in-process agent works in general

@@ -1,10 +1,10 @@
 import Foundation
 
-/// `adb reverse` — the Android side of the divert tunnel, and the only adb-aware divert code in
+/// `adb reverse` — the Android side of `AgentHTTPTunnel`, and the only adb-aware routing code in
 /// the product. Opening one creates state inside the adb server that outlives Jaca, and a
-/// stranded reverse fails every diverted request until removed by hand — hence the ledger entry
+/// stranded reverse fails every routed request until removed by hand — hence the ledger entry
 /// on open and the deregister on close.
-struct AdbReverseTunnel: DivertTunnel {
+struct AdbReverseTunnel: AgentHTTPTunnel {
     let adbPath: String
     let serial: String
 
@@ -27,7 +27,7 @@ struct AdbReverseTunnel: DivertTunnel {
         let result = await run(Self.openArguments(serial: serial, port: port))
         guard result.exitCode == 0 else {
             JacaLog.error("override", "adb reverse tcp:\(port) failed — \(result.text)")
-            throw DivertTunnelError(userMessage: "adb reverse tcp:\(port) failed — \(result.text)")
+            throw AgentHTTPTunnelError(userMessage: "adb reverse tcp:\(port) failed — \(result.text)")
         }
         AdbTunnelCleanup.register(adbPath: adbPath, serial: serial, kind: .reverse, port: port)
         JacaLog.info("override", "adb reverse tcp:\(port) ok (\(serial))")

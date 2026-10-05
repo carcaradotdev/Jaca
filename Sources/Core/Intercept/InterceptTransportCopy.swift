@@ -12,13 +12,13 @@ extension InterceptTransportID {
 
     /// The popover's "what is actually being routed" help: what leaves the device and what tears
     /// it down — the blast-radius contract.
-    var divertScopeHelp: String {
+    var routingScopeHelp: String {
         switch self {
-        case .agentDivert:
+        case .androidAgent:
             return "Only these hosts leave the device's own network. Everything else is untouched. "
                  + "The adb reverse tunnel is removed when this tab stops, and the agent disarms "
                  + "itself if Jaca goes away."
-        case .iosSimulatorDivert:
+        case .iosSimulatorAgent:
             // No tunnel to promise the removal of — the Simulator shares the Mac's loopback.
             return "Only these hosts are diverted to Jaca. Everything else the app requests goes "
                  + "straight out, untouched. The agent disarms itself if Jaca goes away."
@@ -34,10 +34,10 @@ extension InterceptTransportID {
     /// listener the phone can't see.
     func portLabel(port: Int) -> String {
         switch self {
-        case .agentDivert:        return "via adb reverse :\(port)"
-        case .iosSimulatorDivert: return "127.0.0.1:\(port)"
-        case .mitmProxy:          return "127.0.0.1:\(port)"
-        case .companionMetadata:  return "port \(port)"
+        case .androidAgent:      return "via adb reverse :\(port)"
+        case .iosSimulatorAgent: return "127.0.0.1:\(port)"
+        case .mitmProxy:         return "127.0.0.1:\(port)"
+        case .companionMetadata: return "port \(port)"
         }
     }
 
@@ -46,10 +46,10 @@ extension InterceptTransportID {
     /// the Simulator, where the Mac *is* the app's network.
     var originExplainer: String {
         switch self {
-        case .agentDivert, .mitmProxy:
+        case .androidAgent, .mitmProxy:
             return "Jaca fetches this URL from your Mac, not from the device. Origins reachable "
                  + "only from the device won't work."
-        case .iosSimulatorDivert, .companionMetadata:
+        case .iosSimulatorAgent, .companionMetadata:
             return ""
         }
     }
@@ -57,10 +57,10 @@ extension InterceptTransportID {
     /// The editor's notice when a pattern doesn't name a host — we never route "everything".
     var hostsNotice: String {
         switch self {
-        case .agentDivert:
+        case .androidAgent:
             return "This pattern doesn't name a host. Tell Jaca which hosts to route through your "
                  + "Mac — only these leave the device's own network."
-        case .iosSimulatorDivert:
+        case .iosSimulatorAgent:
             return "This pattern doesn't name a host. Tell Jaca which hosts to divert — only these "
                  + "are answered by Jaca; everything else the app requests is untouched."
         case .mitmProxy, .companionMetadata:
@@ -73,9 +73,9 @@ extension InterceptTransportID {
     /// stacks or raw sockets. An unnamed blind spot becomes a bug report.
     var captureDetail: String {
         switch self {
-        case .agentDivert:
+        case .androidAgent:
             return "Inspect one debuggable Android app in-process — no proxy or CA, with call stacks."
-        case .iosSimulatorDivert:
+        case .iosSimulatorAgent:
             return "Inspect one Simulator app in-process — no proxy or CA. URLSession only: "
                  + "WKWebView, background sessions and raw sockets aren't seen."
         case .mitmProxy:

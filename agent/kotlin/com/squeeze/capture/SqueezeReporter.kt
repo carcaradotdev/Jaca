@@ -69,9 +69,9 @@ object SqueezeReporter {
     /**
      * Reads newline-delimited control frames from the host until EOF.
      *
-     * **EOF disarms the divert.** This is the dead-man switch that survives a `SIGKILL`, a Force
+     * **EOF disarms routing.** This is the dead-man switch that survives a `SIGKILL`, a Force
      * Quit, or a crashed Jaca: the socket closes, we go read-only, and the app's traffic returns
-     * to its own network without anyone having to run cleanup. [Divert] additionally expires on
+     * to its own network without anyone having to run cleanup. [AgentHttp] additionally expires on
      * a heartbeat window, which covers a *half-open* socket where no EOF ever arrives.
      */
     private fun startControlReader(socket: LocalSocket) {
@@ -85,8 +85,8 @@ object SqueezeReporter {
             } catch (e: Exception) {
                 Log.d(TAG, "control reader ended: $e")
             } finally {
-                Divert.disarm()
-                Log.d(TAG, "host disconnected — divert disarmed")
+                AgentHttp.disarm()
+                Log.d(TAG, "host disconnected — routing disarmed")
             }
         }, "squeeze-control").apply { isDaemon = true; start() }
     }
@@ -104,10 +104,10 @@ object SqueezeReporter {
                     if (arr != null) for (i in 0 until arr.length()) {
                         arr.optString(i)?.lowercase()?.takeIf { it.isNotEmpty() }?.let { hosts.add(it) }
                     }
-                    Divert.configure(origin, hosts, o.optInt("heartbeatSeconds", 15))
-                    Log.d(TAG, "divert configured: origin=$origin hosts=$hosts")
+                    AgentHttp.configure(origin, hosts, o.optInt("heartbeatSeconds", 15))
+                    Log.d(TAG, "route configured: origin=$origin hosts=$hosts")
                 }
-                "ping" -> Divert.touch()
+                "ping" -> AgentHttp.touch()
                 else -> { /* forward-compatible: ignore */ }
             }
         } catch (t: Throwable) {

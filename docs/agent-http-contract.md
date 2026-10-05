@@ -1,18 +1,23 @@
-# The divert contract
+# The agent HTTP contract
 
 One desktop producer, two device-side twins. This is the whole agreement between them.
 
 | Role | File |
 |---|---|
-| **Producer** (the only one) | `Sources/Core/Intercept/Intercept.swift` — `OverrideEndpoint.divertFrame` |
-| Consumer — Android | `agent/kotlin/com/squeeze/capture/Divert.kt` (+ `SqueezeReporter.kt` for the socket) |
-| Consumer — iOS Simulator | `agent/iOS/JacaDivert.m` (+ `JacaNetChannel.m` for the socket) |
-| Desktop-side header names | `OverrideHeaders` in `Intercept.swift` |
+| **Producer** (the only one) | `Sources/Core/AgentHTTP/AgentHTTPRoute.swift` — `AgentHTTPRoute.routeFrame` |
+| Consumer — Android | `agent/kotlin/com/squeeze/capture/AgentHttp.kt` (+ `SqueezeReporter.kt` for the socket) |
+| Consumer — iOS Simulator | `agent/iOS/JacaAgentHTTP.m` (+ `JacaNetChannel.m` for the socket) |
+| Desktop-side header names | `JacaHeaders` in `Intercept.swift` |
+
+The wire still spells the route frame's type `divert` and the bounce header `X-Jaca-Divert`. Those
+names predate "Agent HTTP", and a re-attached Android app keeps its already-loaded agent, so the
+desktop can't stop speaking them without breaking apps that are still running. Rename the code
+freely; never these strings.
 
 Change anything below and you must change all three. That is why this file exists: the two agents
 are in different languages, on different platforms, with different clocks, and neither compiler can
-see the other. **The desktop has exactly one encoder** (`divertFrame`, called from exactly one
-place, `DivertCoordinator.push`) precisely so a drift has a single place to start.
+see the other. **The desktop has exactly one encoder** (`routeFrame`, called from exactly one
+place, `AgentHTTPCoordinator.push`) precisely so a drift has a single place to start.
 
 ---
 
@@ -25,7 +30,7 @@ transactions. There is no second socket and no second port in either direction.
 {"type":"divert","origin":"http://localhost:41234","hosts":["api.example.com","id.example.com"],"heartbeatSeconds":15}
 ```
 
-Exactly four keys, and **that is the tripwire**. `OverrideEndpointFrameTests` asserts the key set
+Exactly four keys, and **that is the tripwire**. `AgentHTTPRouteFrameTests` asserts the key set
 literally:
 
 > the device must never learn about patterns, payloads, statuses or ordering
@@ -59,23 +64,23 @@ else:
 {"type":"hello","pid":1234,"stage":4,"caps":["override/1"]}   // Android (SqueezeReporter)
 ```
 
-`caps` is the negotiation. The desktop sends **no** divert frame until it has seen `override/1`
-(`DivertCoordinator` publishes `.waitingForAgent` in the meantime, never `.active`), so an agent
+`caps` is the negotiation. The desktop sends **no** route frame until it has seen `override/1`
+(`AgentHTTPCoordinator` publishes `.waitingForAgent` in the meantime, never `.active`), so an agent
 built before this feature is a no-op rather than a hazard. A hello *without* `override/1` is not
 silence — it becomes `.agentTooOld`, because "wait" and "rebuild your agent" are different
 instructions to a user.
 
 ---
 
-## 2. `origin == null` means divert **nothing**
+## 2. `origin == null` means route **nothing**
 
-Never "divert everything". There is one spelling of disarm, and the producer makes a second one
-unrepresentable: `OverrideEndpoint.init` clears `origin` and `hosts` **together**, so an empty host
+Never "route everything". There is one spelling of disarm, and the producer makes a second one
+unrepresentable: `AgentHTTPRoute.init` clears `origin` and `hosts` **together**, so an empty host
 set can never arm a device and an absent origin can never leave a stale host list behind.
 
 Both agents start with a nil origin, so a freshly attached/injected agent is **read-only by
 construction** rather than by a flag. Android's predecessor shipped with `ENABLED = true`
-hard-coded and a rebuild silently diverted a hard-coded endpoint; this default is the fix for that
+hard-coded and a rebuild silently routed a hard-coded endpoint; this default is the fix for that
 class of mistake.
 
 ---
@@ -94,16 +99,16 @@ class of mistake.
 
 ## 4. The monotonic dead-man window
 
-`heartbeatSeconds` is a *permission*, not a timer. The agent keeps diverting only while the desktop
+`heartbeatSeconds` is a *permission*, not a timer. The agent keeps routing only while the desktop
 has spoken within that window; the desktop re-states the **full endpoint** every
-`heartbeatSeconds / 3` (`DivertCoordinator.heartbeatInterval`), so a heartbeat both feeds the switch
+`heartbeatSeconds / 3` (`AgentHTTPCoordinator.heartbeatInterval`), so a heartbeat both feeds the switch
 and repairs a desync.
 
 Two rules that are easy to get wrong:
 
 1. **Expiry is checked on the match path, never by a timer thread.** A suspended process, a Doze
    window, or a half-open socket can starve a timer; they cannot starve a check that runs as part
-   of answering "should I divert this request?".
+   of answering "should I route this request?".
 2. **Expiry disarms.** It does not merely decline this one request. Once the window lapses the
    object goes read-only, so nothing can half-arm afterwards.
 
@@ -127,7 +132,7 @@ half-open socket where no EOF ever arrives; and a failed dial to the desktop mak
 
 ## 5. `X-Jaca-Original-URL`
 
-A diverted request is sent to the origin with its URL replaced by `<origin><path-and-query>`, and
+A routed request is sent to the origin with its URL replaced by `<origin><path-and-query>`, and
 the URL the app actually asked for carried in `X-Jaca-Original-URL`.
 
 - The header is set **before** the URL is replaced, so the outbound request is never briefly
@@ -141,13 +146,13 @@ the URL the app actually asked for carried in `X-Jaca-Original-URL`.
   so cookies, logging, and anything reading `response.URL` still see the real host. The loopback URL
   never leaves the agent.
 - Every `x-jaca-*` header is stripped before a request reaches a real origin
-  (`OverrideHeaders.isJacaInternal`) and hidden from the Headers tab.
+  (`JacaHeaders.isJacaInternal`) and hidden from the Headers tab.
 
 ---
 
 ## 6. The 599 retry-direct pair
 
-The desktop routes by **host**, but rules match by **URL**. So a request can be diverted and then
+The desktop routes by **host**, but rules match by **URL**. So a request can be routed and then
 turn out to match nothing. The desktop must not fetch it — the device is about to send it itself,
 and fetching here too would execute every unmatched request twice (duplicating POSTs). Instead it
 bounces:
@@ -163,24 +168,24 @@ app's own network, and drops the bounce from capture**. The user gets exactly on
 Three things about this are not optional:
 
 - **It is a pair, never the status alone.** `JacaIsRetryDirectBounce` requires both.
-- **It also requires that *we* diverted this request** (`wasDiverted`). An origin legitimately
+- **It also requires that *we* routed this request** (`wasRouted`). An origin legitimately
   answering 599 with that header on a request we never touched would otherwise loop forever.
 - **599 is unassigned**, which is why it was chosen: it cannot collide with a real origin's
   semantics.
 
 The desktop also bounces before touching upstream when the exchange can't survive the hop —
-`Accept: text/event-stream` or `application/grpc` (`OverrideServer.isStreamingRequest`), and any
+`Accept: text/event-stream` or `application/grpc` (`AgentHTTPServer.isStreamingRequest`), and any
 request whose original URL can't be recovered.
 
 ### Eligibility (agent-side)
 
-A request is only ever diverted if it can be **replayed**, because both safety nets (the bounce and
+A request is only ever routed if it can be **replayed**, because both safety nets (the bounce and
 the fail-open retry) re-send it:
 
 | Excluded | Why |
 |---|---|
 | `Connection: upgrade` | WebSockets/h2c don't survive a buffered hop |
-| A body we couldn't drain | Android: one-shot/duplex bodies. iOS: an `HTTPBodyStream` still present after the tap tried to read it — the order matters, so an ordinary upload stays divertible while an unreadable one does not |
+| A body we couldn't drain | Android: one-shot/duplex bodies. iOS: an `HTTPBodyStream` still present after the tap tried to read it — the order matters, so an ordinary upload stays routable while an unreadable one does not |
 
 ---
 
@@ -201,13 +206,13 @@ the fail-open retry) re-send it:
 
 | Claim | Test |
 |---|---|
-| The frame has exactly four keys, hosts sorted, escaping, `disarmed()` → literal `"origin":null` | `Tests/OverrideEndpointFrameTests.swift` |
+| The frame has exactly four keys, hosts sorted, escaping, `disarmed()` → literal `"origin":null` | `Tests/AgentHTTPRouteFrameTests.swift` |
 | The iOS hello literal classifies as `override/1`; unknown frames are ignored | `Tests/AgentFrameTests.swift` |
-| No frame before hello; `.agentTooOld` on a hello without `override/1`; the heartbeat re-states the full endpoint; an empty host set disarms | `Tests/DivertCoordinatorTests.swift` |
-| Host lowercasing, expiry *disarming*, path+query, eligibility, the 599 pair needing `wasDiverted`, URL restore | `Tests/ObjC/JacaDivertTests.m` (target `JacaAgentTests`, runs on macOS) |
+| No frame before hello; `.agentTooOld` on a hello without `override/1`; the heartbeat re-states the full endpoint; an empty host set disarms | `Tests/AgentHTTPCoordinatorTests.swift` |
+| Host lowercasing, expiry *disarming*, path+query, eligibility, the 599 pair needing `wasRouted`, URL restore | `Tests/ObjC/JacaAgentHTTPTests.m` (target `JacaAgentTests`, runs on macOS) |
 
 ## See also
 
-- [`response-overrides-android.md`](response-overrides-android.md) — the feature, its traps, and
+- [`agent-https-debugging-android.md`](agent-https-debugging-android.md) — the feature, its traps, and
   the Android path
-- [`response-overrides-ios.md`](response-overrides-ios.md) — the iOS-Simulator path
+- [`agent-https-debugging-ios.md`](agent-https-debugging-ios.md) — the iOS-Simulator path

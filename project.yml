@@ -103,8 +103,8 @@ targets:
       - name: Build iOS Simulator network agent
         basedOnDependencyAnalysis: false
         script: |
-          # Every agent/iOS/*.m: the agent is three files (tap+divert client, transport, and the
-          # Divert.kt twin). The glob is deliberately non-recursive, so a subdirectory can never be
+          # Every agent/iOS/*.m: the agent is three files (tap+route client, transport, and the
+          # AgentHttp.kt twin). The glob is deliberately non-recursive, so a subdirectory can never be
           # linked into the dylib.
           OUT="$BUILT_PRODUCTS_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/JacaNetAgent.dylib"
           mkdir -p "$(dirname "$OUT")"
@@ -145,7 +145,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: dev.srsouza.JacaTests
         GENERATE_INFOPLIST_FILE: YES
 
-  # The agent's decisions, tested on the host. agent/iOS/JacaDivert.m uses no iOS-only API for
+  # The agent's decisions, tested on the host. agent/iOS/JacaAgentHTTP.m uses no iOS-only API for
   # exactly this reason: the dead-man window, the host match and the 599 bounce pair are the parts
   # a mistake in makes an app either uncapturable or permanently pointed at a dead port, and
   # "rebuild the dylib, launch a simulator, launch an app" is far too slow a loop to catch them.
@@ -155,8 +155,8 @@ targets:
     deploymentTarget: "14.0"
     sources:
       - path: Tests/ObjC
-      - path: agent/iOS/JacaDivert.h
-      - path: agent/iOS/JacaDivert.m
+      - path: agent/iOS/JacaAgentHTTP.h
+      - path: agent/iOS/JacaAgentHTTP.m
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.srsouza.JacaAgentTests

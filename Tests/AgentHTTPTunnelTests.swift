@@ -1,12 +1,12 @@
 import XCTest
 @testable import Jaca
 
-/// The tunnel seam is what keeps `Core/Overrides/` free of adb. Two things are worth asserting
+/// The tunnel seam is what keeps the route layer free of adb. Two things are worth asserting
 /// here and nowhere else: the exact `adb` invocation (a typo in it disables the whole feature with
 /// no compile error), and that shared loopback really is free of persistent state — the ledger is
 /// the mechanism that reclaims a stranded tunnel, and a transport that has nothing to strand must
 /// never write to it.
-final class DivertTunnelTests: XCTestCase {
+final class AgentHTTPTunnelTests: XCTestCase {
 
     // MARK: - Shared loopback (iOS Simulator)
 

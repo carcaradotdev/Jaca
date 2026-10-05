@@ -416,7 +416,7 @@ struct NetworkSessionView: View {
                                           httpStack: txn.httpStack)
     }
 
-    /// This tab's divert arming state, or `.idle` when it isn't an agent tab. One reader on the
+    /// This tab's routing arming state, or `.idle` when it isn't an agent tab. One reader on the
     /// session, shared with the toolbar, popover, row badges and attach banner.
     private var armingState: InterceptArmingState { session.armingState }
 

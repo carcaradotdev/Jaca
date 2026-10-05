@@ -25,7 +25,7 @@ enum OverrideSeeding {
     static func headers(_ headers: [HeaderPair]) -> [HeaderPair] {
         let managed: Set<String> = ["content-length", "content-encoding", "transfer-encoding", "connection"]
         let kept = headers.filter {
-            !managed.contains($0.name.lowercased()) && !OverrideHeaders.isJacaInternal($0.name)
+            !managed.contains($0.name.lowercased()) && !JacaHeaders.isJacaInternal($0.name)
         }
         return kept.isEmpty ? [HeaderPair(name: "Content-Type", value: "application/json")] : kept
     }

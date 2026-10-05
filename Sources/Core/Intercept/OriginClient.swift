@@ -7,7 +7,7 @@ import Foundation
 ///
 /// - **MITM proxy** — do *not* follow. The client re-requests each hop through us, so following
 ///   here would hide hops from capture. This is `UpstreamClient`'s existing behaviour.
-/// - **Divert** — *must* follow. The device app is talking to a loopback tunnel; handing it a bare
+/// - **Agent routing** — *must* follow. The device app is talking to a loopback tunnel; handing it a bare
 ///   3xx pointing at the real origin would make it leave the tunnel and defeat the override.
 ///
 /// The follow loop lives here, not in `UpstreamClient`, so the proxy is untouched by it.
@@ -68,7 +68,7 @@ struct OriginClient: OriginRequesting {
     ///
     /// 303 always downgrades and 301/302 downgrade a non-GET/HEAD (as `URLSession` does), but
     /// **307/308 never do** — they exist to preserve the method and body. Downgrading every 3xx
-    /// turned a diverted `POST` into a bodiless GET and a silent 404/405.
+    /// turned a routed `POST` into a bodiless GET and a silent 404/405.
     static func downgradesToGET(status: Int, method: String) -> Bool {
         switch status {
         case 303:      return true

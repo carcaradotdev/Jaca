@@ -129,8 +129,8 @@ final class OverrideClampTests: XCTestCase {
     func test_everySkipReasonHasNonEmptyMessage() {
         let reasons: [InterceptSkipReason] = [
             .masterOff,
-            .transportUnsupported(transport: .agentDivert(package: "p"), missing: [.bodies]),
-            .transportUnsupported(transport: .iosSimulatorDivert(bundleID: "b"), missing: [.bodies]),
+            .transportUnsupported(transport: .androidAgent(package: "p"), missing: [.bodies]),
+            .transportUnsupported(transport: .iosSimulatorAgent(bundleID: "b"), missing: [.bodies]),
             .transportUnsupported(transport: .mitmProxy, missing: [.mapRemote]),
             .transportUnsupported(transport: .companionMetadata, missing: [.shortCircuit]),
             .transportNotArmed("adb reverse failed"),
@@ -146,17 +146,17 @@ final class OverrideClampTests: XCTestCase {
     /// The clamp is only honest if the capability the toolbar shows is the capability the pipeline
     /// applies. `AgentCaptureSource.nativeCapabilities` is that single constant: the source reads
     /// it to answer the UI, and hands the *same* constant to `AgentController`, which passes it to
-    /// `DivertCoordinator` and on into `OverrideServer`. `capabilities:` has no default anywhere
+    /// `AgentHTTPCoordinator` and on into `AgentHTTPServer`. `capabilities:` has no default anywhere
     /// along that chain, so there is no second value for the two to drift apart into.
     @MainActor
-    func test_declaredCapabilitiesAreTheOnesHandedToOverrideServer() {
+    func test_declaredCapabilitiesAreTheOnesHandedToAgentHTTPServer() {
         let wired = AgentCaptureSource(adbURL: URL(fileURLWithPath: "/nonexistent/adb"),
                                        serial: "s", package: "p", intercept: Self.stubServices())
         XCTAssertEqual(wired.interceptCapabilities, AgentCaptureSource.nativeCapabilities)
         XCTAssertEqual(AgentCaptureSource.nativeCapabilities, .desktopTerminated)
 
         // The iOS Simulator runs the same chain — source constant → controller → coordinator →
-        // OverrideServer — so it gets the same guarantee, not a hard-coded capability of its own.
+        // AgentHTTPServer — so it gets the same guarantee, not a hard-coded capability of its own.
         let wiredIOS = IOSSimulatorAgentCaptureSource(device: Self.simulator, bundleID: "com.example.App",
                                                       intercept: Self.stubServices())
         XCTAssertEqual(wiredIOS.interceptCapabilities, IOSSimulatorAgentCaptureSource.nativeCapabilities)
@@ -181,20 +181,20 @@ final class OverrideClampTests: XCTestCase {
 
     // MARK: - Redirect policy per transport
 
-    /// A diverted app must have redirects followed on the Mac, or it leaves the tunnel chasing a
+    /// A routed app must have redirects followed on the Mac, or it leaves the tunnel chasing a
     /// 3xx; the MITM proxy must not, because the client re-requests each hop through us and
     /// following here would hide hops from capture.
-    func test_divertTransportsFollowRedirectsAndTheProxyDoesNot() {
-        XCTAssertEqual(InterceptServices.redirectPolicy(for: .agentDivert(package: "p")),
+    func test_agentTransportsFollowRedirectsAndTheProxyDoesNot() {
+        XCTAssertEqual(InterceptServices.redirectPolicy(for: .androidAgent(package: "p")),
                        .follow(max: 5))
-        XCTAssertEqual(InterceptServices.redirectPolicy(for: .iosSimulatorDivert(bundleID: "b")),
+        XCTAssertEqual(InterceptServices.redirectPolicy(for: .iosSimulatorAgent(bundleID: "b")),
                        .follow(max: 5))
         XCTAssertEqual(InterceptServices.redirectPolicy(for: .mitmProxy), .doNotFollow)
         XCTAssertEqual(InterceptServices.redirectPolicy(for: .companionMetadata), .doNotFollow)
     }
 
     /// 307/308 are the two redirects defined to preserve the method **and** the body. Following
-    /// one as a bodiless GET turns a diverted POST into whatever the origin answers a GET with —
+    /// one as a bodiless GET turns a routed POST into whatever the origin answers a GET with —
     /// usually a 404/405, handed back to the app as if it were its own response.
     func test_307And308PreserveTheMethodAndBody() {
         XCTAssertFalse(OriginClient.downgradesToGET(status: 307, method: "POST"))

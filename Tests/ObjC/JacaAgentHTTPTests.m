@@ -1,16 +1,16 @@
-// JacaDivertTests.m — the agent's decisions, tested on the host.
+// JacaAgentHTTPTests.m — the agent's decisions, tested on the host.
 //
-// `agent/iOS/JacaDivert.m` uses no iOS-only API precisely so this suite can exist: the dead-man
+// `agent/iOS/JacaAgentHTTP.m` uses no iOS-only API precisely so this suite can exist: the dead-man
 // window, the host match and the 599 bounce pair are the parts where a mistake either makes an app
 // uncapturable or leaves it permanently pointed at a dead loopback port, and "rebuild the dylib,
 // boot a simulator, launch an app" is far too slow a loop to catch them.
 //
-// The Kotlin twin (agent/kotlin/com/squeeze/capture/Divert.kt) is the same contract in another
+// The Kotlin twin (agent/kotlin/com/squeeze/capture/AgentHttp.kt) is the same contract in another
 // language; when one changes, this file is where the other's behaviour is written down.
 
 #import <XCTest/XCTest.h>
 
-#import "JacaDivert.h"
+#import "JacaAgentHTTP.h"
 
 static NSHTTPURLResponse *ResponseWithStatus(NSInteger status, NSDictionary *headers) {
     return [[NSHTTPURLResponse alloc] initWithURL:[NSURL URLWithString:@"http://127.0.0.1:41234/v1/state"]
@@ -19,45 +19,45 @@ static NSHTTPURLResponse *ResponseWithStatus(NSInteger status, NSDictionary *hea
                                      headerFields:headers];
 }
 
-@interface JacaDivertTests : XCTestCase
+@interface JacaAgentHTTPTests : XCTestCase
 @end
 
-@implementation JacaDivertTests
+@implementation JacaAgentHTTPTests
 
-// The divert state is process-global (there is one agent per app), so each test starts read-only.
-- (void)setUp { JacaDivertDisarm(); }
-- (void)tearDown { JacaDivertDisarm(); }
+// The route state is process-global (there is one agent per app), so each test starts read-only.
+- (void)setUp { JacaAgentHTTPDisarm(); }
+- (void)tearDown { JacaAgentHTTPDisarm(); }
 
 #pragma mark - Host matching
 
-/// Arranged through `JacaDivertApplyControlLine` with a frame byte-for-byte as
-/// `OverrideEndpoint.divertFrame` emits it, so this also pins the cross-language wire format:
+/// Arranged through `JacaAgentHTTPApplyControlLine` with a frame byte-for-byte as
+/// `AgentHTTPRoute.routeFrame` emits it, so this also pins the cross-language wire format:
 /// hosts sorted, origin as a JSON string, `heartbeatSeconds` alongside.
 - (void)test_hostsMatchCaseInsensitivelyFromADesktopFrame {
-    JacaDivertApplyControlLine(
+    JacaAgentHTTPApplyControlLine(
         @"{\"type\":\"divert\",\"origin\":\"http://127.0.0.1:41234\","
         @"\"hosts\":[\"api.example.com\"],\"heartbeatSeconds\":15}");
 
-    XCTAssertTrue(JacaDivertIsArmed());
-    XCTAssertEqualObjects(JacaDivertTargetFor(@"api.example.com", @"/v1/state"),
+    XCTAssertTrue(JacaAgentHTTPIsArmed());
+    XCTAssertEqualObjects(JacaAgentHTTPTargetFor(@"api.example.com", @"/v1/state"),
                           @"http://127.0.0.1:41234/v1/state");
     // The app's URL can carry any casing; DNS doesn't care and neither may we.
-    XCTAssertEqualObjects(JacaDivertTargetFor(@"API.Example.COM", @"/v1/state"),
+    XCTAssertEqualObjects(JacaAgentHTTPTargetFor(@"API.Example.COM", @"/v1/state"),
                           @"http://127.0.0.1:41234/v1/state");
 }
 
 /// A host the desktop never named stays on the device's own network — that is what makes
-/// diverting a whole host safe.
+/// routing a whole host safe.
 - (void)test_unlistedHostIsLeftAlone {
-    JacaDivertConfigure(@"http://127.0.0.1:41234", [NSSet setWithObject:@"api.example.com"], 15);
-    XCTAssertNil(JacaDivertTargetFor(@"analytics.example.com", @"/collect"));
+    JacaAgentHTTPConfigure(@"http://127.0.0.1:41234", [NSSet setWithObject:@"api.example.com"], 15);
+    XCTAssertNil(JacaAgentHTTPTargetFor(@"analytics.example.com", @"/collect"));
 }
 
 /// A nil origin is the single spelling of disarm, and the default a fresh agent starts in.
-- (void)test_nilOriginDivertsNothing {
-    JacaDivertConfigure(nil, [NSSet setWithObject:@"api.example.com"], 15);
-    XCTAssertFalse(JacaDivertIsArmed());
-    XCTAssertNil(JacaDivertTargetFor(@"api.example.com", @"/v1/state"));
+- (void)test_nilOriginRoutesNothing {
+    JacaAgentHTTPConfigure(nil, [NSSet setWithObject:@"api.example.com"], 15);
+    XCTAssertFalse(JacaAgentHTTPIsArmed());
+    XCTAssertNil(JacaAgentHTTPTargetFor(@"api.example.com", @"/v1/state"));
 }
 
 #pragma mark - The dead-man switch
@@ -65,23 +65,23 @@ static NSHTTPURLResponse *ResponseWithStatus(NSInteger status, NSDictionary *hea
 /// Expiry doesn't merely decline this request: it **disarms**, so a Jaca that was SIGKILLed leaves
 /// the app provably back on its own network with nobody having to run any cleanup.
 - (void)test_expiredWindowReturnsNilAndLeavesTheObjectDisarmed {
-    JacaDivertConfigure(@"http://127.0.0.1:41234", [NSSet setWithObject:@"api.example.com"], 0);
-    XCTAssertTrue(JacaDivertIsArmed());
+    JacaAgentHTTPConfigure(@"http://127.0.0.1:41234", [NSSet setWithObject:@"api.example.com"], 0);
+    XCTAssertTrue(JacaAgentHTTPIsArmed());
     usleep(2000);   // past a zero-length window
 
-    XCTAssertNil(JacaDivertTargetFor(@"api.example.com", @"/v1/state"));
-    XCTAssertFalse(JacaDivertIsArmed(), @"expiry must disarm, not just decline one request");
+    XCTAssertNil(JacaAgentHTTPTargetFor(@"api.example.com", @"/v1/state"));
+    XCTAssertFalse(JacaAgentHTTPIsArmed(), @"expiry must disarm, not just decline one request");
 }
 
 /// …and the desktop coming back re-arms it. The heartbeat re-states the whole endpoint for exactly
 /// this reason, so a lapsed window repairs itself within one interval.
 - (void)test_aFreshFrameReArmsAfterExpiry {
-    JacaDivertConfigure(@"http://127.0.0.1:41234", [NSSet setWithObject:@"api.example.com"], 0);
+    JacaAgentHTTPConfigure(@"http://127.0.0.1:41234", [NSSet setWithObject:@"api.example.com"], 0);
     usleep(2000);
-    XCTAssertNil(JacaDivertTargetFor(@"api.example.com", @"/v1/state"));
+    XCTAssertNil(JacaAgentHTTPTargetFor(@"api.example.com", @"/v1/state"));
 
-    JacaDivertConfigure(@"http://127.0.0.1:41234", [NSSet setWithObject:@"api.example.com"], 15);
-    XCTAssertEqualObjects(JacaDivertTargetFor(@"api.example.com", @"/v1/state"),
+    JacaAgentHTTPConfigure(@"http://127.0.0.1:41234", [NSSet setWithObject:@"api.example.com"], 15);
+    XCTAssertEqualObjects(JacaAgentHTTPTargetFor(@"api.example.com", @"/v1/state"),
                           @"http://127.0.0.1:41234/v1/state");
 }
 
@@ -110,25 +110,25 @@ static NSHTTPURLResponse *ResponseWithStatus(NSInteger status, NSDictionary *hea
     NSURL *url = [NSURL URLWithString:@"https://api.example.com/v1/state"];
 
     NSMutableURLRequest *plain = [NSMutableURLRequest requestWithURL:url];
-    XCTAssertTrue(JacaIsDivertEligible(plain));
+    XCTAssertTrue(JacaIsRoutable(plain));
 
     // A protocol upgrade isn't plain HTTP on the other side.
     NSMutableURLRequest *upgrade = [NSMutableURLRequest requestWithURL:url];
     [upgrade setValue:@"Upgrade" forHTTPHeaderField:@"Connection"];
-    XCTAssertFalse(JacaIsDivertEligible(upgrade));
+    XCTAssertFalse(JacaIsRoutable(upgrade));
 
     // A body stream can only be read once, and both safety nets re-send the request.
     NSMutableURLRequest *streamed = [NSMutableURLRequest requestWithURL:url];
     streamed.HTTPMethod = @"POST";
     streamed.HTTPBodyStream = [NSInputStream inputStreamWithData:[NSData dataWithBytes:"x" length:1]];
-    XCTAssertFalse(JacaIsDivertEligible(streamed));
+    XCTAssertFalse(JacaIsRoutable(streamed));
 }
 
 #pragma mark - The retry-direct bounce
 
 /// The four combinations, because recognising the bounce on anything less than all three facts is
 /// how you get either a leaked 599 row or an infinite retry loop.
-- (void)test_theBounceNeedsTheStatusTheHeaderAndOurOwnDivert {
+- (void)test_theBounceNeedsTheStatusTheHeaderAndOurOwnRoute {
     NSDictionary *withHeader = @{@"X-Jaca-Divert": @"retry-direct"};
 
     XCTAssertTrue(JacaIsRetryDirectBounce(ResponseWithStatus(599, withHeader), YES));
@@ -144,9 +144,9 @@ static NSHTTPURLResponse *ResponseWithStatus(NSInteger status, NSDictionary *hea
     XCTAssertFalse(JacaIsRetryDirectBounce(ResponseWithStatus(200, withHeader), YES));
 }
 
-#pragma mark - Hiding the divert from the app
+#pragma mark - Hiding the route from the app
 
-/// A diverted call still has to look like the real URL to the app: cookies, logging, and anything
+/// A routed call still has to look like the real URL to the app: cookies, logging, and anything
 /// reading `response.URL` must never see the loopback one.
 - (void)test_theClientSeesTheOriginalURLWithTheRealStatusAndHeaders {
     NSHTTPURLResponse *fromJaca = ResponseWithStatus(201, @{@"Content-Type": @"application/json",

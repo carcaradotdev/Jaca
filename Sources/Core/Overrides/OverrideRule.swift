@@ -19,13 +19,13 @@ struct OverrideRule: Codable, Sendable, Identifiable, Hashable {
     /// **The blast radius** — only these hosts leave the device's own network. Derived from the
     /// pattern when it names a literal host, otherwise the editor asks. Ignored by the MITM and
     /// companion transports, which are already on the wire.
-    var divertHosts: Set<String> = []
+    var routedHosts: Set<String> = []
     var createdAt: Date = Date()
 
     init(id: UUID = UUID(), name: String = "", enabled: Bool = true,
          matcher: OverrideMatcher = .init(), scope: OverrideScope = .init(),
          action: OverrideActionSpec = .respond(.init()), delayMillis: Int = 0,
-         divertHosts: Set<String> = [], createdAt: Date = Date()) {
+         routedHosts: Set<String> = [], createdAt: Date = Date()) {
         self.id = id
         self.name = name
         self.enabled = enabled
@@ -33,7 +33,7 @@ struct OverrideRule: Codable, Sendable, Identifiable, Hashable {
         self.scope = scope
         self.action = action
         self.delayMillis = delayMillis
-        self.divertHosts = divertHosts
+        self.routedHosts = routedHosts
         self.createdAt = createdAt
     }
 
@@ -156,7 +156,10 @@ enum OverrideBodyRef: Codable, Sendable, Hashable {
 
 extension OverrideRule {
     enum CodingKeys: String, CodingKey {
-        case id, name, enabled, matcher, scope, action, delayMillis, divertHosts, createdAt
+        case id, name, enabled, matcher, scope, action, delayMillis, createdAt
+        // The property was renamed; the key on disk wasn't. Without the explicit raw value every
+        // saved rule would decode with no hosts, and the next save would write that loss back.
+        case routedHosts = "divertHosts"
     }
 
     init(from decoder: Decoder) throws {
@@ -168,7 +171,7 @@ extension OverrideRule {
         scope       = try c.decodeIfPresent(OverrideScope.self, forKey: .scope) ?? .init()
         action      = try c.decodeIfPresent(OverrideActionSpec.self, forKey: .action) ?? .respond(.init())
         delayMillis = try c.decodeIfPresent(Int.self, forKey: .delayMillis) ?? 0
-        divertHosts = try c.decodeIfPresent(Set<String>.self, forKey: .divertHosts) ?? []
+        routedHosts = try c.decodeIfPresent(Set<String>.self, forKey: .routedHosts) ?? []
         // ISO-8601 *or* numeric, so either strategy loads: `createdAt` is cosmetic and must
         // never be the reason a rule is dropped.
         createdAt   = OverrideRule.decodeDate(from: c) ?? Date()

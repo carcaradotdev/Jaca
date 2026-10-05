@@ -166,7 +166,7 @@ struct OverridesPopover: View {
             LemonadeUi.Text("\(hostText) · \(transport.portLabel(port: port))",
                             textStyle: LemonadeTypography.shared.bodyXSmallRegular,
                             color: LemonadeTheme.colors.content.contentTertiary, maxLines: 2)
-                .help(transport.divertScopeHelp)
+                .help(transport.routingScopeHelp)
         case .failed(let detail):
             VStack(alignment: .leading, spacing: 2) {
                 LemonadeUi.Text("Overrides inactive",

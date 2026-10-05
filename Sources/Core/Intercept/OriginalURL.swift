@@ -8,7 +8,7 @@ enum AgentOriginalURL {
     /// Prefers `X-Jaca-Original-URL` (set by the agent, which knows the real URL), falling back
     /// to `Host` + origin-form URI — what a non-agent client hitting loopback sends.
     static func recover(headers: [HeaderPair], uri: String) -> String? {
-        if let original = headers.first(where: { $0.name.lowercased() == OverrideHeaders.originalURL.lowercased() })?.value,
+        if let original = headers.first(where: { $0.name.lowercased() == JacaHeaders.originalURL.lowercased() })?.value,
            !original.isEmpty, URL(string: original)?.host != nil {
             return original
         }

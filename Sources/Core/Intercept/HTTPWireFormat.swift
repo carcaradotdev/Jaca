@@ -24,7 +24,7 @@ enum HTTPWireFormat {
     static func shouldDropFromOutbound(_ name: String) -> Bool {
         let lower = name.lowercased()
         return isHopByHop(lower) || lower == "host" || lower == "content-length"
-            || OverrideHeaders.isJacaInternal(lower)
+            || JacaHeaders.isJacaInternal(lower)
     }
 
     /// Writes a complete response, recomputing the framing headers so they always agree with the

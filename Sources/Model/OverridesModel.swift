@@ -41,7 +41,7 @@ final class OverridesModel {
     private(set) var lastActivity: String?
 
     private let resolver = OverrideResolver()
-    private var coordinators: [InterceptTarget: DivertCoordinator] = [:]
+    private var coordinators: [InterceptTarget: AgentHTTPCoordinator] = [:]
 
     // MARK: - Init
 
@@ -90,7 +90,7 @@ final class OverridesModel {
                     if let existing = self.coordinators[target],
                        existing !== coordinator, !existing.isStopped { return }
                     self.coordinators[target] = coordinator
-                    coordinator.updateHosts(self.divertHosts(for: target))
+                    coordinator.updateHosts(self.routedHosts(for: target))
                 }
             },
             onDeregisterCoordinator: { [weak self] target, coordinator in
@@ -121,8 +121,8 @@ final class OverridesModel {
     /// it would re-enable a rule the user switched off in the editor before saving.
     func add(_ rule: OverrideRule) {
         var newRule = rule
-        if newRule.divertHosts.isEmpty {
-            newRule.divertHosts = OverrideCompiler.derivedDivertHosts(for: newRule.matcher)
+        if newRule.routedHosts.isEmpty {
+            newRule.routedHosts = OverrideCompiler.derivedRoutedHosts(for: newRule.matcher)
         }
         rules.append(newRule)
         persistAndRepublish()
@@ -159,7 +159,7 @@ final class OverridesModel {
                                 name: source.name.isEmpty ? "Copy" : "\(source.name) copy",
                                 enabled: true, matcher: source.matcher, scope: source.scope,
                                 action: source.action, delayMillis: source.delayMillis,
-                                divertHosts: source.divertHosts)
+                                routedHosts: source.routedHosts)
         rules.append(copy)
         persistAndRepublish()
     }
@@ -185,7 +185,7 @@ final class OverridesModel {
     func diagnostic(for id: UUID) -> String? { resolver.current.diagnostics[id] }
 
     /// The rule that produced this response, read from the stamp the transaction carries — an
-    /// id-keyed map can't work, since `OverrideServer` mints ids no captured row shares.
+    /// id-keyed map can't work, since `AgentHTTPServer` mints ids no captured row shares.
     func appliedRule(for txn: NetworkTransaction) -> OverrideRule? {
         guard let ruleID = txn.overriddenByRuleID else { return nil }
         return rules.first { $0.id == ruleID }
@@ -230,7 +230,7 @@ final class OverridesModel {
         rule.matcher = OverrideMatcher(pattern: OverrideSeeding.pattern(for: txn),
                                        kind: .glob,
                                        methods: [txn.method.uppercased()])
-        rule.divertHosts = OverrideCompiler.derivedDivertHosts(for: rule.matcher)
+        rule.routedHosts = OverrideCompiler.derivedRoutedHosts(for: rule.matcher)
 
         let pretty = OverrideSeeding.prettyPrinted(responseBody, contentType: txn.responseContentType)
         rule.action = .respond(OverrideResponseSpec(
@@ -245,8 +245,8 @@ final class OverridesModel {
 
     /// Hosts to route for one target. The real `deviceID` matters: with it hard-coded nil, a
     /// device-scoped rule contributed no hosts and could never fire.
-    private func divertHosts(for target: InterceptTarget) -> Set<String> {
-        resolver.current.divertHosts(deviceID: target.deviceID, appID: target.package)
+    private func routedHosts(for target: InterceptTarget) -> Set<String> {
+        resolver.current.routedHosts(deviceID: target.deviceID, appID: target.package)
     }
 
     private func recordHit(ruleID: UUID?) {
@@ -272,7 +272,7 @@ final class OverridesModel {
     private func republish() {
         resolver.publish(OverrideCompiler.compile(rules, masterEnabled: masterEnabled))
         for (target, coordinator) in coordinators {
-            coordinator.updateHosts(divertHosts(for: target))
+            coordinator.updateHosts(routedHosts(for: target))
         }
     }
 }

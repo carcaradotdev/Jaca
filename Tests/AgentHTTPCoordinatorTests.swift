@@ -2,10 +2,10 @@ import XCTest
 @testable import Jaca
 
 /// The coordinator writes through an injected `AgentControlWriter` and reaches the device through
-/// an injected `DivertTunnel`, so its whole control-frame contract can be asserted with no device,
+/// an injected `AgentHTTPTunnel`, so its whole control-frame contract can be asserted with no device,
 /// no `adb` and no subprocess. The only real socket anywhere here is the loopback listener
-/// `OverrideServer` binds on port 0, which is local and deterministic.
-final class DivertCoordinatorTests: XCTestCase {
+/// `AgentHTTPServer` binds on port 0, which is local and deterministic.
+final class AgentHTTPCoordinatorTests: XCTestCase {
 
     private final class RecordingWriter: AgentControlWriter, @unchecked Sendable {
         enum Event: Equatable { case frame(String), flush }
@@ -24,7 +24,7 @@ final class DivertCoordinatorTests: XCTestCase {
 
     /// Stands in for `AdbReverseTunnel` without spawning anything, and can be told to fail so the
     /// "whose words does the user see?" question has an answer in a test rather than on a device.
-    private final class StubTunnel: DivertTunnel, @unchecked Sendable {
+    private final class StubTunnel: AgentHTTPTunnel, @unchecked Sendable {
         let failure: String?
         private let lock = NSLock()
         private var _closedPorts: [Int] = []
@@ -33,7 +33,7 @@ final class DivertCoordinatorTests: XCTestCase {
 
         func origin(forLocalPort port: Int) -> String { "http://stub:\(port)" }
         func open(localPort port: Int) async throws {
-            if let failure { throw DivertTunnelError(userMessage: failure) }
+            if let failure { throw AgentHTTPTunnelError(userMessage: failure) }
         }
         func close(localPort port: Int) async { lock.lock(); _closedPorts.append(port); lock.unlock() }
         var needsTunnelLedger: Bool { false }
@@ -43,7 +43,7 @@ final class DivertCoordinatorTests: XCTestCase {
 
     /// A tunnel whose `open` parks until released, so a `stop()` can be driven *into* the
     /// bring-up window rather than merely before or after it.
-    private final class BlockingTunnel: DivertTunnel, @unchecked Sendable {
+    private final class BlockingTunnel: AgentHTTPTunnel, @unchecked Sendable {
         private let opened = AsyncSemaphore()
         private let release = AsyncSemaphore()
         private let lock = NSLock()
@@ -89,9 +89,9 @@ final class DivertCoordinatorTests: XCTestCase {
     }
 
     private func makeCoordinator(_ writer: RecordingWriter,
-                                 tunnel: DivertTunnel = StubTunnel(),
-                                 heartbeatSeconds: Int = 15) -> DivertCoordinator {
-        DivertCoordinator(transport: .agentDivert(package: "com.example.app"),
+                                 tunnel: AgentHTTPTunnel = StubTunnel(),
+                                 heartbeatSeconds: Int = 15) -> AgentHTTPCoordinator {
+        AgentHTTPCoordinator(transport: .androidAgent(package: "com.example.app"),
                           deviceID: "unit-test-serial",
                           appID: "com.example.app",
                           capabilities: .desktopTerminated,
@@ -136,7 +136,7 @@ final class DivertCoordinatorTests: XCTestCase {
     // MARK: - Start
 
     /// The lie this step removes. A bound server means the *desktop* is ready; nothing is being
-    /// diverted until the agent has said hello, and `.active` there paints a live green bolt over
+    /// routed until the agent has said hello, and `.active` there paints a live green bolt over
     /// a session where every request goes straight past us.
     func test_aBoundServerWithNoHelloIsWaitingForTheAgentNotActive() async {
         let writer = RecordingWriter()
@@ -158,8 +158,8 @@ final class DivertCoordinatorTests: XCTestCase {
 
         let port = try XCTUnwrap(activePort(coordinator.currentState))
         XCTAssertEqual(coordinator.currentState, .active(port: port, hosts: ["api.example.com"]))
-        XCTAssertEqual(writer.frames, [OverrideEndpoint.divertFrame(
-            OverrideEndpoint(origin: "http://stub:\(port)", hosts: ["api.example.com"]))])
+        XCTAssertEqual(writer.frames, [AgentHTTPRoute.routeFrame(
+            AgentHTTPRoute(origin: "http://stub:\(port)", hosts: ["api.example.com"]))])
         await coordinator.stop()
     }
 
@@ -193,9 +193,9 @@ final class DivertCoordinatorTests: XCTestCase {
         await coordinator.stop()
     }
 
-    /// Empty hosts must disarm the device, never divert everything: `OverrideEndpoint`'s init
+    /// Empty hosts must disarm the device, never route everything: `AgentHTTPRoute`'s init
     /// clears the origin with the host set, so the frame that lands is a real disarm.
-    func test_clearingTheHostSetDisarmsRatherThanDivertingEverything() async throws {
+    func test_clearingTheHostSetDisarmsRatherThanRoutingEverything() async throws {
         let writer = RecordingWriter()
         let coordinator = makeCoordinator(writer)
         coordinator.updateHosts(["api.example.com"])
@@ -257,7 +257,7 @@ final class DivertCoordinatorTests: XCTestCase {
         await coordinator.stop()
 
         XCTAssertEqual(writer.events,
-                       [.frame(OverrideEndpoint.divertFrame(.disarmed(heartbeatSeconds: 15))), .flush])
+                       [.frame(AgentHTTPRoute.routeFrame(.disarmed(heartbeatSeconds: 15))), .flush])
         XCTAssertEqual(coordinator.currentState, .idle)
     }
 
@@ -302,7 +302,7 @@ final class DivertCoordinatorTests: XCTestCase {
     /// The `.active` lie this exists to break: `agentDidReconnect` deliberately keeps `override/1`
     /// support sticky across a socket cycle, so after the user quits the app the coordinator still
     /// believes the agent supports overrides. Without an outside report it would keep publishing
-    /// `.active` while nothing whatsoever was being diverted.
+    /// `.active` while nothing whatsoever was being routed.
     func test_aRunningAppWithNoAgentInItReportsDetachedNotActive() async {
         let writer = RecordingWriter()
         let coordinator = makeCoordinator(writer)
@@ -370,16 +370,16 @@ final class DivertCoordinatorTests: XCTestCase {
     }
 
     func test_heartbeatIntervalIsAThirdOfTheWindow() {
-        XCTAssertEqual(DivertCoordinator.heartbeatInterval(heartbeatSeconds: 15), .seconds(5))
-        XCTAssertEqual(DivertCoordinator.heartbeatInterval(heartbeatSeconds: 30), .seconds(10))
-        XCTAssertEqual(DivertCoordinator.heartbeatInterval(heartbeatSeconds: 9), .seconds(3))
+        XCTAssertEqual(AgentHTTPCoordinator.heartbeatInterval(heartbeatSeconds: 15), .seconds(5))
+        XCTAssertEqual(AgentHTTPCoordinator.heartbeatInterval(heartbeatSeconds: 30), .seconds(10))
+        XCTAssertEqual(AgentHTTPCoordinator.heartbeatInterval(heartbeatSeconds: 9), .seconds(3))
     }
 
     /// A window so short that a third of it rounds to zero must not turn the heartbeat into a
     /// spin loop.
     func test_heartbeatIntervalNeverCollapsesToZero() {
-        XCTAssertEqual(DivertCoordinator.heartbeatInterval(heartbeatSeconds: 1), .seconds(1))
-        XCTAssertEqual(DivertCoordinator.heartbeatInterval(heartbeatSeconds: 0), .seconds(1))
+        XCTAssertEqual(AgentHTTPCoordinator.heartbeatInterval(heartbeatSeconds: 1), .seconds(1))
+        XCTAssertEqual(AgentHTTPCoordinator.heartbeatInterval(heartbeatSeconds: 0), .seconds(1))
     }
 
     // MARK: - Teardown is terminal
@@ -387,7 +387,7 @@ final class DivertCoordinatorTests: XCTestCase {
     /// The owning controller can be mid-`await` in its bring-up (pushing ~15 MB of artifacts over
     /// adb) when the user hits stop. Teardown then runs to completion *first*, and the resumed
     /// bring-up calls `start()` afterwards. Before `stop()` was made terminal, that late `start()`
-    /// bound a second `OverrideServer`, opened a tunnel, and spawned a heartbeat with nothing left
+    /// bound a second `AgentHTTPServer`, opened a tunnel, and spawned a heartbeat with nothing left
     /// to cancel it — observed on a device as `adb reverse --list` still showing the mapping and
     /// the state stuck at `.waitingForAgent` eight seconds after stopping.
     func test_startAfterStopIsRefusedRatherThanLeakingASecondServer() async {

@@ -118,7 +118,7 @@ final class InterceptPipelineTests: XCTestCase {
         XCTAssertEqual(result.response, originResponse)
         XCTAssertNil(result.appliedRuleID)
         XCTAssertEqual(result.skipped, .noRuleMatched)
-        XCTAssertFalse(result.response.headers.contains { $0.name == OverrideHeaders.override })
+        XCTAssertFalse(result.response.headers.contains { $0.name == JacaHeaders.override })
     }
 
     /// The default pipeline must be behaviour-preserving, so wiring it into an existing transport
@@ -142,7 +142,7 @@ final class InterceptPipelineTests: XCTestCase {
             origin: StubOrigin(response: originResponse))
 
         let result = await pipeline.run(request(), capabilities: .desktopTerminated)
-        let stamp = result.response.headers.first { $0.name == OverrideHeaders.override }
+        let stamp = result.response.headers.first { $0.name == JacaHeaders.override }
         XCTAssertEqual(stamp?.value, ruleID.uuidString)
     }
 

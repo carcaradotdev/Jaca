@@ -27,12 +27,12 @@ enum FeatureFlags {
 
     /// Companion + HTTPS decryption (CA install, device-wide capture). When off, the companion
     /// subsystem is never started and network inspection offers only the in-process Agent.
-    static var httpsDecryptionEnabled: Bool { networkInspectionMode == .httpsDecryption }
+    static var httpsDecryptionEnabled: Bool { networkInspectionMode == .mitmHTTPSDebugging }
 
     /// Response overrides (answer a matched request from a rule instead of the origin). Arming it
     /// routes selected hosts through the Mac — over an `adb reverse` tunnel on Android, over the
     /// shared loopback on the iOS Simulator — so it stays opt-in.
-    static var responseOverridesEnabled: Bool { networkInspectionMode == .responseOverrides }
+    static var responseOverridesEnabled: Bool { networkInspectionMode == .agentHTTPSDebugging }
 
     /// Whether Jaca may relaunch a **simulator** app itself to put the agent back, after the user
     /// reopened that app outside Jaca.

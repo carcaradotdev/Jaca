@@ -51,7 +51,7 @@ struct SettingsView: View {
                         // One choice rather than two toggles: overrides only run in the in-process
                         // agent, which the companion capture replaces, so both on was a combination
                         // where neither worked as described. No "off": the agent captures either way.
-                        modeOption(.responseOverrides, title: "Agent HTTPS debugging", detail:
+                        modeOption(.agentHTTPSDebugging, title: "Agent HTTPS debugging", detail:
                             "Lets you answer a matched request from a rule instead of the " +
                             "real server — right-click any captured request, or use the Overrides button " +
                             "next to the search field.\n\n" +
@@ -62,7 +62,7 @@ struct SettingsView: View {
                             "and the agent stops diverting on its own if Jaca goes away.") {
                             simulatorReattachSetting
                         }
-                        modeOption(.httpsDecryption, title: "HTTPS debugging", detail:
+                        modeOption(.mitmHTTPSDebugging, title: "HTTPS debugging", detail:
                             "Off by default. Network inspection uses the in-process Agent — per-app, with " +
                             "call stacks, no certificate needed — which covers most debugging.\n\n" +
                             "Turn this on to also capture whole-device traffic via the companion app and " +

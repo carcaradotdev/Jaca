@@ -29,11 +29,12 @@ final class AttachDetectionTests: XCTestCase {
 
     // MARK: - The overrides-off configuration
 
-    /// The regression this exists for: `FeatureFlags.responseOverridesEnabled` defaults to **off**,
-    /// so `divert` is nil and nothing writes `armings[target]`. Routing detach through the
-    /// coordinator therefore meant that in the DEFAULT configuration a tab whose app had been
-    /// reopened outside Jaca showed a green running dot, no banner, and no way to re-attach —
-    /// exactly the "armed but silently doing nothing" failure this layer exists to break.
+    /// The regression this exists for: with overrides off (HTTPS debugging mode, so
+    /// `FeatureFlags.responseOverridesEnabled` is false), `agentHTTP` is nil and nothing writes
+    /// `armings[target]`. Routing detach through the coordinator therefore meant that in that
+    /// configuration a tab whose app had been reopened outside Jaca showed a green running dot,
+    /// no banner, and no way to re-attach — exactly the "armed but silently doing nothing" failure
+    /// this layer exists to break.
     func test_detachIsReportedWithNoOverrideServicesWired() throws {
         let session = try makeSession(overrides: nil)
         XCTAssertEqual(session.armingState, .idle)

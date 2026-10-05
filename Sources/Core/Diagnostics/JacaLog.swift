@@ -22,7 +22,7 @@ enum JacaLog {
     private static let lock = NSLock()
 
     /// Verbose logging, off by default. `append` is a synchronous write under a process-global
-    /// lock and `debug` runs on hot paths — once per bounced request, for a whole diverted host —
+    /// lock and `debug` runs on hot paths — once per bounced request, for a whole routed host —
     /// so ungated it blocks NIO event loops and churns the 2 MB rotation past anything useful.
     static let verboseKey = "diagnosticsVerboseLogging"
     static var verboseEnabled: Bool {

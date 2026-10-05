@@ -6,7 +6,7 @@ import Foundation
 /// their events.
 ///
 /// The simulator shares the Mac's loopback, so there is nothing to tunnel and **no second socket
-/// in either direction**: the injected agent dials `127.0.0.1:<port>` and Jaca writes its divert
+/// in either direction**: the injected agent dials `127.0.0.1:<port>` and Jaca writes its route
 /// frames back down the very connection it already reads transactions from.
 final class IOSSimulatorAgentController: @unchecked Sendable {
     private let udid: String
@@ -15,14 +15,14 @@ final class IOSSimulatorAgentController: @unchecked Sendable {
     private let onTransaction: @Sendable (NetworkTransaction) -> Void
     private let onStatus: @Sendable (String) -> Void
     /// Reports "the agent is no longer in the app" independently of the coordinator, because
-    /// losing the agent stops **capture**, not just overrides — and `divert` is nil whenever
-    /// response overrides are off, which is the default.
+    /// losing the agent stops **capture**, not just overrides — and `agentHTTP` is nil whenever
+    /// response overrides are off (HTTPS debugging mode).
     private let onAttach: @Sendable (InterceptArmingState) -> Void
 
     /// Owns the override server and the control frames; nil when overrides aren't wired. A `let`
     /// built in `init`: `NetworkSession.interceptWired` is only re-evaluated when `current` is
     /// assigned, so a later coordinator would leave the toolbar reading as unarmed forever.
-    let divert: DivertCoordinator?
+    let agentHTTP: AgentHTTPCoordinator?
     private let interceptPipeline: InterceptPipeline?
     private let intercept: InterceptServices?
     private let target: InterceptTarget
@@ -57,7 +57,7 @@ final class IOSSimulatorAgentController: @unchecked Sendable {
         self.onTransaction = onTransaction
         self.onStatus = onStatus
         self.onAttach = onAttach
-        self.interceptPipeline = intercept?.pipeline(for: .iosSimulatorDivert(bundleID: bundleID),
+        self.interceptPipeline = intercept?.pipeline(for: .iosSimulatorAgent(bundleID: bundleID),
                                                      deviceID: udid, appID: bundleID)
         let box = self.weakSelf
         let channel = AgentLineChannel(name: "ios-\(bundleID)", callbacks: .init(
@@ -68,7 +68,7 @@ final class IOSSimulatorAgentController: @unchecked Sendable {
             // here too — a dropped socket is the only event that separates "the user quit the
             // app" from "capture is quietly working".
             onDisconnected: {
-                box.controller?.divert?.agentDidReconnect()
+                box.controller?.agentHTTP?.agentDidReconnect()
                 box.controller?.supervisor.agentDisconnected()
             }))
         self.channel = channel
@@ -84,12 +84,12 @@ final class IOSSimulatorAgentController: @unchecked Sendable {
             onPresence: { presence, _ in
                 guard let controller = box.controller else { return }
                 controller.onAttach(.forPresence(presence, appID: bundleID))
-                controller.divert?.appPresenceChanged(presence)
+                controller.agentHTTP?.appPresenceChanged(presence)
             },
             onStatus: { onStatus($0) })
         let target = InterceptTarget(deviceID: udid, package: bundleID)
-        self.divert = intercept.map { services in
-            DivertCoordinator(transport: .iosSimulatorDivert(bundleID: bundleID),
+        self.agentHTTP = intercept.map { services in
+            AgentHTTPCoordinator(transport: .iosSimulatorAgent(bundleID: bundleID),
                               deviceID: udid, appID: bundleID,
                               capabilities: capabilities,
                               tunnel: SharedLoopbackTunnel(),
@@ -98,7 +98,7 @@ final class IOSSimulatorAgentController: @unchecked Sendable {
         }
         self.intercept = intercept
         self.target = target
-        if let divert = self.divert { intercept?.register(target: target, coordinator: divert) }
+        if let agentHTTP = self.agentHTTP { intercept?.register(target: target, coordinator: agentHTTP) }
         box.controller = self
     }
 
@@ -134,7 +134,7 @@ final class IOSSimulatorAgentController: @unchecked Sendable {
         // captured again until Jaca restarts. Every early return below has to give it back.
         guard !stopped else { return releaseClaim() }
 
-        if let divert, let interceptPipeline { await divert.start(pipeline: interceptPipeline) }
+        if let agentHTTP, let interceptPipeline { await agentHTTP.start(pipeline: interceptPipeline) }
         guard !stopped else { return releaseClaim() }
 
         onStatus("network agent: launching \(bundleID)…")
@@ -174,7 +174,7 @@ final class IOSSimulatorAgentController: @unchecked Sendable {
     func stop() {
         stopped = true
         supervisor.stop()
-        let coordinator = divert
+        let coordinator = agentHTTP
         let services = intercept, target = target
 
         // Synchronously, before the teardown Task: `restartForInterceptChange()` stops and starts
@@ -206,9 +206,9 @@ final class IOSSimulatorAgentController: @unchecked Sendable {
         case .hello(let supportsOverride):
             // A pre-overrides agent never reads its socket, so reporting it turns an eternal
             // "arming…" into a sentence that names the fix.
-            guard supportsOverride else { divert?.agentDidAdvertiseWithoutOverrideSupport(); return }
+            guard supportsOverride else { agentHTTP?.agentDidAdvertiseWithoutOverrideSupport(); return }
             JacaLog.info("agent", "hello with override/1 from \(bundleID)")
-            divert?.agentDidAdvertiseOverrideSupport()
+            agentHTTP?.agentDidAdvertiseOverrideSupport()
         case .unrecognised:
             break
         }
@@ -241,7 +241,7 @@ final class IOSSimulatorAgentController: @unchecked Sendable {
     /// same sink — otherwise the toolbar sits on `.idle`, which reads as "nothing is wired here".
     private func fail(_ message: String) {
         onStatus("network agent: \(message)")
-        intercept?.reportArming(target: target, coordinator: divert, state: .failed(message))
+        intercept?.reportArming(target: target, coordinator: agentHTTP, state: .failed(message))
     }
 }
 

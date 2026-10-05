@@ -1,16 +1,16 @@
-// JacaDivert.m — see JacaDivert.h for the contract and the review tripwire.
+// JacaAgentHTTP.m — see JacaAgentHTTP.h for the contract and the review tripwire.
 //
-// Twin of agent/kotlin/com/squeeze/capture/Divert.kt. Keep the two semantically identical: the
-// desktop produces exactly one frame shape (`OverrideEndpoint.divertFrame`) and both agents have
+// Twin of agent/kotlin/com/squeeze/capture/AgentHttp.kt. Keep the two semantically identical: the
+// desktop produces exactly one frame shape (`AgentHTTPRoute.routeFrame`) and both agents have
 // to mean the same thing by it.
 
-#import "JacaDivert.h"
+#import "JacaAgentHTTP.h"
 
 #import <mach/mach_time.h>
 #import <os/lock.h>
 
 NSString *const kJacaOriginalURLHeader = @"X-Jaca-Original-URL";
-NSString *const kJacaDivertHeader = @"X-Jaca-Divert";
+NSString *const kJacaRetryDirectHeader = @"X-Jaca-Divert";
 NSString *const kJacaRetryDirect = @"retry-direct";
 const NSInteger kJacaRetryDirectStatus = 599;
 
@@ -21,7 +21,7 @@ const NSInteger kJacaRetryDirectStatus = 599;
 /// `mach_continuous_time` is the only Darwin clock with both properties, and both are load-bearing:
 /// a wall clock would let an NTP step or a user changing the date grant an expired window a fresh
 /// lease, and `mach_absolute_time` stops while the process is suspended — so an app backgrounded
-/// for an hour would wake up believing the desktop had spoken seconds ago and keep diverting to a
+/// for an hour would wake up believing the desktop had spoken seconds ago and keep routing to a
 /// port nobody is listening on. (This is `SystemClock.elapsedRealtime()` on the Android side.)
 static uint64_t JacaMonotonicMillis(void) {
     static mach_timebase_info_data_t timebase;
@@ -43,19 +43,19 @@ static uint64_t gWindowMillis = 15000;
 static uint64_t gLastControlAt = 0;
 
 /// Callers hold `gLock`.
-static void JacaDivertDisarmLocked(void) {
+static void JacaAgentHTTPDisarmLocked(void) {
     gOrigin = nil;
     gHosts = nil;
 }
 
-void JacaDivertConfigure(NSString *origin, NSSet<NSString *> *hosts, int heartbeatSeconds) {
+void JacaAgentHTTPConfigure(NSString *origin, NSSet<NSString *> *hosts, int heartbeatSeconds) {
     NSMutableSet<NSString *> *lowered = [NSMutableSet setWithCapacity:hosts.count];
     for (NSString *host in hosts) {
         if (![host isKindOfClass:NSString.class] || host.length == 0) continue;
         [lowered addObject:host.lowercaseString];
     }
     // An empty host set can never arm: it would otherwise be one forgotten guard away from meaning
-    // "divert everything". The desktop's `OverrideEndpoint` clears origin and hosts together for
+    // "route everything". The desktop's `AgentHTTPRoute` clears origin and hosts together for
     // the same reason, so this is belt-and-braces on a contract both sides already keep.
     BOOL armed = origin.length > 0 && lowered.count > 0;
     os_unfair_lock_lock(&gLock);
@@ -69,26 +69,26 @@ void JacaDivertConfigure(NSString *origin, NSSet<NSString *> *hosts, int heartbe
     os_unfair_lock_unlock(&gLock);
 }
 
-void JacaDivertTouch(void) {
+void JacaAgentHTTPTouch(void) {
     os_unfair_lock_lock(&gLock);
     gLastControlAt = JacaMonotonicMillis();
     os_unfair_lock_unlock(&gLock);
 }
 
-void JacaDivertDisarm(void) {
+void JacaAgentHTTPDisarm(void) {
     os_unfair_lock_lock(&gLock);
-    JacaDivertDisarmLocked();
+    JacaAgentHTTPDisarmLocked();
     os_unfair_lock_unlock(&gLock);
 }
 
-BOOL JacaDivertIsArmed(void) {
+BOOL JacaAgentHTTPIsArmed(void) {
     os_unfair_lock_lock(&gLock);
     BOOL armed = gOrigin != nil;
     os_unfair_lock_unlock(&gLock);
     return armed;
 }
 
-NSString *JacaDivertTargetFor(NSString *host, NSString *pathAndQuery) {
+NSString *JacaAgentHTTPTargetFor(NSString *host, NSString *pathAndQuery) {
     if (host.length == 0) return nil;
     NSString *lowered = host.lowercaseString;
     os_unfair_lock_lock(&gLock);
@@ -97,7 +97,7 @@ NSString *JacaDivertTargetFor(NSString *host, NSString *pathAndQuery) {
     // The dead-man switch, evaluated on the match path. Expiry doesn't just decline this request:
     // it disarms, so the app is provably back on its own network even if Jaca never speaks again.
     if (JacaMonotonicMillis() - gLastControlAt > gWindowMillis) {
-        JacaDivertDisarmLocked();
+        JacaAgentHTTPDisarmLocked();
         os_unfair_lock_unlock(&gLock);
         return nil;
     }
@@ -107,7 +107,7 @@ NSString *JacaDivertTargetFor(NSString *host, NSString *pathAndQuery) {
     return [origin stringByAppendingString:pathAndQuery ?: @"/"];
 }
 
-void JacaDivertApplyControlLine(NSString *line) {
+void JacaAgentHTTPApplyControlLine(NSString *line) {
     if (line.length == 0) return;
     NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
     if (data == nil) return;
@@ -129,9 +129,9 @@ void JacaDivertApplyControlLine(NSString *line) {
         }
         id rawWindow = frame[@"heartbeatSeconds"];
         int window = [rawWindow isKindOfClass:NSNumber.class] ? ((NSNumber *)rawWindow).intValue : 15;
-        JacaDivertConfigure(origin, hosts, window);
+        JacaAgentHTTPConfigure(origin, hosts, window);
     } else if ([type isEqualToString:@"ping"]) {
-        JacaDivertTouch();
+        JacaAgentHTTPTouch();
     }
     // else: forward-compatible. A newer desktop can add frames without breaking this agent.
 }
@@ -162,7 +162,7 @@ NSString *JacaPathAndQuery(NSURL *url) {
     return [absolute substringFromIndex:slash.location];
 }
 
-BOOL JacaIsDivertEligible(NSURLRequest *req) {
+BOOL JacaIsRoutable(NSURLRequest *req) {
     if (req == nil) return NO;
     // A body stream can only be read once, and both safety nets (the retry-direct bounce and the
     // fail-open retry) re-send the request. The tap drains a stream into `HTTPBody` before asking,
@@ -176,23 +176,23 @@ BOOL JacaIsDivertEligible(NSURLRequest *req) {
     return YES;
 }
 
-NSURL *JacaDivertTargetURL(NSURLRequest *req) {
-    if (!JacaDivertIsArmed()) return nil;      // the hot path when read-only: one lock, no parsing
-    if (!JacaIsDivertEligible(req)) return nil;
+NSURL *JacaAgentHTTPTargetURL(NSURLRequest *req) {
+    if (!JacaAgentHTTPIsArmed()) return nil;      // the hot path when read-only: one lock, no parsing
+    if (!JacaIsRoutable(req)) return nil;
     NSURL *url = req.URL;
     NSString *host = url.host;
     if (host.length == 0) return nil;
-    NSString *target = JacaDivertTargetFor(host, JacaPathAndQuery(url));
+    NSString *target = JacaAgentHTTPTargetFor(host, JacaPathAndQuery(url));
     if (target == nil) return nil;
     return [NSURL URLWithString:target];
 }
 
-BOOL JacaIsRetryDirectBounce(NSHTTPURLResponse *resp, BOOL wasDiverted) {
-    // `wasDiverted` first, and it is not optional: a real origin answering 599 with this header on
-    // a request we never diverted would otherwise send us round the same request forever.
-    if (!wasDiverted || resp == nil) return NO;
+BOOL JacaIsRetryDirectBounce(NSHTTPURLResponse *resp, BOOL wasRouted) {
+    // `wasRouted` first, and it is not optional: a real origin answering 599 with this header on
+    // a request we never routed would otherwise send us round the same request forever.
+    if (!wasRouted || resp == nil) return NO;
     if (resp.statusCode != kJacaRetryDirectStatus) return NO;
-    NSString *value = [resp valueForHTTPHeaderField:kJacaDivertHeader];
+    NSString *value = [resp valueForHTTPHeaderField:kJacaRetryDirectHeader];
     return value != nil && [value caseInsensitiveCompare:kJacaRetryDirect] == NSOrderedSame;
 }
 

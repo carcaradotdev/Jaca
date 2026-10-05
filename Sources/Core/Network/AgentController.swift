@@ -16,7 +16,7 @@ final class AgentController: @unchecked Sendable {
 
     /// Owns the override server, the `adb reverse` tunnel and the control frames. Nil when
     /// response overrides aren't wired up for this session.
-    let divert: DivertCoordinator?
+    let agentHTTP: AgentHTTPCoordinator?
     private let interceptPipeline: InterceptPipeline?
     private let interceptServices: InterceptServices?
     private let interceptTarget: InterceptTarget?
@@ -48,7 +48,7 @@ final class AgentController: @unchecked Sendable {
         self.socketName = "squeeze_\(UInt32.random(in: 1...0xFFFFFF))"
         self.onTransaction = onTransaction
         self.onStatus = onStatus
-        self.interceptPipeline = intercept?.pipeline(for: .agentDivert(package: package),
+        self.interceptPipeline = intercept?.pipeline(for: .androidAgent(package: package),
                                                      deviceID: serial, appID: package)
         let box = self.weakSelf
         let channel = AgentLineChannel(name: "android-\(package)", callbacks: .init(
@@ -56,11 +56,11 @@ final class AgentController: @unchecked Sendable {
             onFirstBytes: { box.controller?.noteAgentLoaded() },
             // On *disconnect*: the re-arm rides the next hello or heartbeat, so a re-attached
             // agent is never spoken to before it has said anything.
-            onDisconnected: { box.controller?.divert?.agentDidReconnect() }))
+            onDisconnected: { box.controller?.agentHTTP?.agentDidReconnect() }))
         self.channel = channel
         let target = InterceptTarget(deviceID: serial, package: package)
-        self.divert = intercept.map { services in
-            DivertCoordinator(transport: .agentDivert(package: package),
+        self.agentHTTP = intercept.map { services in
+            AgentHTTPCoordinator(transport: .androidAgent(package: package),
                               deviceID: serial, appID: package,
                               capabilities: capabilities,
                               tunnel: AdbReverseTunnel(adbPath: adbURL.path, serial: serial),
@@ -69,7 +69,7 @@ final class AgentController: @unchecked Sendable {
         }
         self.interceptServices = intercept
         self.interceptTarget = target
-        if let divert = self.divert { intercept?.register(target: target, coordinator: divert) }
+        if let agentHTTP = self.agentHTTP { intercept?.register(target: target, coordinator: agentHTTP) }
         box.controller = self
     }
 
@@ -83,13 +83,13 @@ final class AgentController: @unchecked Sendable {
             guard supportsOverride else {
                 // Alive but predating overrides — reporting it turns an eternal "arming…" into
                 // a sentence that names the fix.
-                divert?.agentDidAdvertiseWithoutOverrideSupport()
+                agentHTTP?.agentDidAdvertiseWithoutOverrideSupport()
                 return
             }
             JacaLog.info("agent", "hello with override/1 from \(package)")
             // Only now does the desktop send an endpoint, so an older agent that can't read
             // control frames is a no-op rather than a hazard.
-            divert?.agentDidAdvertiseOverrideSupport()
+            agentHTTP?.agentDidAdvertiseOverrideSupport()
         case .unrecognised:
             break
         }
@@ -136,9 +136,9 @@ final class AgentController: @unchecked Sendable {
         channel.dial(port: forwardedPort)
 
         // Up before the app is attached, so the port is stable for the whole session (see
-        // `DivertCoordinator`).
-        if let divert, let interceptPipeline {
-            await divert.start(pipeline: interceptPipeline)
+        // `AgentHTTPCoordinator`).
+        if let agentHTTP, let interceptPipeline {
+            await agentHTTP.start(pipeline: interceptPipeline)
         }
         guard !stopped else { return }
 
@@ -248,7 +248,7 @@ final class AgentController: @unchecked Sendable {
     /// control channel is still open when the disarm frame is written.
     func stop() {
         stopped = true
-        let coordinator = divert
+        let coordinator = agentHTTP
         let p = forwardedPort
         let url = adbURL, serial = serial
         let services = interceptServices
@@ -263,7 +263,7 @@ final class AgentController: @unchecked Sendable {
 
         channel.stopAccepting()
         Task {
-            await coordinator?.stop()                       // divert off, reverse removed, server closed
+            await coordinator?.stop()                       // route off, reverse removed, server closed
             await self.channel.flush()                      // the disarm frame has reached send(2)
             self.channel.close()
             await Self.removeForward(port: p, adbURL: url, serial: serial)

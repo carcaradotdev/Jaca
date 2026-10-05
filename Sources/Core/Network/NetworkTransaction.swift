@@ -38,7 +38,7 @@ struct NetworkTransaction: Identifiable, Sendable, Hashable {
     var callStack: [String]? = nil
 
     /// The override rule that produced this response. Read from the `X-Jaca-Override` header, not
-    /// by correlating ids: `OverrideServer` mints ids no captured row ever has.
+    /// by correlating ids: `AgentHTTPServer` mints ids no captured row ever has.
     var overriddenByRuleID: UUID? = nil
 
     /// Which HTTP stack produced this transaction ("okhttp3", "okhttp2", "urlconnection"), when
@@ -74,10 +74,10 @@ struct NetworkTransaction: Identifiable, Sendable, Hashable {
     /// Headers as the app saw them, minus Jaca's own markers: `X-Jaca-*` is plumbing, and showing
     /// it in the Headers tab or a HAR export would misrepresent what the server sent.
     var displayRequestHeaders: [HeaderPair] {
-        requestHeaders.filter { !OverrideHeaders.isJacaInternal($0.name) }
+        requestHeaders.filter { !JacaHeaders.isJacaInternal($0.name) }
     }
     var displayResponseHeaders: [HeaderPair] {
-        responseHeaders.filter { !OverrideHeaders.isJacaInternal($0.name) }
+        responseHeaders.filter { !JacaHeaders.isJacaInternal($0.name) }
     }
 
     /// Total wall-clock duration once finished, in seconds.

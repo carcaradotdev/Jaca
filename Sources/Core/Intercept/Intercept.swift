@@ -14,18 +14,18 @@ import Foundation
 /// An *interception point*, which isn't the same as a capture source: the companion streams
 /// flow metadata (not overridable) *and*, once decrypting, forwards through the proxy (which is).
 enum InterceptTransportID: Sendable, Hashable {
-    case agentDivert(package: String)
-    case iosSimulatorDivert(bundleID: String)
+    case androidAgent(package: String)
+    case iosSimulatorAgent(bundleID: String)
     case mitmProxy
     case companionMetadata
 
     /// Short label for diagnostics and the authoring-time capability hints.
     var label: String {
         switch self {
-        case .agentDivert:         return "in-process agent"
-        case .iosSimulatorDivert:  return "iOS Simulator agent"
-        case .mitmProxy:           return "HTTPS decryption"
-        case .companionMetadata:   return "companion flow metadata"
+        case .androidAgent:      return "in-process agent"
+        case .iosSimulatorAgent: return "iOS Simulator agent"
+        case .mitmProxy:         return "HTTPS decryption"
+        case .companionMetadata: return "companion flow metadata"
         }
     }
 }
@@ -33,7 +33,7 @@ enum InterceptTransportID: Sendable, Hashable {
 // MARK: - Neutral exchange types
 
 /// One request, as seen at an interception point, with the URL already restored to what the app
-/// originally asked for (never the diverted loopback URL).
+/// originally asked for (never the routed loopback URL).
 struct InterceptedRequest: Sendable {
     let id: UUID
     var method: String
@@ -107,7 +107,7 @@ struct InterceptCapabilities: OptionSet, Sendable, Hashable {
     /// Can pause an exchange for interactive editing (breakpoints). Not built.
     static let suspend = InterceptCapabilities(rawValue: 1 << 5)
 
-    /// Any hop the desktop terminates itself: agent divert, simulator divert, MITM proxy.
+    /// Any hop the desktop terminates itself: the Android agent, the iOS Simulator agent, the MITM proxy.
     static let desktopTerminated: InterceptCapabilities = [.shortCircuit, .editResponse, .delay, .bodies]
     /// Flow metadata only — a host and a port, with no HTTP semantics to override.
     static let observeOnly: InterceptCapabilities = []
@@ -184,66 +184,6 @@ protocol InterceptReporting: Sendable {
     func report(requestID: UUID, appliedRuleID: UUID?, skipped: InterceptSkipReason?)
 }
 
-/// The entire vocabulary the device is ever given: where to send traffic, which hosts, and how
-/// long that permission lasts. No patterns, payloads, statuses or ordering.
-///
-/// **The tripwire for review:** a field added here is a field the device learned about. Teaching
-/// it a path, method, header, body, status, ordering or rule-id crosses the line that keeps the
-/// agent dumb — and shows up in a diff of this struct.
-///
-/// Twins to keep in sync: `agent/iOS/JacaDivert.m`,
-/// `agent/kotlin/com/squeeze/capture/Divert.kt`. See `docs/divert-contract.md`.
-struct OverrideEndpoint: Sendable, Equatable {
-    /// `nil` means divert **nothing** — never "divert everything".
-    private(set) var origin: String?
-    private(set) var hosts: Set<String>
-    var heartbeatSeconds: Int
-
-    /// Clears `origin` and `hosts` **together**, so an empty host set can never arm the device
-    /// and an absent origin can never leave a stale host list behind.
-    init(origin: String?, hosts: Set<String>, heartbeatSeconds: Int = 15) {
-        let armed = !(origin ?? "").isEmpty && !hosts.isEmpty
-        self.origin = armed ? origin : nil
-        self.hosts = armed ? hosts : []
-        self.heartbeatSeconds = heartbeatSeconds
-    }
-
-    /// The single spelling of "stop". Carries the heartbeat window so the value survives teardown.
-    static func disarmed(heartbeatSeconds: Int = 15) -> OverrideEndpoint {
-        OverrideEndpoint(origin: nil, hosts: [], heartbeatSeconds: heartbeatSeconds)
-    }
-
-    var isArmed: Bool { origin != nil }
-
-    /// The **only** desktop→device frame in the product. Newline-free (the wire is NDJSON), and
-    /// hosts are sorted so an unchanged rule set frames identically every heartbeat.
-    static func divertFrame(_ endpoint: OverrideEndpoint) -> String {
-        let hostList = endpoint.hosts.sorted().map(quoted).joined(separator: ",")
-        let originJSON = endpoint.origin.map(quoted) ?? "null"
-        return "{\"type\":\"divert\",\"origin\":\(originJSON),\"hosts\":[\(hostList)]," +
-               "\"heartbeatSeconds\":\(endpoint.heartbeatSeconds)}"
-    }
-
-    /// Hosts come from user-authored rules, so a stray quote must not produce an unparsable
-    /// frame.
-    private static func quoted(_ value: String) -> String {
-        var out = "\""
-        for scalar in value.unicodeScalars {
-            switch scalar {
-            case "\"":     out += "\\\""
-            case "\\":     out += "\\\\"
-            case "\n":     out += "\\n"
-            case "\r":     out += "\\r"
-            case "\t":     out += "\\t"
-            default:
-                if scalar.value < 0x20 { out += String(format: "\\u%04x", scalar.value) }
-                else { out.unicodeScalars.append(scalar) }
-            }
-        }
-        return out + "\""
-    }
-}
-
 // MARK: - Pipeline
 
 /// Executes an `InterceptDecision`: resolve → delay → (short-circuit | origin → edit) → report.
@@ -274,7 +214,7 @@ struct InterceptPipeline: Sendable {
     enum UnmatchedPolicy: Sendable, Equatable {
         /// Fetch the real response — correct for the MITM proxy, the request's only path.
         case fetchFromOrigin
-        /// Hand the request back to the device instead. Correct for divert: the device sends it
+        /// Hand the request back to the device instead. Correct for routed requests: the device sends it
         /// itself, so fetching here too would execute every unmatched request **twice**.
         case handBack
     }
@@ -328,19 +268,19 @@ struct InterceptPipeline: Sendable {
     private func stamp(_ response: InterceptedResponse, ruleID: UUID?) -> InterceptedResponse {
         guard let ruleID else { return response }
         var out = response
-        out.headers.append(HeaderPair(name: OverrideHeaders.override, value: ruleID.uuidString))
+        out.headers.append(HeaderPair(name: JacaHeaders.override, value: ruleID.uuidString))
         return out
     }
 }
 
 /// Header names Jaca uses on the wire. All are stripped before a request reaches a real origin,
 /// and hidden from the Headers tab.
-enum OverrideHeaders {
+enum JacaHeaders {
     /// Set by the device so the desktop can recover the URL the app actually asked for.
     static let originalURL = "X-Jaca-Original-URL"
     /// Set by the desktop to bounce a request back for a direct retry.
-    static let divert = "X-Jaca-Divert"
-    /// Value of `divert` meaning "not mocking this — send it yourself".
+    static let retryDirectHeader = "X-Jaca-Divert"
+    /// Value of `retryDirectHeader` meaning "not mocking this — send it yourself".
     static let retryDirect = "retry-direct"
     /// Status paired with `retryDirect`. 599 is unassigned, so it can't collide with an origin.
     static let retryDirectStatus = 599

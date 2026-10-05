@@ -3,12 +3,12 @@
 // Three invariants live here and nowhere else in the agent:
 //   * SO_NOSIGPIPE, so a write to a socket Jaca already closed can't kill the *user's app*;
 //   * newline framing, with a partial line held over between reads;
-//   * EOF ⇒ JacaDivertDisarm(), unconditionally — the dead-man switch that survives a SIGKILL, a
-//     Force Quit or a crashed Jaca. (JacaDivert's window covers the half-open case where no EOF
+//   * EOF ⇒ JacaAgentHTTPDisarm(), unconditionally — the dead-man switch that survives a SIGKILL, a
+//     Force Quit or a crashed Jaca. (JacaAgentHTTP's window covers the half-open case where no EOF
 //     ever arrives.)
 
 #import "JacaNetChannel.h"
-#import "JacaDivert.h"
+#import "JacaAgentHTTP.h"
 
 #import <arpa/inet.h>
 #import <netinet/in.h>
@@ -44,7 +44,7 @@ static void JacaChannelDrainLines(NSMutableData *buffer) {
                                                       length:lineLength
                                                     encoding:NSUTF8StringEncoding];
             // A line that isn't valid UTF-8 is dropped rather than allowed to desync the framing.
-            if (line != nil) JacaDivertApplyControlLine(line);
+            if (line != nil) JacaAgentHTTPApplyControlLine(line);
         }
         start = i + 1;
     }
@@ -63,7 +63,7 @@ static void JacaChannelReadUntilEOF(int fd) {
     }
     // Unconditional: normal close, error, or a Jaca that was killed. The app goes back to its own
     // network on its very next request, with nobody having to run any cleanup.
-    JacaDivertDisarm();
+    JacaAgentHTTPDisarm();
     dispatch_async(JacaChannelQueue(), ^{
         if (gSocket == fd) gSocket = -1;   // cleared *before* the close, so no queued write can
         close(fd);                         // reach a recycled fd number
@@ -123,7 +123,7 @@ static void JacaChannelWrite(NSData *payload) {
         ssize_t n = send(gSocket, bytes, left, 0);
         if (n <= 0) {
             // Wake the reader and let *it* close: that keeps a single owner for the fd, and the
-            // reader's EOF path is also what disarms the divert.
+            // reader's EOF path is also what disarms routing.
             shutdown(gSocket, SHUT_RDWR);
             return;
         }

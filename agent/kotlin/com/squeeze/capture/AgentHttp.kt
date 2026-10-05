@@ -13,13 +13,13 @@ import android.os.SystemClock
  *
  * **The tripwire for review:** any change that adds a path, method, header, body, status, ordering
  * or rule-id concept to this file has crossed the line that keeps the agent dumb. The desktop-side
- * `OverrideEndpoint` (Sources/Core/Intercept/Intercept.swift) is the single type where such a
+ * `AgentHTTPRoute` (Sources/Core/AgentHTTP/AgentHTTPRoute.swift) is the single type where such a
  * change would show up in a diff — it is the only producer of the frame this object consumes.
- * The cross-language contract both sides implement is written down in `docs/divert-contract.md`.
+ * The cross-language contract both sides implement is written down in `docs/agent-http-contract.md`.
  *
  * [origin] starts `null`, so a freshly attached agent is **read-only by construction**, not by a
- * compile-time flag. (Its predecessor, `PocDivert`, shipped with `ENABLED = true` hard-coded — a
- * rebuild silently diverted a hard-coded endpoint. That is why this default matters.)
+ * compile-time flag. (Its proof-of-concept predecessor shipped with `ENABLED = true` hard-coded — a
+ * rebuild silently routed a hard-coded endpoint. That is why this default matters.)
  *
  * ### The dead-man switch
  * Expiry is checked on the *match path* rather than by a timer thread, so Doze, a suspended
@@ -28,15 +28,15 @@ import android.os.SystemClock
  * [SqueezeReporter] and the fail-open retry in [OkHttpHook], a SIGKILLed Jaca cannot leave the
  * user's app pointed at a dead tunnel.
  */
-internal object Divert {
+internal object AgentHttp {
 
     /** Carries the URL the app *meant* to call, so the desktop can route and capture on it. */
     const val ORIGINAL_URL_HEADER = "X-Jaca-Original-URL"
 
     /** Response header the desktop sets to bounce a request back for a direct retry. */
-    const val DIVERT_HEADER = "X-Jaca-Divert"
+    const val RETRY_DIRECT_HEADER = "X-Jaca-Divert"
 
-    /** Value of [DIVERT_HEADER] meaning "I'm not mocking this — send it yourself". */
+    /** Value of [RETRY_DIRECT_HEADER] meaning "I'm not mocking this — send it yourself". */
     const val RETRY_DIRECT = "retry-direct"
 
     /** Status paired with [RETRY_DIRECT]. 599 is unassigned, so it can't collide with an origin. */
@@ -48,7 +48,7 @@ internal object Divert {
     /** Hosts the desktop asked us to route. Everything else stays on the device's own network. */
     @Volatile private var hosts: Set<String> = emptySet()
 
-    /** How long we keep diverting without hearing from the desktop. */
+    /** How long we keep routing without hearing from the desktop. */
     @Volatile private var windowMs: Long = 15_000L
 
     @Volatile private var lastControlAt: Long = 0L
@@ -72,7 +72,7 @@ internal object Divert {
         hosts = emptySet()
     }
 
-    /** True while we'd divert at all — used to skip work on the hot path when read-only. */
+    /** True while we'd route at all — used to skip work on the hot path when read-only. */
     val isArmed: Boolean get() = origin != null
 
     /**

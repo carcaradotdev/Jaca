@@ -20,7 +20,7 @@ final class AgentCaptureSource: CaptureSource {
     /// The agent terminates the exchange on the desktop, so it can do everything: answer without
     /// the network, rewrite a real response, delay, and see bodies.
     ///
-    /// One constant, two readers — the UI below and `OverrideServer` via the controller — so the
+    /// One constant, two readers — the UI below and `AgentHTTPServer` via the controller — so the
     /// toolbar can't promise more than the clamp allows.
     static let nativeCapabilities: InterceptCapabilities = .desktopTerminated
 
@@ -28,7 +28,7 @@ final class AgentCaptureSource: CaptureSource {
     /// honoured here, so the source declares nothing.
     var interceptCapabilities: InterceptCapabilities { intercept == nil ? [] : Self.nativeCapabilities }
 
-    var arming: DivertCoordinator? { controller?.divert }
+    var arming: AgentHTTPCoordinator? { controller?.agentHTTP }
 
     func start(into sink: CaptureSink) {
         guard let adbURL, !package.isEmpty,

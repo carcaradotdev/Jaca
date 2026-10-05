@@ -8,9 +8,9 @@
 // as one newline-delimited JSON line per completed request — the SAME schema Jaca's
 // AgentTransactionParser already parses for the Android agent.
 //
-// This file is the **tap and the divert client**. The transport lives in JacaNetChannel and the
-// routing state in JacaDivert; those two are deliberately separate, but the tap and the client are
-// not, because they interleave across three delegate methods and share the `diverted` flag that
+// This file is the **tap and the route client**. The transport lives in JacaNetChannel and the
+// routing state in JacaAgentHTTP; those two are deliberately separate, but the tap and the client are
+// not, because they interleave across three delegate methods and share the `routed` flag that
 // makes the 599 bounce safe.
 //
 // Build (Jaca's project.yml postBuildScript compiles every agent/iOS/*.m into
@@ -22,7 +22,7 @@
 #import <objc/runtime.h>
 #import <os/lock.h>
 
-#import "JacaDivert.h"
+#import "JacaAgentHTTP.h"
 #import "JacaNetChannel.h"
 
 #pragma mark - Frame helpers
@@ -81,7 +81,7 @@ static NSString *const kHandled = @"JacaHandled";
 @property (nonatomic) NSTimeInterval responseAt;
 /// True while the request in flight is pointed at Jaca instead of the real origin. Guards the
 /// 599 bounce check, so a real origin answering 599 can't send us round a retry loop.
-@property (nonatomic) BOOL diverted;
+@property (nonatomic) BOOL routed;
 /// We fail open at most once per request; a genuinely broken origin must not be retried forever.
 @property (nonatomic) BOOL failedOpen;
 @end
@@ -132,16 +132,16 @@ static NSString *const kHandled = @"JacaHandled";
 
     NSMutableURLRequest *req = [self outboundRequest];
 
-    // Divert *after* the body drain, so an upload the tap made replayable is still eligible while
+    // Route *after* the body drain, so an upload the tap made replayable is still eligible while
     // a stream we couldn't drain is not.
-    NSURL *target = JacaDivertTargetURL(req);
+    NSURL *target = JacaAgentHTTPTargetURL(req);
     if (target != nil) {
         // The desktop routes and captures on the URL the app actually asked for, never on the
         // loopback one. Set the header before the URL so the outbound request is never briefly
         // repointed without it.
         [req setValue:self.request.URL.absoluteString forHTTPHeaderField:kJacaOriginalURLHeader];
         req.URL = target;
-        self.diverted = YES;
+        self.routed = YES;
     }
 
     self.session = [NSURLSession sessionWithConfiguration:NSURLSessionConfiguration.ephemeralSessionConfiguration
@@ -193,7 +193,7 @@ static NSString *const kHandled = @"JacaHandled";
 /// The request we actually send: marked so our own protocol doesn't re-enter, with the drained
 /// body re-supplied as `HTTPBody`. That re-supply is what makes the request **replayable**, which
 /// both safety nets (the retry-direct bounce and the fail-open retry) depend on. A body we could
-/// not drain keeps its stream, and `JacaIsDivertEligible` then refuses to divert it.
+/// not drain keeps its stream, and `JacaIsRoutable` then refuses to route it.
 - (NSMutableURLRequest *)outboundRequest {
     NSMutableURLRequest *req = [self.request mutableCopy];
     [NSURLProtocol setProperty:@YES forKey:kHandled inRequest:req];
@@ -224,7 +224,7 @@ static NSString *const kHandled = @"JacaHandled";
 - (void)retryDirect {
     if ([self isStopped]) return;
 
-    self.diverted = NO;
+    self.routed = NO;
     self.resp = nil;
     self.responseAt = 0;
     [self.respData setLength:0];
@@ -259,7 +259,7 @@ static NSString *const kHandled = @"JacaHandled";
 
     // The desktop declined to mock this one. Send it ourselves — and let neither the app nor
     // capture ever see the bounce, so the user gets exactly one row: the real request.
-    if (JacaIsRetryDirectBounce(http, self.diverted)) {
+    if (JacaIsRetryDirectBounce(http, self.routed)) {
         ch(NSURLSessionResponseCancel);
         [self retryDirect];
         return;
@@ -267,9 +267,9 @@ static NSString *const kHandled = @"JacaHandled";
 
     self.resp = http;
     self.responseAt = [[NSDate date] timeIntervalSince1970];
-    // A diverted call still has to look like the real URL to the app (cookies, logging, anything
+    // A routed call still has to look like the real URL to the app (cookies, logging, anything
     // reading `response.URL`), so the loopback URL never leaves this file.
-    NSURLResponse *forClient = self.diverted ? JacaResponseForClient(http, self.request.URL) : resp;
+    NSURLResponse *forClient = self.routed ? JacaResponseForClient(http, self.request.URL) : resp;
     [self.client URLProtocol:self didReceiveResponse:(forClient ?: resp)
           cacheStoragePolicy:NSURLCacheStorageNotAllowed];
     ch(NSURLSessionResponseAllow);
@@ -295,9 +295,9 @@ static NSString *const kHandled = @"JacaHandled";
     // real request, so the only visible effect is that the override stopped applying. Bounded to
     // one retry, only before anything reached the client, and never for the app's own cancel.
     BOOL appCancelled = [error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorCancelled;
-    if (error != nil && self.diverted && !self.failedOpen && ![self isStopped]
+    if (error != nil && self.routed && !self.failedOpen && ![self isStopped]
         && !appCancelled && self.resp == nil) {
-        JacaDivertDisarm();
+        JacaAgentHTTPDisarm();
         self.failedOpen = YES;
         [self retryDirect];
         return;
@@ -316,7 +316,7 @@ static NSString *const kHandled = @"JacaHandled";
 #pragma mark - Reporting
 
 /// One `txn` line. Everything is taken from `self.request` — the app's *original* request — so a
-/// diverted exchange is still reported as the real https URL, with none of Jaca's own headers.
+/// routed exchange is still reported as the real https URL, with none of Jaca's own headers.
 - (void)reportTransaction:(NSError *)error {
     NSURLRequest *orig = self.request;
     NSTimeInterval finished = [[NSDate date] timeIntervalSince1970];
@@ -330,7 +330,7 @@ static NSString *const kHandled = @"JacaHandled";
         @"requestSize": @(self.reqBody.length),
         @"responseSize": @(self.respBytes),
         // Tells the desktop which HTTP stack this came from, so it can say whether the row is
-        // divertible at all. Everything this protocol sees went through URLSession.
+        // routable at all. Everything this protocol sees went through URLSession.
         @"httpStack": @"urlsession",
     } mutableCopy];
     // Binary bodies omit the key rather than fabricating text; the sizes above stay true.

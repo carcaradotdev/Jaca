@@ -7,7 +7,7 @@ import Foundation
 /// a detached `Task` that doesn't survive `NSApp.terminate`, so quitting mid-capture stranded one
 /// forward per session in the adb server. A stranded **reverse** is worse — it points the
 /// device's `localhost:<port>` at a dead listener — which is why the agent also disarms on EOF
-/// and heartbeat expiry (`Divert.kt`), where no code of ours runs at all.
+/// and heartbeat expiry (`AgentHttp.kt`), where no code of ours runs at all.
 enum AdbTunnelCleanup {
     enum Kind: String, Codable, Sendable {
         case forward

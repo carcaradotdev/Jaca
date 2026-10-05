@@ -30,7 +30,7 @@ struct OverrideEditorSheet: View {
     /// often twenty or more — which used to open expanded and push the body away.
     @State private var responseTab: ResponseTab = .body
     @State private var bodyStatus = BodyStatus()
-    /// Whether `draft.divertHosts` came from the pattern; see `DivertHostSync`.
+    /// Whether `draft.routedHosts` came from the pattern; see `RoutedHostsSync`.
     @State private var hostsDerived: Bool
     @State private var find = CodeEditorFind()
 
@@ -67,9 +67,9 @@ struct OverrideEditorSheet: View {
         let screen = NSScreen.main?.visibleFrame
         self.sheetSize = CGSize(width: OverrideEditorLayout.sheetWidth(visibleWidth: screen?.width),
                                 height: OverrideEditorLayout.sheetHeight(visibleHeight: screen?.height))
-        _hostsDerived = State(initialValue: DivertHostSync.initial(
-            hosts: rule.divertHosts,
-            derived: OverrideCompiler.derivedDivertHosts(for: rule.matcher)).isDerived)
+        _hostsDerived = State(initialValue: RoutedHostsSync.initial(
+            hosts: rule.routedHosts,
+            derived: OverrideCompiler.derivedRoutedHosts(for: rule.matcher)).isDerived)
 
         switch rule.action {
         case .respond(let spec):
@@ -232,7 +232,7 @@ struct OverrideEditorSheet: View {
                 // The error has its own row below, rather than as the field's support text: support
                 // text makes the cell taller and the centred label drifts off the input.
                 LemonadeUi.TextField(input: $draft.matcher.pattern,
-                                     onInputChanged: { _ in syncDivertHosts() },
+                                     onInputChanged: { _ in syncRoutedHosts() },
                                      placeholderText: "https://api.example.com/v1/users/*",
                                      error: patternError != nil)
             }
@@ -252,7 +252,7 @@ struct OverrideEditorSheet: View {
                         onTabSelected: {
                             draft.matcher.kind = $0 == 0 ? .glob : .regex
                             // A regex names no host, so hosts derived from the glob are now stale.
-                            syncDivertHosts()
+                            syncRoutedHosts()
                         }
                     )
                     .frame(width: 140)
@@ -261,7 +261,7 @@ struct OverrideEditorSheet: View {
                                         onChipClicked: {
                             withAnimation(.easeInOut(duration: 0.2)) {
                                 draft.matcher.pattern = OverrideMatching.generalize(draft.matcher.pattern)
-                                syncDivertHosts()
+                                syncRoutedHosts()
                             }
                         })
                         .transition(.opacity)
@@ -293,7 +293,7 @@ struct OverrideEditorSheet: View {
                 }
                 .transition(.opacity)
                 row("Hosts to route") {
-                    LemonadeUi.TextField(input: divertHostsBinding,
+                    LemonadeUi.TextField(input: routedHostsBinding,
                                          placeholderText: "api.example.com, auth.example.com")
                 }
                 .transition(.opacity)
@@ -638,7 +638,7 @@ struct OverrideEditorSheet: View {
     /// blocks Save — never "route everything".
     private var needsExplicitHosts: Bool {
         !draft.matcher.pattern.isEmpty
-            && OverrideCompiler.derivedDivertHosts(for: draft.matcher).isEmpty
+            && OverrideCompiler.derivedRoutedHosts(for: draft.matcher).isEmpty
     }
 
     private var patternError: String? {
@@ -674,7 +674,7 @@ struct OverrideEditorSheet: View {
             return "Enter a URL or pattern to match."
         }
         if patternError != nil { return "Fix the pattern to save." }
-        if needsExplicitHosts && draft.divertHosts.isEmpty {
+        if needsExplicitHosts && draft.routedHosts.isEmpty {
             return "Add at least one host to route."
         }
         return nil
@@ -705,15 +705,15 @@ struct OverrideEditorSheet: View {
         var byteCount = 0
     }
 
-    private var divertHostsBinding: Binding<String> {
+    private var routedHostsBinding: Binding<String> {
         Binding(
-            get: { draft.divertHosts.sorted().joined(separator: ", ") },
+            get: { draft.routedHosts.sorted().joined(separator: ", ") },
             set: { text in
                 let typed = Set(text.split(separator: ",")
                     .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
                     .filter { !$0.isEmpty })
-                let next = DivertHostSync.afterUserEdit(hosts: typed)
-                draft.divertHosts = next.hosts
+                let next = RoutedHostsSync.afterUserEdit(hosts: typed)
+                draft.routedHosts = next.hosts
                 hostsDerived = next.isDerived
             }
         )
@@ -723,11 +723,11 @@ struct OverrideEditorSheet: View {
 
     /// Keeps the routed-host set in step with the matcher, including dropping hosts derived from
     /// an earlier pattern once the current one no longer names a host.
-    private func syncDivertHosts() {
-        let next = DivertHostSync.afterMatcherChange(
-            .init(hosts: draft.divertHosts, isDerived: hostsDerived),
-            derived: OverrideCompiler.derivedDivertHosts(for: draft.matcher))
-        draft.divertHosts = next.hosts
+    private func syncRoutedHosts() {
+        let next = RoutedHostsSync.afterMatcherChange(
+            .init(hosts: draft.routedHosts, isDerived: hostsDerived),
+            derived: OverrideCompiler.derivedRoutedHosts(for: draft.matcher))
+        draft.routedHosts = next.hosts
         hostsDerived = next.isDerived
     }
 
@@ -797,7 +797,7 @@ struct OverrideEditorSheet: View {
         var rule = OverrideRule()
         if let seedHost, !seedHost.isEmpty {
             rule.matcher.pattern = "https://\(seedHost)/"
-            rule.divertHosts = [seedHost.lowercased()]
+            rule.routedHosts = [seedHost.lowercased()]
         }
         return rule
     }

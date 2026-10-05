@@ -37,7 +37,7 @@ struct GlobProgram: Sendable, Hashable {
     var namesPort: Bool = false
     /// Requirements parsed out of the pattern's own query string, if it had one.
     var requiredQuery: [String: String]
-    /// The literal host the pattern names, if any — used to derive the divert host set.
+    /// The literal host the pattern names, if any — used to derive the route host set.
     var literalHost: String?
 }
 
@@ -192,7 +192,7 @@ enum OverrideMatching {
     }
 
     /// The literal hostname a pattern names, or nil when the host is wildcarded. Populates a
-    /// rule's `divertHosts`; nil makes the editor *ask*, so Jaca never routes everything.
+    /// rule's `routedHosts`; nil makes the editor *ask*, so Jaca never routes everything.
     static func literalHost(of patternBody: String) -> String? {
         var body = patternBody
         if let range = body.range(of: "://") { body = String(body[range.upperBound...]) }

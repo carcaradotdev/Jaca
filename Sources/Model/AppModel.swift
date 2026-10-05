@@ -25,18 +25,18 @@ final class AppModel {
             guard networkInspectionMode != oldValue else { return }
             // Persisted first: both reconfigurations read the flags back.
             FeatureFlags.networkInspectionMode = networkInspectionMode
-            if (oldValue == .httpsDecryption) != httpsDecryptionEnabled { reconfigureCompanion() }
-            if (oldValue == .responseOverrides) != responseOverridesEnabled { reconfigureOverrides() }
+            if (oldValue == .mitmHTTPSDebugging) != httpsDecryptionEnabled { reconfigureCompanion() }
+            if (oldValue == .agentHTTPSDebugging) != responseOverridesEnabled { reconfigureOverrides() }
         }
     }
 
     /// Experimental HTTPS decryption + companion capture. When off, the companion subsystem is
     /// never started and network inspection offers only Agent mode (per-app, in-process, no CA).
-    var httpsDecryptionEnabled: Bool { networkInspectionMode == .httpsDecryption }
+    var httpsDecryptionEnabled: Bool { networkInspectionMode == .mitmHTTPSDebugging }
 
     /// Response overrides (answer a matched request from a rule instead of the origin). Arming it
     /// routes the rules' hosts through the Mac.
-    var responseOverridesEnabled: Bool { networkInspectionMode == .responseOverrides }
+    var responseOverridesEnabled: Bool { networkInspectionMode == .agentHTTPSDebugging }
 
     /// The unified Projects area state: auto-detected Claude projects + user-added
     /// folders, their worktrees, and per-checkout cache cleanup.

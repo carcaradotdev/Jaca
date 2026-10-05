@@ -27,22 +27,22 @@ final class OverrideRowGateTests: XCTestCase {
 
     // MARK: - The landmine
 
-    /// The iOS agent hooks `URLSession`, so every row it reports is divertible by construction.
+    /// The iOS agent hooks `URLSession`, so every row it reports is routable by construction.
     /// `httpStack` is an Android concept and must not be consulted here at all.
     func test_iosSimulatorRowIsSeedable_evenThoughItsStackIsNotOkhttp3() {
-        XCTAssertNil(reason(transport: .iosSimulatorDivert(bundleID: "com.example.App"),
+        XCTAssertNil(reason(transport: .iosSimulatorAgent(bundleID: "com.example.App"),
                             httpStack: "urlsession"))
     }
 
     func test_iosSimulatorRowWithNoReportedStackIsSeedable() {
-        XCTAssertNil(reason(transport: .iosSimulatorDivert(bundleID: "com.example.App"),
+        XCTAssertNil(reason(transport: .iosSimulatorAgent(bundleID: "com.example.App"),
                             httpStack: nil))
     }
 
     /// The one arming state that genuinely means "this row's app can't receive an override until
     /// the user acts", so it names the app and says what to do.
     func test_iosSimulatorDetachedExplainsTheRelaunch_namingTheApp() {
-        let message = reason(transport: .iosSimulatorDivert(bundleID: "com.example.App"),
+        let message = reason(transport: .iosSimulatorAgent(bundleID: "com.example.App"),
                              arming: .detached(appID: "com.example.App"))
         XCTAssertEqual(message,
                        "com.example.App is running without the Jaca agent — relaunch it to resume.")
@@ -53,15 +53,15 @@ final class OverrideRowGateTests: XCTestCase {
     /// Keeps `OverrideAuthoringTests.test_missingHttpStackDecodesAsNilNotEmpty` load-bearing: an
     /// agent built before `httpStack` existed reports nothing, and *unknown* must never block.
     func test_androidRowWithUnknownStackIsSeedable() {
-        XCTAssertNil(reason(transport: .agentDivert(package: "com.example"), httpStack: nil))
+        XCTAssertNil(reason(transport: .androidAgent(package: "com.example"), httpStack: nil))
     }
 
     func test_androidOkhttp3RowIsSeedable() {
-        XCTAssertNil(reason(transport: .agentDivert(package: "com.example"), httpStack: "okhttp3"))
+        XCTAssertNil(reason(transport: .androidAgent(package: "com.example"), httpStack: "okhttp3"))
     }
 
     func test_androidNonOkhttpRowIsBlocked_withTheStacksHumanName() {
-        let message = reason(transport: .agentDivert(package: "com.example"),
+        let message = reason(transport: .androidAgent(package: "com.example"),
                              httpStack: "urlconnection")
         XCTAssertEqual(message,
                        "This request came from HttpURLConnection, not okhttp3 — Jaca can't divert it.")
@@ -107,15 +107,15 @@ final class OverrideRowGateTests: XCTestCase {
     /// and nothing to wait for, and authoring a rule from an already-captured row is exactly what
     /// the user should be able to do.
     func test_stoppedCaptureDoesNotSurfaceAnArmingReason() {
-        XCTAssertNil(reason(transport: .iosSimulatorDivert(bundleID: "com.example.App"),
+        XCTAssertNil(reason(transport: .iosSimulatorAgent(bundleID: "com.example.App"),
                             arming: .detached(appID: "com.example.App"),
                             hasRunningSource: false))
     }
 
-    /// …but a row that could never be diverted stays refused whether or not capture is running:
+    /// …but a row that could never be routed stays refused whether or not capture is running:
     /// that fact is about the row, not about the session.
-    func test_stoppedCaptureStillBlocksANonDivertibleAndroidRow() {
-        XCTAssertNotNil(reason(transport: .agentDivert(package: "com.example"),
+    func test_stoppedCaptureStillBlocksANonRoutableAndroidRow() {
+        XCTAssertNotNil(reason(transport: .androidAgent(package: "com.example"),
                                arming: .idle,
                                hasRunningSource: false,
                                httpStack: "urlconnection"))
@@ -127,26 +127,26 @@ final class OverrideRowGateTests: XCTestCase {
     /// only from the device won't work") is false — and scaring people off a working action is
     /// worse than saying nothing.
     func test_simulatorHasNoOriginExplainerAndNamesNoTunnel() {
-        let ios = InterceptTransportID.iosSimulatorDivert(bundleID: "com.example.App")
+        let ios = InterceptTransportID.iosSimulatorAgent(bundleID: "com.example.App")
         XCTAssertTrue(ios.originExplainer.isEmpty)
-        XCTAssertFalse(ios.divertScopeHelp.lowercased().contains("tunnel"))
-        XCTAssertFalse(ios.divertScopeHelp.lowercased().contains("adb"))
+        XCTAssertFalse(ios.routingScopeHelp.lowercased().contains("tunnel"))
+        XCTAssertFalse(ios.routingScopeHelp.lowercased().contains("adb"))
         XCTAssertEqual(ios.portLabel(port: 41234), "127.0.0.1:41234")
     }
 
     /// The Android device only reaches that port because `adb reverse` put it there; printing a
     /// bare "127.0.0.1:P" sends people hunting for a listener the phone can't see.
     func test_androidNamesItsTunnelAndItsPort() {
-        let android = InterceptTransportID.agentDivert(package: "com.example")
+        let android = InterceptTransportID.androidAgent(package: "com.example")
         XCTAssertEqual(android.portLabel(port: 41234), "via adb reverse :41234")
-        XCTAssertTrue(android.divertScopeHelp.contains("adb reverse"))
+        XCTAssertTrue(android.routingScopeHelp.contains("adb reverse"))
         XCTAssertFalse(android.originExplainer.isEmpty)
     }
 
     /// `NSURLProtocol` never sees `WKWebView`, background `URLSession` configurations or raw
     /// sockets. The chooser must not promise coverage the transport doesn't have.
     func test_simulatorCaptureDetailDoesNotPromiseCallStacks() {
-        let ios = InterceptTransportID.iosSimulatorDivert(bundleID: "com.example.App")
+        let ios = InterceptTransportID.iosSimulatorAgent(bundleID: "com.example.App")
         XCTAssertFalse(ios.captureDetail.contains("call stack"))
         XCTAssertTrue(ios.captureDetail.contains("URLSession"))
         XCTAssertFalse(InterceptTransportID.agentChooserDetail.contains("debuggable app in-process — no proxy or CA, with call stacks"))

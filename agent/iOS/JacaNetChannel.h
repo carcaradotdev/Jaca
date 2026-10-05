@@ -1,5 +1,5 @@
 // JacaNetChannel.h — the one TCP connection back to Jaca. Transport only: it frames lines, it
-// does not know what a divert is.
+// does not know what routing is.
 //
 // The simulator shares the Mac's loopback, so the agent *dials* 127.0.0.1:$JACA_NET_PORT (Jaca
 // binds the listener before it launches the app). One socket carries both directions — transaction

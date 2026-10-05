@@ -39,7 +39,7 @@ enum AgentTransactionParser {
         // The agent captures our stamp on the way back, so the row knows it was overridden with
         // no id matching across two id spaces.
         txn.overriddenByRuleID = txn.responseHeaders
-            .first { $0.name.lowercased() == OverrideHeaders.override.lowercased() }
+            .first { $0.name.lowercased() == JacaHeaders.override.lowercased() }
             .flatMap { UUID(uuidString: $0.value) }
         return txn
     }

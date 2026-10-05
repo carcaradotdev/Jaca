@@ -5,7 +5,7 @@ import XCTest
 ///
 /// A `SIGKILL` runs no cleanup by definition, so this ledger is the only thing that can reclaim a
 /// stale `adb reverse` — and a stale reverse points the device's `localhost:P` at a listener that
-/// no longer exists, breaking every diverted request until someone removes it by hand.
+/// no longer exists, breaking every routed request until someone removes it by hand.
 final class TunnelLedgerTests: XCTestCase {
 
     /// Ownership is tracked by pid because `adb reverse --list` prints bare `tcp:P tcp:P` entries

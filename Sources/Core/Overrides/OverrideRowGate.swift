@@ -13,7 +13,7 @@ enum OverrideRowGate {
                                   overridesAvailable: Bool,
                                   featureEnabled: Bool,
                                   url: String,
-                                  /// Android-only, so consulted for `.agentDivert` and nowhere
+                                  /// Android-only, so consulted for `.androidAgent` and nowhere
                                   /// else. nil means *unknown* (an agent predating `httpStack`)
                                   /// and must never block authoring.
                                   httpStack: String?) -> String? {
@@ -28,16 +28,16 @@ enum OverrideRowGate {
         switch transport {
         case .companionMetadata:
             return "Overrides apply to in-process agent capture. Companion capture will follow."
-        case .agentDivert:
+        case .androidAgent:
             // `httpStack` is the only reliable signal: `callStack` strips okhttp frames, so
             // testing *it* here disabled every row (OverrideAuthoringTests).
             if let httpStack, httpStack != "okhttp3" {
                 return "This request came from \(InterceptTransportID.stackLabel(httpStack)), "
                      + "not okhttp3 — Jaca can't divert it."
             }
-        case .iosSimulatorDivert, .mitmProxy:
+        case .iosSimulatorAgent, .mitmProxy:
             // No stack check: the iOS agent hooks `URLSession`, so everything it reports is
-            // divertible, and the proxy never learns which client stack sent a request.
+            // routable, and the proxy never learns which client stack sent a request.
             break
         }
 
