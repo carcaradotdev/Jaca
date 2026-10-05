@@ -25,6 +25,9 @@ final class JacaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         installStatusItem()
         adoptMainWindow()
+        // A SIGKILLed run leaves its adb tunnels behind, pointing the device's localhost at a
+        // listener that no longer exists. Reclaim them now.
+        AdbTunnelCleanup.reconcileOrphansFromPreviousRuns()
     }
 
     /// Applies the Dock/⌘-Tab preference live. Changing the policy hides the window and
@@ -61,6 +64,9 @@ final class JacaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         ProxyCleanup.revertAll()
+        // Without this, quitting mid-capture stranded a forward in the adb server, where it
+        // outlived Jaca itself.
+        AdbTunnelCleanup.revertAll()
     }
 
     // MARK: - Status item

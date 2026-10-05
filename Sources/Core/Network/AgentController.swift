@@ -1,51 +1,5 @@
 import Foundation
 
-/// Parses one agent JSON line into a NetworkTransaction. Pure & testable.
-enum AgentTransactionParser {
-    static func parse(_ line: String) -> NetworkTransaction? {
-        guard let data = line.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              (obj["type"] as? String) == "txn" else { return nil }
-
-        let url = obj["url"] as? String ?? ""
-        let comps = URLComponents(string: url)
-        var txn = NetworkTransaction(
-            method: obj["method"] as? String ?? "GET",
-            url: url,
-            host: comps?.host ?? "",
-            scheme: comps?.scheme ?? (url.hasPrefix("https") ? "https" : "http"),
-            requestHeaders: headers(obj["requestHeaders"]),
-            requestBody: bodyData(obj["requestBody"]),
-            startedAt: date(obj["startedAt"]) ?? Date()
-        )
-        if let status = obj["status"] as? Int, status > 0 { txn.statusCode = status }
-        txn.responseHeaders = headers(obj["responseHeaders"])
-        txn.responseBody = bodyData(obj["responseBody"])
-        txn.responseContentType = txn.responseHeaders.first { $0.name.lowercased() == "content-type" }?.value
-        txn.responseReceivedAt = date(obj["responseAt"])
-        txn.finishedAt = date(obj["finishedAt"])
-        txn.requestBytes = obj["requestSize"] as? Int ?? (txn.requestBody?.count ?? 0)
-        txn.responseBytes = obj["responseSize"] as? Int ?? (txn.responseBody?.count ?? 0)
-        txn.error = obj["error"] as? String
-        txn.callStack = (obj["callStack"] as? [Any])?.compactMap { $0 as? String }
-        return txn
-    }
-
-    private static func headers(_ any: Any?) -> [HeaderPair] {
-        guard let dict = any as? [String: Any] else { return [] }
-        return dict.map { HeaderPair(name: $0.key, value: "\($0.value)") }
-            .sorted { $0.name.lowercased() < $1.name.lowercased() }
-    }
-    private static func bodyData(_ any: Any?) -> Data? {
-        guard let s = any as? String, !s.isEmpty else { return nil }
-        return s.data(using: .utf8)
-    }
-    private static func date(_ any: Any?) -> Date? {
-        guard let t = any as? Double, t > 0 else { return nil }
-        return Date(timeIntervalSince1970: t)
-    }
-}
-
 /// Drives the in-process agent for a debuggable Android app: push artifacts,
 /// attach via `cmd activity attach-agent` (no root), `adb forward` the agent's
 /// localabstract socket, and stream captured transactions to `onTransaction`.
@@ -60,18 +14,31 @@ final class AgentController: @unchecked Sendable {
     private let onTransaction: @Sendable (NetworkTransaction) -> Void
     private let onStatus: @Sendable (String) -> Void
 
+    /// Owns the override server, the `adb reverse` tunnel and the control frames. Nil when
+    /// response overrides aren't wired up for this session.
+    let agentHTTP: AgentHTTPCoordinator?
+    private let interceptPipeline: InterceptPipeline?
+    private let interceptServices: InterceptServices?
+    private let interceptTarget: InterceptTarget?
+
+    /// The socket to the agent, including its lock, `SO_NOSIGPIPE` and the line framing.
+    private let channel: AgentLineChannel
+    /// The channel has to exist before `self` does — the coordinator takes it as its writer — so
+    /// its callbacks reach back through this box, filled in at the end of `init`.
+    private let weakSelf = WeakController()
+
     private var forwardedPort: Int32 = 0
-    private var fd: Int32 = -1
-    private var readerThread: Thread?
     private var stopped = false
-    /// Set once the reader connects to the agent's forwarded socket — i.e. the agent actually
-    /// loaded in-process. Drives the "attached but never loaded" diagnostic.
-    private var socketConnected = false
+    /// Set once the agent's first bytes arrive — i.e. it actually loaded in-process. Drives the
+    /// "attached but never loaded" diagnostic.
+    private let socketConnected = AtomicFlag()
 
     init(adbURL: URL, serial: String, package: String, soPath: URL,
          bootDexPath: URL, captureDexPath: URL,
          onTransaction: @escaping @Sendable (NetworkTransaction) -> Void,
-         onStatus: @escaping @Sendable (String) -> Void) {
+         onStatus: @escaping @Sendable (String) -> Void,
+         capabilities: InterceptCapabilities,
+         intercept: InterceptServices? = nil) {
         self.adbURL = adbURL
         self.serial = serial
         self.package = package
@@ -81,6 +48,56 @@ final class AgentController: @unchecked Sendable {
         self.socketName = "squeeze_\(UInt32.random(in: 1...0xFFFFFF))"
         self.onTransaction = onTransaction
         self.onStatus = onStatus
+        self.interceptPipeline = intercept?.pipeline(for: .androidAgent(package: package),
+                                                     deviceID: serial, appID: package)
+        let box = self.weakSelf
+        let channel = AgentLineChannel(name: "android-\(package)", callbacks: .init(
+            onLine: { line in box.controller?.handle(line: line) },
+            onFirstBytes: { box.controller?.noteAgentLoaded() },
+            // On *disconnect*: the re-arm rides the next hello or heartbeat, so a re-attached
+            // agent is never spoken to before it has said anything.
+            onDisconnected: { box.controller?.agentHTTP?.agentDidReconnect() }))
+        self.channel = channel
+        let target = InterceptTarget(deviceID: serial, package: package)
+        self.agentHTTP = intercept.map { services in
+            AgentHTTPCoordinator(transport: .androidAgent(package: package),
+                              deviceID: serial, appID: package,
+                              capabilities: capabilities,
+                              tunnel: AdbReverseTunnel(adbPath: adbURL.path, serial: serial),
+                              writer: channel,
+                              onStateChange: { services.reportArming(target: target, coordinator: $0, state: $1) })
+        }
+        self.interceptServices = intercept
+        self.interceptTarget = target
+        if let agentHTTP = self.agentHTTP { intercept?.register(target: target, coordinator: agentHTTP) }
+        box.controller = self
+    }
+
+    /// One agent line, routed. Both controllers classify through `AgentFrame`, so their readers
+    /// can't drift apart.
+    private func handle(line: String) {
+        switch AgentFrame.classify(line) {
+        case .transaction(let txn):
+            onTransaction(txn)
+        case .hello(let supportsOverride):
+            guard supportsOverride else {
+                // Alive but predating overrides — reporting it turns an eternal "arming…" into
+                // a sentence that names the fix.
+                agentHTTP?.agentDidAdvertiseWithoutOverrideSupport()
+                return
+            }
+            JacaLog.info("agent", "hello with override/1 from \(package)")
+            // Only now does the desktop send an endpoint, so an older agent that can't read
+            // control frames is a no-op rather than a hazard.
+            agentHTTP?.agentDidAdvertiseOverrideSupport()
+        case .unrecognised:
+            break
+        }
+    }
+
+    private func noteAgentLoaded() {
+        socketConnected.set()
+        onStatus("agent: in-process (receiving)")
     }
 
     /// Checks whether `package` is debuggable (run-as succeeds only for debug builds).
@@ -105,9 +122,25 @@ final class AgentController: @unchecked Sendable {
     /// reader, then supervises the app's pid: re-attaches whenever the app restarts
     /// (a reinstall kills the old process and launches a new one with a new pid).
     private func run() async {
+        // `stop()` can land inside any of these awaits — pushing ~15 MB of artifacts takes
+        // seconds over USB — so each is followed by a re-check. Without them the teardown
+        // completes first and this function brings everything back up behind it: a dial thread
+        // retrying forever, an override server nobody closes, an `adb reverse` nobody removes.
         await pushArtifacts()
+        guard !stopped else { return }
+
         guard await setupForward() else { onStatus("agent: adb forward failed"); return }
-        startReaderLoop()
+        // `stop()` already captured `forwardedPort` as 0, so nothing else will ever remove this one.
+        guard !stopped else { await removeForward(); return }
+
+        channel.dial(port: forwardedPort)
+
+        // Up before the app is attached, so the port is stable for the whole session (see
+        // `AgentHTTPCoordinator`).
+        if let agentHTTP, let interceptPipeline {
+            await agentHTTP.start(pipeline: interceptPipeline)
+        }
+        guard !stopped else { return }
 
         var lastPid: String?
         var announcedWaiting = false
@@ -190,7 +223,7 @@ final class AgentController: @unchecked Sendable {
     private func scheduleAgentLoadCheck(pid: String) {
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(6))
-            guard let self, !self.stopped, !self.socketConnected else { return }
+            guard let self, !self.stopped, !self.socketConnected.isSet else { return }
             self.onStatus("agent: attached to pid \(pid) but its in-process socket never opened — it "
                 + "likely failed to load. Check `adb logcat | grep -i squeeze`; make sure the app is the "
                 + "arm64-v8a build.")
@@ -201,77 +234,76 @@ final class AgentController: @unchecked Sendable {
         guard let fwd = await adb(["forward", "tcp:0", "localabstract:\(socketName)"]),
               let port = Int32(fwd.stdout.trimmingCharacters(in: .whitespacesAndNewlines)) else { return false }
         forwardedPort = port
+        // Registered so a quit/^C/crash can't strand it in the adb server, where it would
+        // outlive Jaca itself.
+        AdbTunnelCleanup.register(adbPath: adbURL.path, serial: serial, kind: .forward, port: Int(port))
         return true
     }
 
-    private func startReaderLoop() {
-        let thread = Thread { [weak self] in self?.readerLoop() }
-        thread.name = "squeeze-agent-reader"
-        readerThread = thread
-        thread.start()
-    }
-
-    /// Connects to the forwarded socket and streams; on disconnect (process died or
-    /// not yet attached) it retries forever until stopped, so a re-attached app's
-    /// fresh agent is picked up automatically.
-    private func readerLoop() {
-        while !stopped {
-            let s = connect(port: forwardedPort)
-            if s < 0 { Thread.sleep(forTimeInterval: 0.3); continue }
-            socketConnected = true   // the agent loaded and opened its socket
-            fd = s
-            _ = streamFrom(fd: s)
-            if fd >= 0 { close(fd); fd = -1 }
-            if stopped { return }
-            Thread.sleep(forTimeInterval: 0.3)   // socket closed → retry / await re-attach
-        }
-    }
-
-    /// Reads newline-delimited JSON from `s`. Returns true if any bytes arrived.
-    private func streamFrom(fd s: Int32) -> Bool {
-        var firstData = true
-        var buffer = Data()
-        var chunk = [UInt8](repeating: 0, count: 16384)
-        while !stopped {
-            let n = recv(s, &chunk, chunk.count, 0)
-            if n <= 0 { break }
-            if firstData { firstData = false; onStatus("agent: in-process (receiving)") }
-            buffer.append(contentsOf: chunk[0..<n])
-            while let nl = buffer.firstIndex(of: 0x0A) {
-                let lineData = buffer[buffer.startIndex..<nl]
-                buffer.removeSubrange(buffer.startIndex...nl)
-                if let line = String(data: lineData, encoding: .utf8),
-                   let txn = AgentTransactionParser.parse(line) {
-                    onTransaction(txn)
-                }
-            }
-        }
-        return !firstData
-    }
-
-    private func connect(port: Int32) -> Int32 {
-        let s = socket(AF_INET, SOCK_STREAM, 0)
-        guard s >= 0 else { return -1 }
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = in_port_t(UInt16(port).bigEndian)
-        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr)
-        let r = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        if r != 0 { close(s); return -1 }
-        return s
-    }
-
+    /// Interactive teardown, **asynchronous** on purpose: it runs on the main actor, where a
+    /// synchronous `adb` call would block the UI for seconds against a wedged device. The
+    /// synchronous path exists only for process exit (`AdbTunnelCleanup.revertAll`).
+    ///
+    /// Order matters: disarm and drop the reverse tunnel *before* removing the forward, so the
+    /// control channel is still open when the disarm frame is written.
     func stop() {
         stopped = true
-        if fd >= 0 { close(fd); fd = -1 }
+        let coordinator = agentHTTP
         let p = forwardedPort
-        if p > 0 {
-            let url = adbURL, serial = serial
-            Task { _ = try? await CommandRunner.run(url, ["-s", serial, "forward", "--remove", "tcp:\(p)"]) }
+        let url = adbURL, serial = serial
+        let services = interceptServices
+        let target = interceptTarget
+
+        // Stop reconnecting, but leave the live fd open so the disarm frame still lands. Closing
+        // it here makes every teardown write bail, leaving the device to recover only via the
+        // EOF/heartbeat fallbacks.
+        // Synchronous: a restart builds the replacement in the same main-actor run, so a
+        // still-live coordinator would leave the target permanently unregistered.
+        coordinator?.beginStop()
+
+        channel.stopAccepting()
+        Task {
+            await coordinator?.stop()                       // route off, reverse removed, server closed
+            await self.channel.flush()                      // the disarm frame has reached send(2)
+            self.channel.close()
+            await Self.removeForward(port: p, adbURL: url, serial: serial)
+            // Drop the coordinator so a closed tab stops receiving host-set updates.
+            if let target, let coordinator {
+                services?.deregister(target: target, coordinator: coordinator)
+            }
         }
     }
+
+    /// Drops the forward this controller opened. Shared with `run()`'s bail-out: a forward
+    /// created after `stop()` captured the port is invisible to the teardown.
+    private func removeForward() async {
+        let p = forwardedPort
+        forwardedPort = 0
+        await Self.removeForward(port: p, adbURL: adbURL, serial: serial)
+    }
+
+    private static func removeForward(port: Int32, adbURL: URL, serial: String) async {
+        guard port > 0 else { return }
+        _ = try? await CommandRunner.run(adbURL, ["-s", serial, "forward", "--remove", "tcp:\(port)"])
+        AdbTunnelCleanup.deregister(adbPath: adbURL.path, serial: serial, kind: .forward, port: Int(port))
+    }
+}
+
+/// Lets `AgentLineChannel`'s callbacks reach the controller. The channel is constructed before
+/// `self` exists, so they can't capture it directly.
+private final class WeakController: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var value: AgentController?
+    var controller: AgentController? {
+        get { lock.lock(); defer { lock.unlock() }; return value }
+        set { lock.lock(); value = newValue; lock.unlock() }
+    }
+}
+
+/// A one-way flag set from the reader thread and read from a `Task`.
+private final class AtomicFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+    func set() { lock.lock(); flag = true; lock.unlock() }
+    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return flag }
 }

@@ -10,6 +10,8 @@ struct NetworkSessionView: View {
     @State private var showCAInstall = false
     @State private var showCompanionCA = false
     @State private var searchText = ""
+    /// The rule being created/edited from the row context menu; the draft carries add-vs-update.
+    @State private var editingOverride: OverrideDraft?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,6 +26,9 @@ struct NetworkSessionView: View {
                     .help("Open HTTPS decryption setup")
                 divider
             }
+            // Above the content, so a tab that silently stopped capturing says so where the user
+            // is already looking.
+            AgentAttachBanner(session: session)
             if showCaptureChooser {
                 captureChooser
             } else {
@@ -71,6 +76,17 @@ struct NetworkSessionView: View {
         }
         .sheet(isPresented: $showCompanionCA) {
             CompanionCASheet(session: session)
+        }
+        .sheet(item: $editingOverride) { draft in
+            if let overrides = session.overrides {
+                OverrideEditorSheet(
+                    rule: draft.rule, session: session, overrides: overrides, isNew: draft.isNew,
+                    seedWarning: draft.seedWarning,
+                    onSave: { saved in
+                        withAnimation(.easeInOut(duration: 0.28)) { overrides.save(saved) }
+                    }
+                )
+            }
         }
     }
 
@@ -261,6 +277,10 @@ struct NetworkSessionView: View {
             )
             .frame(maxWidth: 360)
 
+            // The editor is presented here, on the main window, for both entry points: see
+            // `OverridesPopover.onEdit`.
+            OverridesToolbarButton(session: session, onEdit: { editingOverride = $0 })
+
             Spacer()
 
             modeBadge
@@ -322,9 +342,11 @@ struct NetworkSessionView: View {
                 ScrollView {
                     LazyVStack(spacing: 0) {
                         ForEach(session.filtered) { txn in
-                            NetworkRowView(txn: txn, selected: txn.id == session.selectedID)
+                            NetworkRowView(txn: txn, selected: txn.id == session.selectedID,
+                                           badge: overrideBadge(for: txn))
                                 .contentShape(Rectangle())
                                 .onTapGesture { session.selectedID = txn.id }
+                                .contextMenu { rowMenu(for: txn) }
                         }
                     }
                 }
@@ -333,8 +355,107 @@ struct NetworkSessionView: View {
         .background(LemonadeTheme.colors.background.bgDefault)
     }
 
+    // MARK: - Response overrides
+
+    /// The row context menu. Items that can't work stay **visible and disabled** with a reason —
+    /// a hidden item teaches nothing about why.
+    @ViewBuilder
+    private func rowMenu(for txn: NetworkTransaction) -> some View {
+        let blocked = overrideUnavailableReason(for: txn)
+        let existing = session.overrides?.matchingRule(forURL: txn.url, method: txn.method)
+
+        Button(existing == nil ? "Override response…" : "Edit override “\(existing!.displayName)”") {
+            session.selectedID = txn.id
+            if let existing {
+                editingOverride = .existing(existing)
+            } else {
+                seedOverride(from: txn)
+            }
+        }
+        .disabled(blocked != nil)
+        .help(blocked ?? "")
+
+        if existing != nil {
+            Button("Add another override…") {
+                session.selectedID = txn.id
+                seedOverride(from: txn)
+            }
+            .disabled(blocked != nil)
+            .help(blocked ?? "")
+        }
+
+        Divider()
+
+        Button("Copy URL") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(txn.url, forType: .string)
+        }
+        Button("Copy response body") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(
+                txn.responseBody.flatMap { String(data: $0, encoding: .utf8) } ?? "", forType: .string)
+        }
+
+        Divider()
+
+        Button("Filter by this host") {
+            searchText = txn.host
+            session.filterText = txn.host
+        }
+    }
+
+    /// Why this row can't be overridden, or nil. The decision is pure and unit-tested
+    /// (`OverrideRowGate`); the view only supplies the state.
+    private func overrideUnavailableReason(for txn: NetworkTransaction) -> String? {
+        OverrideRowGate.unavailableReason(transport: session.interceptTransport,
+                                          arming: armingState,
+                                          hasRunningSource: session.hasRunningSource,
+                                          overridesAvailable: session.overrides != nil,
+                                          featureEnabled: FeatureFlags.responseOverridesEnabled,
+                                          url: txn.url,
+                                          httpStack: txn.httpStack)
+    }
+
+    /// This tab's routing arming state, or `.idle` when it isn't an agent tab. One reader on the
+    /// session, shared with the toolbar, popover, row badges and attach banner.
+    private var armingState: InterceptArmingState { session.armingState }
+
+    private func seedOverride(from txn: NetworkTransaction) {
+        guard let overrides = session.overrides else { return }
+        Task { @MainActor in
+            let rule = await overrides.seed(from: txn, session: session)
+            editingOverride = .new(rule, warning: OverrideSeeding.warning(for: txn))
+        }
+    }
+
+    /// The row's override badge state, read from the shared model.
+    private func overrideBadge(for txn: NetworkTransaction) -> NetworkRowView.OverrideBadge {
+        guard let overrides = session.overrides, FeatureFlags.responseOverridesEnabled else { return .none }
+        if let applied = overrides.appliedRule(for: txn) {
+            return .applied(applied.displayName)
+        }
+        guard overrides.masterEnabled,
+              let matching = overrides.matchingRule(forURL: txn.url, method: txn.method)
+        else { return .none }
+
+        // A matching rule that isn't armed must not promise "applies on the next request" —
+        // arming may have failed. Wording is shared with the popover and toolbar.
+        if let blocked = armingState.blockedMessage { return .blocked(blocked) }
+
+        // With no source running there's no transport to judge against, so "applies on the next
+        // request" is the honest reading.
+        if session.hasRunningSource,
+           let skip = overrides.blockedReason(forURL: txn.url, method: txn.method,
+                                              transport: session.interceptTransport,
+                                              capabilities: session.activeInterceptCapabilities) {
+            return .blocked(skip.message)
+        }
+        return .willApply(matching.displayName)
+    }
+
     private var columnHeader: some View {
         HStack(spacing: LemonadeTheme.spaces.spacing200) {
+            headerCell(" ", width: 14)          // override badge gutter (hand-synced with the row)
             headerCell("Status", width: 52)
             headerCell("Method", width: 60)
             headerCell("Host", width: 150)
@@ -548,11 +669,27 @@ private struct NetworkAppPicker: View {
 private struct NetworkRowView: View {
     let txn: NetworkTransaction
     let selected: Bool
+    var badge: OverrideBadge = .none
+
+    /// Whether an override touched (or would touch) this row. Passed in, never derived inside
+    /// `body` — `filtered` can hold thousands of rows.
+    enum OverrideBadge: Equatable {
+        case none
+        /// A rule produced this response.
+        case applied(String)
+        /// A rule matches, but this row predates it.
+        case willApply(String)
+        /// A rule matches but can't run on this transport.
+        case blocked(String)
+    }
 
     var body: some View {
         HStack(spacing: LemonadeTheme.spaces.spacing200) {
+            badgeGutter
             Text(txn.statusText)
-                .foregroundStyle(NetworkFormatting.statusColor(txn))
+                .foregroundStyle(badge.isApplied
+                                 ? LemonadeTheme.colors.content.contentCaution
+                                 : NetworkFormatting.statusColor(txn))
                 .fontWeight(.semibold)
                 .frame(width: 52, alignment: .leading)
             Text(txn.method)
@@ -574,7 +711,50 @@ private struct NetworkRowView: View {
         .font(LogLevelStyle.mono(11))
         .padding(.horizontal, LemonadeTheme.spaces.spacing300)
         .padding(.vertical, LemonadeTheme.spaces.spacing100)
-        .background(selected ? LemonadeTheme.colors.interaction.bgSubtleInteractive : .clear)
+        .background(rowBackground)
+        .animation(.easeInOut(duration: 0.25), value: badge)
+    }
+
+    @ViewBuilder
+    private var badgeGutter: some View {
+        Group {
+            switch badge {
+            case .none:
+                Color.clear
+            case .applied:
+                Image(systemName: "bolt.fill")
+                    .foregroundStyle(LemonadeTheme.colors.content.contentCaution)
+            case .willApply:
+                Image(systemName: "bolt")
+                    .foregroundStyle(LemonadeTheme.colors.content.contentTertiary)
+                    .opacity(0.6)
+            case .blocked:
+                Image(systemName: "bolt.slash")
+                    .foregroundStyle(LemonadeTheme.colors.content.contentCaution)
+            }
+        }
+        .font(.system(size: 9, weight: .semibold))
+        .frame(width: 14, alignment: .leading)
+        .help(badge.tooltip)
+    }
+
+    private var rowBackground: Color {
+        if selected { return LemonadeTheme.colors.interaction.bgSubtleInteractive }
+        if badge.isApplied { return LemonadeTheme.colors.background.bgCautionSubtle.opacity(0.4) }
+        return .clear
+    }
+}
+
+private extension NetworkRowView.OverrideBadge {
+    var isApplied: Bool { if case .applied = self { return true }; return false }
+
+    var tooltip: String {
+        switch self {
+        case .none:                return ""
+        case .applied(let name):   return "Answered by “\(name)” — the request never left the device"
+        case .willApply(let name): return "Matches “\(name)” — applies on the next request"
+        case .blocked(let reason): return reason
+        }
     }
 }
 

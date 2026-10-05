@@ -12,6 +12,10 @@ struct CaptureContext {
     let targetPackage: String?
     /// Companion mode: the shared mDNS browse + stream hub.
     let companion: CompanionHub?
+    /// The resolver, reporter and origin client a transport needs to participate in interception;
+    /// nil disables overriding here. Threaded like `companion` above, so sources never reach for
+    /// the model.
+    var intercept: InterceptServices? = nil
 }
 
 /// Callbacks a running source uses to report back to its session. Source-specific
@@ -24,6 +28,11 @@ protocol CaptureSink: AnyObject {
     func capture(didBindPort port: Int)
     /// Proxy: started, but no decrypted HTTPS seen yet — guide the user to install/trust the CA.
     func captureNeedsSetup()
+
+    /// The source's in-process agent is no longer in the app (or the app is gone). Separate from
+    /// `arming` because losing the agent stops **capture**, not just overrides, so it must reach
+    /// the UI even when overrides were never wired. Only the iOS-Simulator source detects it.
+    func capture(didChangeAttach state: InterceptArmingState)
 }
 
 /// A pluggable network-capture backend. Add a new way to capture (proxy, in-process
@@ -34,6 +43,22 @@ protocol CaptureSink: AnyObject {
 protocol CaptureSource: AnyObject {
     func start(into sink: CaptureSink)
     func stop()
+    /// What this source can honour when a rule matches. Defaults to nothing, so a transport
+    /// only participates in interception once it deliberately opts in.
+    var interceptCapabilities: InterceptCapabilities { get }
+
+    /// The coordinator arming this source's device, when overrides were actually wired up.
+    /// Nil means nothing is armed — the UI must not claim overrides are active.
+    var arming: AgentHTTPCoordinator? { get }
+}
+
+extension CaptureSink {
+    func capture(didChangeAttach state: InterceptArmingState) {}
+}
+
+extension CaptureSource {
+    var interceptCapabilities: InterceptCapabilities { [] }
+    var arming: AgentHTTPCoordinator? { nil }
 }
 
 /// Static, selectable description of a capture option for a device. Drives the chooser

@@ -59,10 +59,14 @@ final class ProxyServer: @unchecked Sendable {
         channel = try bootstrap.bind(host: "0.0.0.0", port: port).wait()
     }
 
+    /// Terminal — the owner drops the instance right after — and non-blocking: `close().wait()`
+    /// and `syncShutdownGracefully()` park the calling thread, which is the main actor when a tab
+    /// closes, freezing the UI until the handshakes in flight unwind.
     func stop() {
-        try? channel?.close().wait()
+        let group = self.group
+        channel?.close(promise: nil)
         channel = nil
-        try? group.syncShutdownGracefully()
+        DispatchQueue.global(qos: .utility).async { try? group.syncShutdownGracefully() }
     }
 }
 

@@ -94,24 +94,13 @@ final class SimulatorLogSource: LogSource {
 
     func stop() { process.stop() }
 
-    /// Resolves the running PID(s) for a bundle id on a booted simulator via
-    /// `launchctl list` (label `UIKitApplication:<bundleID>[…]`). iOS unified-log
+    /// Resolves the running PID(s) for a bundle id on a booted simulator. iOS unified-log
     /// lines carry the process id, so we filter by it — the bundle id never appears
-    /// as the process name.
+    /// as the process name. The `launchctl list` call and its label parsing live in
+    /// `SimulatorProcesses`, shared with the Network side's attach watchdog.
     static func resolvePIDs(udid: String, bundleID: String) async -> Set<Int32> {
-        guard !bundleID.isEmpty,
-              let r = try? await CommandRunner.run(
-                  AppleToolchain.xcrun, ["simctl", "spawn", udid, "launchctl", "list"]),
-              r.exitCode == 0 else { return [] }
-        var pids: Set<Int32> = []
-        for line in r.stdout.split(separator: "\n") {
-            // "<pid>\t<status>\tUIKitApplication:com.example.app.dev[xxxx][rb-legacy]"
-            guard line.contains(":\(bundleID)[") || line.hasSuffix(":\(bundleID)") else { continue }
-            if let pidField = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).first,
-               let pid = Int32(pidField), pid > 0 {
-                pids.insert(pid)
-            }
-        }
-        return pids
+        guard !bundleID.isEmpty, let output = await SimulatorProcesses.launchctlList(udid: udid)
+        else { return [] }
+        return SimulatorProcesses.pids(bundleID: bundleID, inLaunchctlList: output)
     }
 }

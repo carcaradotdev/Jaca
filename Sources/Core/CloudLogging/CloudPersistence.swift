@@ -13,8 +13,11 @@ private struct FailableDecodable<T: Decodable>: Decodable {
 enum CloudPersistence {
     /// Tolerantly decodes a JSON array: the whole array first, then element-by-element, skipping
     /// any record that fails. Returns [] only when the data isn't a JSON array at all.
-    static func decodeArray<T: Decodable>(_ type: T.Type, from data: Data) -> [T] {
-        let decoder = JSONDecoder()
+    ///
+    /// `decoder` lets a store match the strategy it *encoded* with. A mismatch is silent and
+    /// total: every record throws, the array comes back empty, and the next save writes nothing.
+    static func decodeArray<T: Decodable>(_ type: T.Type, from data: Data,
+                                          decoder: JSONDecoder = JSONDecoder()) -> [T] {
         if let all = try? decoder.decode([T].self, from: data) { return all }
         guard let wrapped = try? decoder.decode([FailableDecodable<T>].self, from: data) else { return [] }
         return wrapped.compactMap { $0.value }

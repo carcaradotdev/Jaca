@@ -17,20 +17,34 @@ final class AppModel {
     /// Top-level area the app is showing: the device/session view or the worktrees area.
     var mode: WorkspaceMode = .devices
 
-    /// Experimental HTTPS decryption + companion capture, OFF by default and fully opt-in
-    /// (Settings). When off, the companion subsystem is never started and network inspection
-    /// offers only Agent mode (per-app, in-process, no CA). Persisted across launches.
-    var httpsDecryptionEnabled: Bool = FeatureFlags.httpsDecryptionEnabled {
+    /// Agent HTTPS debugging (the default, with response overrides) or HTTPS debugging as a
+    /// man-in-the-middle via the companion app — one or the other; see
+    /// `FeatureFlags.networkInspectionMode`. Persisted across launches.
+    var networkInspectionMode: NetworkInspectionMode = FeatureFlags.networkInspectionMode {
         didSet {
-            guard httpsDecryptionEnabled != oldValue else { return }
-            FeatureFlags.httpsDecryptionEnabled = httpsDecryptionEnabled
-            reconfigureCompanion()
+            guard networkInspectionMode != oldValue else { return }
+            // Persisted first: both reconfigurations read the flags back.
+            FeatureFlags.networkInspectionMode = networkInspectionMode
+            if (oldValue == .mitmHTTPSDebugging) != httpsDecryptionEnabled { reconfigureCompanion() }
+            if (oldValue == .agentHTTPSDebugging) != responseOverridesEnabled { reconfigureOverrides() }
         }
     }
+
+    /// Experimental HTTPS decryption + companion capture. When off, the companion subsystem is
+    /// never started and network inspection offers only Agent mode (per-app, in-process, no CA).
+    var httpsDecryptionEnabled: Bool { networkInspectionMode == .mitmHTTPSDebugging }
+
+    /// Response overrides (answer a matched request from a rule instead of the origin). Arming it
+    /// routes the rules' hosts through the Mac.
+    var responseOverridesEnabled: Bool { networkInspectionMode == .agentHTTPSDebugging }
 
     /// The unified Projects area state: auto-detected Claude projects + user-added
     /// folders, their worktrees, and per-checkout cache cleanup.
     let projects = ProjectsModel()
+
+    /// The single source of truth for response-override rules, read by every `NetworkSession` and
+    /// all the override UI, so two tabs can never disagree about what is mocked.
+    let overrides = OverridesModel()
 
     /// The Gradle daemons area state (lists/kills running Gradle daemons).
     let gradle = GradleDaemonsModel()
@@ -181,6 +195,14 @@ final class AppModel {
             companions.stop()
         }
         recomputeDevices()
+    }
+
+    /// Re-arm (or disarm) running captures when the flag toggles at runtime. A session wires its
+    /// intercept services once in `makeContext()`, so only a restart re-runs it.
+    private func reconfigureOverrides() {
+        for session in sessions.compactMap({ $0 as? NetworkSession }) where session.isRunning {
+            session.restartForInterceptChange()
+        }
     }
 
     /// Normalized device model, for matching a companion ("Jaca <MODEL>") to its adb device.
@@ -481,7 +503,8 @@ final class AppModel {
         mode = .devices   // opening a session returns to the devices/sessions view
         guard let authority = ensureCA() else { return nil }
         let session = NetworkSession(device: device, ca: authority, adbURL: adbURL,
-                                     displayName: name, bodyCache: bodyCache, companions: companions)
+                                     displayName: name, bodyCache: bodyCache, companions: companions,
+                                     overrides: overrides)
         session.deviceContext = context(for: device)
         session.onStateChanged = { [weak self] in self?.persistTabs() }
         // Companion-only devices have no proxy/agent path — pre-select companion so the

@@ -7,13 +7,28 @@ final class AgentCaptureSource: CaptureSource {
     private let adbURL: URL?
     private let serial: String
     private let package: String
+    private let intercept: InterceptServices?
     private var controller: AgentController?
 
-    init(adbURL: URL?, serial: String, package: String) {
+    init(adbURL: URL?, serial: String, package: String, intercept: InterceptServices? = nil) {
         self.adbURL = adbURL
         self.serial = serial
         self.package = package
+        self.intercept = intercept
     }
+
+    /// The agent terminates the exchange on the desktop, so it can do everything: answer without
+    /// the network, rewrite a real response, delay, and see bodies.
+    ///
+    /// One constant, two readers — the UI below and `AgentHTTPServer` via the controller — so the
+    /// toolbar can't promise more than the clamp allows.
+    static let nativeCapabilities: InterceptCapabilities = .desktopTerminated
+
+    /// …**but only when override services were actually wired in**. Without them nothing can be
+    /// honoured here, so the source declares nothing.
+    var interceptCapabilities: InterceptCapabilities { intercept == nil ? [] : Self.nativeCapabilities }
+
+    var arming: AgentHTTPCoordinator? { controller?.agentHTTP }
 
     func start(into sink: CaptureSink) {
         guard let adbURL, !package.isEmpty,
@@ -27,6 +42,8 @@ final class AgentCaptureSource: CaptureSource {
             soPath: so, bootDexPath: boot, captureDexPath: cap,
             onTransaction: { [weak sink] txn in Task { @MainActor in sink?.capture(didReceive: txn) } },
             onStatus: { [weak sink] s in Task { @MainActor in sink?.capture(didChangeStatus: s) } },
+            capabilities: Self.nativeCapabilities,
+            intercept: intercept
         )
         self.controller = controller
         controller.start()

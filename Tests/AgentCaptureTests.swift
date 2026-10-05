@@ -77,7 +77,8 @@ final class LiveAgentCaptureTests: XCTestCase {
             adbURL: adb, serial: serial, package: pkg,
             soPath: AgentArtifacts.soURL()!, bootDexPath: AgentArtifacts.bootDexURL!,
             captureDexPath: AgentArtifacts.captureDexURL!,
-            onTransaction: { box.add($0) }, onStatus: { statusBox.set($0) }
+            onTransaction: { box.add($0) }, onStatus: { statusBox.set($0) },
+            capabilities: AgentCaptureSource.nativeCapabilities
         )
         controller.start()
 
@@ -127,7 +128,8 @@ final class LiveAgentCaptureTests: XCTestCase {
             adbURL: adb, serial: serial, package: pkg,
             soPath: AgentArtifacts.soURL()!, bootDexPath: AgentArtifacts.bootDexURL!,
             captureDexPath: AgentArtifacts.captureDexURL!,
-            onTransaction: { box.add($0) }, onStatus: { statusBox.set($0) }
+            onTransaction: { box.add($0) }, onStatus: { statusBox.set($0) },
+            capabilities: AgentCaptureSource.nativeCapabilities
         )
         controller.start()
         _ = await waitUntil(25) { statusBox.value.contains("receiving") }
@@ -194,7 +196,8 @@ final class LiveAgentCaptureTests: XCTestCase {
             adbURL: adb, serial: serial, package: pkg,
             soPath: AgentArtifacts.soURL()!, bootDexPath: AgentArtifacts.bootDexURL!,
             captureDexPath: AgentArtifacts.captureDexURL!,
-            onTransaction: { box.add($0) }, onStatus: { _ in })
+            onTransaction: { box.add($0) }, onStatus: { _ in },
+            capabilities: AgentCaptureSource.nativeCapabilities)
         controller.start()
 
         let first = await waitUntil(30) { box.count > 0 }

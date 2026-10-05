@@ -47,6 +47,9 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
     /// companion capture source streams from. Read reactively (via `companions.devices`) — no polling.
     let companions: CompanionRegistry?
     private var companion: CompanionHub? { companions?.hub }
+
+    /// The shared response-override library — a reference to the one owner, never a copy.
+    let overrides: OverridesModel?
     private var current: CaptureSource?
     private var indexByID: [UUID: Int] = [:]
     private let bodyCache: NetworkBodyCache?
@@ -149,20 +152,79 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
 
     var hostAddress: String { ProxyConfigurator.hostAddress(for: device) }
 
+    /// The rows the list shows, **cached**.
+    ///
+    /// `body` reads this more than once per pass (the empty check and the `ForEach`) and SwiftUI
+    /// re-runs `body` on every captured row, so the naive version was several case-insensitive
+    /// scans of the whole capture per arriving transaction — cost that grows with the session and
+    /// pegs the main thread after a few minutes of real traffic. Appends extend the cached array
+    /// instead of rebuilding it; anything else (a new query, a time selection, a row rewritten in
+    /// place) falls back to a full pass.
     var filtered: [NetworkTransaction] {
-        let q = filterText
-        return transactions.filter { txn in
-            if let range = selectedTimeRange {
-                let end = txn.finishedAt ?? txn.startedAt
-                if txn.startedAt > range.upperBound || end < range.lowerBound { return false }
+        // Reading `transactions` — not just the cache — is what registers the observation
+        // dependency, so a new row still invalidates the view.
+        let all = transactions
+        let key = FilteredKey(stamp: filterStamp, count: all.count,
+                              text: filterText, range: selectedTimeRange)
+        if let cached = filteredCacheKey {
+            if cached == key { return filteredCache }
+            if cached.stamp == key.stamp, cached.text == key.text, cached.range == key.range,
+               key.count > cached.count {
+                for txn in all[cached.count...]
+                where Self.matches(txn, query: key.text, range: key.range) {
+                    filteredCache.append(txn)
+                }
+                filteredCacheKey = key
+                return filteredCache
             }
-            if q.isEmpty { return true }
-            return txn.url.range(of: q, options: .caseInsensitive) != nil
-                || txn.host.range(of: q, options: .caseInsensitive) != nil
-                || txn.method.range(of: q, options: .caseInsensitive) != nil
-                // Companion rows carry the owning app here, so the filter doubles as a package filter.
-                || txn.responseHeaders.contains { $0.name == "X-Jaca-App" && $0.value.range(of: q, options: .caseInsensitive) != nil }
         }
+        filteredCache = all.filter { Self.matches($0, query: key.text, range: key.range) }
+        filteredCacheKey = key
+        return filteredCache
+    }
+
+    /// Pure, so the list predicate can be tested without a session.
+    static func matches(_ txn: NetworkTransaction, query: String,
+                        range: ClosedRange<Date>?) -> Bool {
+        if let range {
+            let end = txn.finishedAt ?? txn.startedAt
+            if txn.startedAt > range.upperBound || end < range.lowerBound { return false }
+        }
+        if query.isEmpty { return true }
+        return txn.url.range(of: query, options: .caseInsensitive) != nil
+            || txn.host.range(of: query, options: .caseInsensitive) != nil
+            || txn.method.range(of: query, options: .caseInsensitive) != nil
+            // Companion rows carry the owning app here, so the filter doubles as a package filter.
+            || txn.responseHeaders.contains { $0.name == "X-Jaca-App" && $0.value.range(of: query, options: .caseInsensitive) != nil }
+    }
+
+    /// What the cached `filtered` was computed from. `stamp` covers every change an append
+    /// can't describe — a row rewritten in place, bodies spilled, a clear.
+    private struct FilteredKey: Equatable {
+        var stamp: UInt64
+        var count: Int
+        var text: String
+        var range: ClosedRange<Date>?
+    }
+
+    @ObservationIgnored private var filterStamp: UInt64 = 0
+    @ObservationIgnored private var filteredCache: [NetworkTransaction] = []
+    @ObservationIgnored private var filteredCacheKey: FilteredKey?
+
+    /// Call for any mutation of an existing row; appends must not, or the cache can never extend.
+    private func invalidateFilterCache() {
+        filterStamp &+= 1
+    }
+
+    /// The captured span, maintained as rows land instead of scanned per frame — the timeline
+    /// asked for `min`/`max` over every transaction on every redraw.
+    private(set) var earliestStart: Date?
+    private(set) var latestEnd: Date?
+
+    /// The timeline's x-axis domain, or nil before anything has been captured.
+    var timeSpan: ClosedRange<Date>? {
+        guard let earliestStart, let latestEnd else { return nil }
+        return earliestStart...max(latestEnd, earliestStart.addingTimeInterval(1))
     }
 
     var selected: NetworkTransaction? {
@@ -171,13 +233,126 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
     }
 
     init(device: Device, ca: CertificateAuthority, adbURL: URL?, displayName: String? = nil,
-         bodyCache: NetworkBodyCache? = nil, companions: CompanionRegistry? = nil) {
+         bodyCache: NetworkBodyCache? = nil, companions: CompanionRegistry? = nil,
+         overrides: OverridesModel? = nil) {
         self.device = device
         self.ca = ca
         self.adbURL = adbURL
         self.displayName = displayName ?? "Network · \(device.displayModel)"
         self.bodyCache = bodyCache
         self.companions = companions
+        self.overrides = overrides
+    }
+
+    /// Restarts the running capture source so it picks up a changed intercept configuration.
+    /// `makeContext()` snapshots the override services at launch, so a mid-capture toggle needs a
+    /// fresh source — re-selecting the same one keeps the captured rows.
+    func restartForInterceptChange() {
+        guard isRunning, let descriptor = currentDescriptor else { return }
+        current?.stop()
+        current = nil
+        attachState = .idle
+        let source = descriptor.make(makeContext())
+        current = source
+        source.start(into: self)
+    }
+
+    /// Whether the device still has a proxy configured, including the per-network
+    /// `global_http_proxy_*` rows a crashed session can strand — "connected, no internet".
+    private(set) var deviceProxyLingers = false
+    private(set) var isRevertingDeviceProxy = false
+
+    /// Checks for a stranded device proxy. Cheap, and only meaningful for an adb device.
+    func refreshDeviceProxyState() async {
+        guard let adbURL, isADBDevice else { deviceProxyLingers = false; return }
+        deviceProxyLingers = await ProxyConfigurator.hasAnyProxyConfigured(
+            adbURL: adbURL, serial: device.id)
+    }
+
+    /// Clears every proxy key and re-validates the network, so a stranded device is recoverable
+    /// without dropping to a shell.
+    func revertDeviceProxy() async {
+        guard let adbURL, isADBDevice, !isRevertingDeviceProxy else { return }
+        isRevertingDeviceProxy = true
+        JacaLog.info("proxy", "reverting device proxy on \(device.id)")
+        await ProxyConfigurator.clearAndroidProxy(adbURL: adbURL, serial: device.id)
+        ProxyCleanup.deregister(adbPath: adbURL.path, serial: device.id)
+        await refreshDeviceProxyState()
+        isRevertingDeviceProxy = false
+        JacaLog.info("proxy",
+            "device proxy revert finished on \(device.id); stillConfigured=\(deviceProxyLingers)")
+    }
+
+    /// This tab's arming target, when it's inspecting one app on one device.
+    var interceptTarget: InterceptTarget? {
+        guard let package = targetPackage, !package.isEmpty else { return nil }
+        return InterceptTarget(deviceID: device.id, package: package)
+    }
+
+    /// Whether this session wired up override services at launch — the toolbar must not claim
+    /// overrides are active when nothing was armed.
+    var interceptWired: Bool { current?.arming != nil }
+
+    /// What the *running* capture source can honour, via the same clamp the runtime uses — so
+    /// the toolbar tint and "can't run here" badge never promise what the transport won't do.
+    var activeInterceptCapabilities: InterceptCapabilities {
+        current?.interceptCapabilities ?? []
+    }
+
+    /// Whether any capture source is running. With none, the honest message is "start capture",
+    /// not "this rule can't run here".
+    var hasRunningSource: Bool { current != nil }
+
+    /// This tab's arming state, read from the one owner (`OverridesModel`) rather than copied.
+    /// Toolbar, popover, row badge and attach banner all render this value.
+    var armingState: InterceptArmingState {
+        guard let overrides, let target = interceptTarget else { return attachState }
+        let armed = overrides.arming(for: target)
+        // With overrides off nothing publishes, so `.idle` means "nobody is arming", not "fine"
+        // — fall back to what the source knows about the agent still being in the app.
+        if case .idle = armed { return attachState }
+        return armed
+    }
+
+    /// What the running source last reported about its agent. Separate from the coordinator's
+    /// arming state because it must survive response overrides being off (HTTPS debugging mode).
+    private(set) var attachState: InterceptArmingState = .idle
+
+    /// Whether to show the pane-top attach notice: the agent is gone but the tab still believes
+    /// it is capturing — the "armed and silently doing nothing" case.
+    ///
+    /// Gated on a running source, **not** on `interceptWired`: losing the agent kills capture
+    /// either way, and only the simulator supervisor produces `.detached`/`.waitingForApp`.
+    var showsAttachBanner: Bool {
+        guard isRunning else { return false }
+        switch armingState {
+        case .detached, .waitingForApp: return true
+        case .idle, .waitingForAgent, .agentTooOld, .active, .failed: return false
+        }
+    }
+
+    /// The attach banner's action. Only the iOS-Simulator source can put the agent back, and only
+    /// by relaunching the user's app — hence explicit, never automatic.
+    func relaunchToAttach() {
+        (current as? IOSSimulatorAgentCaptureSource)?.relaunchToAttach()
+    }
+
+    /// The interception point this tab is currently capturing through.
+    var interceptTransport: InterceptTransportID {
+        switch captureMode {
+        case .agent:
+            // Per platform, not a two-way ternary: a physical iOS device has no agent transport,
+            // and the ternary would have reported it as the Android agent.
+            switch device.platform {
+            case .android:      return .androidAgent(package: targetPackage ?? "")
+            case .iosSimulator: return .iosSimulatorAgent(bundleID: targetPackage ?? "")
+            case .iosDevice:    return .mitmProxy
+            }
+        case .companion:
+            return .companionMetadata
+        default:
+            return .mitmProxy
+        }
     }
 
     // MARK: - Source selection (generic)
@@ -231,6 +406,7 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
     private func launch(_ descriptor: CaptureSourceDescriptor) {
         guard !isRunning else { return }
         isRunning = true
+        attachState = .idle
         let source = descriptor.make(makeContext())
         current = source
         source.start(into: self)
@@ -238,13 +414,15 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
 
     private func makeContext() -> CaptureContext {
         CaptureContext(device: device, adbURL: adbURL, ca: ca, deviceContext: deviceContext,
-                       targetPackage: targetPackage, companion: companion)
+                       targetPackage: targetPackage, companion: companion,
+                       intercept: FeatureFlags.responseOverridesEnabled ? overrides?.services() : nil)
     }
 
     func stop() {
         guard isRunning else { return }
         isRunning = false
         proxyNeedsSetup = false
+        attachState = .idle
         current?.stop()
         current = nil
     }
@@ -272,6 +450,10 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
 
     func capture(didReceive transaction: NetworkTransaction) { upsert(transaction) }
     func capture(didChangeStatus status: String?) { statusMessage = status }
+
+    /// The source lost (or regained) its agent. Held here rather than in `OverridesModel`
+    /// because it's true whether or not overrides are wired — see `attachState`.
+    func capture(didChangeAttach state: InterceptArmingState) { attachState = state }
     func capture(didBindPort port: Int) { boundPort = port }
     func captureNeedsSetup() {
         if !caReady { proxyNeedsSetup = true }
@@ -291,45 +473,153 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
         indexByID.removeAll(keepingCapacity: true)
         selectedID = nil
         selectedTimeRange = nil
+        earliestStart = nil
+        latestEnd = nil
+        evictCursor = 0
+        pendingEvictBytes = 0
+        evictSoonTask?.cancel()
+        evictSoonTask = nil
+        invalidateFilterCache()
     }
 
     func upsert(_ txn: NetworkTransaction) {
         // First successfully MITM'd HTTPS request confirms the CA is trusted.
-        if txn.scheme == "https", txn.error == nil {
+        //
+        // Proof only when the bytes came back decrypted with our CA: a fabricated override never
+        // touched TLS and the agent never uses the CA, so counting either would dismiss the setup
+        // prompt for a user whose CA isn't installed. `== .proxy` was too narrow — companion
+        // capture decrypts through `ProxyServer` too, so its CA sheet never saw `caReady` flip.
+        if txn.scheme == "https", txn.error == nil, captureMode.decryptsWithOurCA, !wasOverridden(txn) {
             caReady = true
             proxyNeedsSetup = false
             caInstaller?.noteInterceptionConfirmed()
         }
+        noteSpan(txn)
         if let idx = indexByID[txn.id] {
             transactions[idx] = txn
+            invalidateFilterCache()
         } else {
             indexByID[txn.id] = transactions.count
             transactions.append(txn)
-            if transactions.count > bodiesInMemory {
-                evictBodies(at: transactions.count - bodiesInMemory - 1)
+            evictBodiesIfBacklogged()
+        }
+    }
+
+    /// Keeps the timeline's domain up to date in O(1) per row.
+    private func noteSpan(_ txn: NetworkTransaction) {
+        if earliestStart == nil || txn.startedAt < earliestStart! { earliestStart = txn.startedAt }
+        let end = txn.finishedAt ?? txn.startedAt
+        if latestEnd == nil || end > latestEnd! { latestEnd = end }
+    }
+
+    /// Rows below this index have had their bodies spilled (or been considered for it).
+    @ObservationIgnored private var evictCursor = 0
+    /// Bytes still held by rows that have fallen out of the in-memory window.
+    @ObservationIgnored private var pendingEvictBytes = 0
+    @ObservationIgnored private var evictSoonTask: Task<Void, Never>?
+    /// Spill in chunks, never one row at a time. Each spill rewrites rows in place, which
+    /// re-renders the list and rebuilds the `filtered` cache — paying that per captured request
+    /// doubled a busy capture's observable churn for no benefit.
+    private let evictBatch = 200
+    /// …but a chunk must never be allowed to hold much memory, which is the point of evicting.
+    /// Whichever ceiling is hit first wins.
+    private let evictByteBudget = 2 * 1024 * 1024
+
+    private func evictBodiesIfBacklogged() {
+        guard bodyCache != nil else { return }
+        let limit = transactions.count - bodiesInMemory
+        guard limit > evictCursor else { return }
+        // Exactly one row falls out of the window per append once past it, so the running total
+        // needs no scan.
+        let newlyEligible = limit - 1
+        if newlyEligible >= 0, newlyEligible < transactions.count {
+            pendingEvictBytes += (transactions[newlyEligible].requestBody?.count ?? 0)
+                + (transactions[newlyEligible].responseBody?.count ?? 0)
+        }
+        if limit - evictCursor >= evictBatch || pendingEvictBytes >= evictByteBudget {
+            evictBodies(upTo: limit)
+            return
+        }
+        scheduleTrailingEviction()
+    }
+
+    /// Drains a backlog too small to trigger a batch, so a capture that goes quiet just over the
+    /// window still spills instead of holding those bodies for the life of the tab.
+    private func scheduleTrailingEviction() {
+        guard evictSoonTask == nil else { return }
+        evictSoonTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard let self else { return }
+            self.evictSoonTask = nil
+            guard !Task.isCancelled else { return }
+            self.evictBodies(upTo: self.transactions.count - self.bodiesInMemory)
+        }
+    }
+
+    private func evictBodies(upTo limit: Int) {
+        guard let cache = bodyCache, limit > evictCursor else { return }
+        var blobs: [(UUID, Data?, Data?)] = []
+        var stripped = false
+        for index in evictCursor..<min(limit, transactions.count) where !transactions[index].bodiesEvicted {
+            let txn = transactions[index]
+            guard txn.requestBody != nil || txn.responseBody != nil else {
+                transactions[index].bodiesEvicted = true
+                stripped = true
+                continue
             }
+            blobs.append((txn.id, txn.requestBody, txn.responseBody))
         }
-    }
-
-    private func evictBodies(at index: Int) {
-        guard let cache = bodyCache,
-              index >= 0, index < transactions.count, !transactions[index].bodiesEvicted else { return }
-        let txn = transactions[index]
-        guard txn.requestBody != nil || txn.responseBody != nil else {
-            transactions[index].bodiesEvicted = true; return
-        }
-        let id = txn.id, req = txn.requestBody, resp = txn.responseBody
+        evictCursor = min(limit, transactions.count)
+        pendingEvictBytes = 0
+        if stripped { invalidateFilterCache() }
+        guard !blobs.isEmpty else { return }
         Task {
-            await cache.save(id, req: req, resp: resp)
-            await MainActor.run { [weak self] in self?.stripBodies(id) }
+            for (id, req, resp) in blobs { await cache.save(id, req: req, resp: resp) }
+            await MainActor.run { [weak self] in self?.stripBodies(blobs.map(\.0)) }
         }
     }
 
-    private func stripBodies(_ id: UUID) {
-        guard let idx = indexByID[id] else { return }
-        transactions[idx].requestBody = nil
-        transactions[idx].responseBody = nil
-        transactions[idx].bodiesEvicted = true
+    /// One mutation for the whole batch, so the list re-renders once rather than per row.
+    private func stripBodies(_ ids: [UUID]) {
+        var changed = false
+        for id in ids {
+            guard let idx = indexByID[id] else { continue }
+            transactions[idx].requestBody = nil
+            transactions[idx].responseBody = nil
+            transactions[idx].bodiesEvicted = true
+            changed = true
+        }
+        if changed { invalidateFilterCache() }
+    }
+
+    /// True when a rule produced this response, so it says nothing about the network it never
+    /// reached. Read from the stamp the pipeline leaves.
+    private func wasOverridden(_ txn: NetworkTransaction) -> Bool {
+        txn.responseHeaders.contains { $0.name.lowercased() == JacaHeaders.override.lowercased() }
+    }
+
+    /// The currently selected transaction, if any.
+    var selectedTransaction: NetworkTransaction? {
+        guard let selectedID, let idx = indexByID[selectedID] else { return nil }
+        return transactions[idx]
+    }
+
+    /// Loads a transaction's bodies, **awaiting** the spill cache when they've been evicted.
+    /// `ensureBodies(for:)` is fire-and-forget, which seeding can't use: the sheet must copy the
+    /// body now, since `NetworkBodyCache` wipes its directory on every launch.
+    func bodies(for id: UUID) async -> (req: Data?, resp: Data?) {
+        guard let idx = indexByID[id] else { return (nil, nil) }
+        let txn = transactions[idx]
+        if !txn.bodiesEvicted || bodyCache == nil { return (txn.requestBody, txn.responseBody) }
+        guard let cache = bodyCache else { return (txn.requestBody, txn.responseBody) }
+        let loaded = await cache.load(id)
+        if let i = indexByID[id] {
+            transactions[i].requestBody = loaded.req
+            transactions[i].responseBody = loaded.resp
+            transactions[i].bodiesEvicted = false
+            invalidateFilterCache()
+        }
+        return (loaded.req, loaded.resp)
     }
 
     func ensureBodies(for id: UUID) {
@@ -343,6 +633,7 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
                 self.transactions[i].requestBody = bodies.req
                 self.transactions[i].responseBody = bodies.resp
                 self.transactions[i].bodiesEvicted = false
+                self.invalidateFilterCache()
             }
         }
     }
