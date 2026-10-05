@@ -277,7 +277,9 @@ struct NetworkSessionView: View {
             )
             .frame(maxWidth: 360)
 
-            OverridesToolbarButton(session: session)
+            // The editor is presented here, on the main window, for both entry points: see
+            // `OverridesPopover.onEdit`.
+            OverridesToolbarButton(session: session, onEdit: { editingOverride = $0 })
 
             Spacer()
 

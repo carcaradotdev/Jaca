@@ -6,6 +6,8 @@ import Lemonade
 /// called yet. Chrome matches `NetworkAppPicker`.
 struct OverridesToolbarButton: View {
     @Bindable var session: NetworkSession
+    /// Opens the editor from the network tab, which owns its presentation; see `OverridesPopover.onEdit`.
+    let onEdit: (OverrideDraft) -> Void
     @State private var showPopover = false
 
     private var overrides: OverridesModel? { session.overrides }
@@ -44,7 +46,12 @@ struct OverridesToolbarButton: View {
             .accessibilityIdentifier("netOverridesButton")
             .animation(.easeInOut(duration: 0.2), value: phase)
             .popover(isPresented: $showPopover, arrowEdge: .bottom) {
-                OverridesPopover(session: session, overrides: overrides)
+                OverridesPopover(session: session, overrides: overrides, onEdit: { draft in
+                    // Close the popover first, and present on the next turn of the run loop, so the
+                    // sheet never overlaps a popover that's still on its way out.
+                    showPopover = false
+                    DispatchQueue.main.async { onEdit(draft) }
+                })
             }
         }
     }

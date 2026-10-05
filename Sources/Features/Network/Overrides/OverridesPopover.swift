@@ -9,8 +9,11 @@ import Lemonade
 struct OverridesPopover: View {
     @Bindable var session: NetworkSession
     @Bindable var overrides: OverridesModel
-
-    @State private var editing: OverrideDraft?
+    /// Asks the network tab to open the editor. The popover doesn't present it itself: a sheet
+    /// attached to a popover's window doesn't block the main window, and clicking the main window
+    /// closes the popover out from under the sheet — after which dismissing the editor left its
+    /// dimming layer stuck over the window.
+    let onEdit: (OverrideDraft) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -29,18 +32,6 @@ struct OverridesPopover: View {
         .frame(width: 380)
         .background(LemonadeTheme.colors.background.bgDefault)
         .task { await session.refreshDeviceProxyState() }
-        .sheet(item: $editing) { draft in
-            OverrideEditorSheet(
-                rule: draft.rule,
-                session: session,
-                overrides: overrides,
-                isNew: draft.isNew,
-                // `save` adds or updates: calling `update` here discarded every new rule.
-                onSave: { saved in
-                    withAnimation(.easeInOut(duration: 0.28)) { overrides.save(saved) }
-                }
-            )
-        }
     }
 
     // MARK: - Header
@@ -79,7 +70,7 @@ struct OverridesPopover: View {
                                 overrides.setEnabled(enabled, for: rule.id)
                             }
                         },
-                        onEdit: { editing = .existing(rule) },
+                        onEdit: { onEdit(.existing(rule)) },
                         onMoveUp: index > 0 ? {
                             withAnimation(.easeInOut(duration: 0.2)) { overrides.move(rule.id, by: -1) }
                         } : nil,
@@ -131,7 +122,7 @@ struct OverridesPopover: View {
     private var footer: some View {
         VStack(alignment: .leading, spacing: LemonadeTheme.spaces.spacing200) {
             LemonadeUi.Button(label: "New override",
-                              onClick: { editing = .new(OverrideEditorSheet.blankRule(seedHost: seedHost)) },
+                              onClick: { onEdit(.new(OverrideEditorSheet.blankRule(seedHost: seedHost))) },
                               leadingIcon: .plus, variant: .neutral, type: .subtle, size: .small)
 
             // The visible teardown + blast-radius contract: exactly what is running, and where.
