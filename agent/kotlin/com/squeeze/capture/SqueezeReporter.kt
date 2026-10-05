@@ -83,10 +83,10 @@ object SqueezeReporter {
                     if (line.isNotBlank()) handleControl(line)
                 }
             } catch (e: Exception) {
-                Log.i(TAG, "control reader ended: $e")
+                Log.d(TAG, "control reader ended: $e")
             } finally {
                 Divert.disarm()
-                Log.i(TAG, "host disconnected — divert disarmed")
+                Log.d(TAG, "host disconnected — divert disarmed")
             }
         }, "squeeze-control").apply { isDaemon = true; start() }
     }
@@ -105,7 +105,7 @@ object SqueezeReporter {
                         arr.optString(i)?.lowercase()?.takeIf { it.isNotEmpty() }?.let { hosts.add(it) }
                     }
                     Divert.configure(origin, hosts, o.optInt("heartbeatSeconds", 15))
-                    Log.i(TAG, "divert configured: origin=$origin hosts=$hosts")
+                    Log.d(TAG, "divert configured: origin=$origin hosts=$hosts")
                 }
                 "ping" -> Divert.touch()
                 else -> { /* forward-compatible: ignore */ }

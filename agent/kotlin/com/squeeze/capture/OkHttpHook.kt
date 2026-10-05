@@ -266,7 +266,7 @@ object OkHttpHook {
                 bCls.getMethod("header", String::class.java, String::class.java)
                     .invoke(builder, Divert.ORIGINAL_URL_HEADER, url)
                 val diverted = invokeUnwrapped { bCls.getMethod("build").invoke(builder) }
-                Log.i(TAG, "divert: $url -> $target")
+                Log.d(TAG, "divert: $url -> $target")
                 diverted
             } catch (t: Throwable) {
                 Log.e(TAG, "divert failed; proceeding with the original request", t)
