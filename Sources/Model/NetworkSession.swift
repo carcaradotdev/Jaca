@@ -152,20 +152,79 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
 
     var hostAddress: String { ProxyConfigurator.hostAddress(for: device) }
 
+    /// The rows the list shows, **cached**.
+    ///
+    /// `body` reads this more than once per pass (the empty check and the `ForEach`) and SwiftUI
+    /// re-runs `body` on every captured row, so the naive version was several case-insensitive
+    /// scans of the whole capture per arriving transaction — cost that grows with the session and
+    /// pegs the main thread after a few minutes of real traffic. Appends extend the cached array
+    /// instead of rebuilding it; anything else (a new query, a time selection, a row rewritten in
+    /// place) falls back to a full pass.
     var filtered: [NetworkTransaction] {
-        let q = filterText
-        return transactions.filter { txn in
-            if let range = selectedTimeRange {
-                let end = txn.finishedAt ?? txn.startedAt
-                if txn.startedAt > range.upperBound || end < range.lowerBound { return false }
+        // Reading `transactions` — not just the cache — is what registers the observation
+        // dependency, so a new row still invalidates the view.
+        let all = transactions
+        let key = FilteredKey(stamp: filterStamp, count: all.count,
+                              text: filterText, range: selectedTimeRange)
+        if let cached = filteredCacheKey {
+            if cached == key { return filteredCache }
+            if cached.stamp == key.stamp, cached.text == key.text, cached.range == key.range,
+               key.count > cached.count {
+                for txn in all[cached.count...]
+                where Self.matches(txn, query: key.text, range: key.range) {
+                    filteredCache.append(txn)
+                }
+                filteredCacheKey = key
+                return filteredCache
             }
-            if q.isEmpty { return true }
-            return txn.url.range(of: q, options: .caseInsensitive) != nil
-                || txn.host.range(of: q, options: .caseInsensitive) != nil
-                || txn.method.range(of: q, options: .caseInsensitive) != nil
-                // Companion rows carry the owning app here, so the filter doubles as a package filter.
-                || txn.responseHeaders.contains { $0.name == "X-Jaca-App" && $0.value.range(of: q, options: .caseInsensitive) != nil }
         }
+        filteredCache = all.filter { Self.matches($0, query: key.text, range: key.range) }
+        filteredCacheKey = key
+        return filteredCache
+    }
+
+    /// Pure, so the list predicate can be tested without a session.
+    static func matches(_ txn: NetworkTransaction, query: String,
+                        range: ClosedRange<Date>?) -> Bool {
+        if let range {
+            let end = txn.finishedAt ?? txn.startedAt
+            if txn.startedAt > range.upperBound || end < range.lowerBound { return false }
+        }
+        if query.isEmpty { return true }
+        return txn.url.range(of: query, options: .caseInsensitive) != nil
+            || txn.host.range(of: query, options: .caseInsensitive) != nil
+            || txn.method.range(of: query, options: .caseInsensitive) != nil
+            // Companion rows carry the owning app here, so the filter doubles as a package filter.
+            || txn.responseHeaders.contains { $0.name == "X-Jaca-App" && $0.value.range(of: query, options: .caseInsensitive) != nil }
+    }
+
+    /// What the cached `filtered` was computed from. `stamp` covers every change an append
+    /// can't describe — a row rewritten in place, bodies spilled, a clear.
+    private struct FilteredKey: Equatable {
+        var stamp: UInt64
+        var count: Int
+        var text: String
+        var range: ClosedRange<Date>?
+    }
+
+    @ObservationIgnored private var filterStamp: UInt64 = 0
+    @ObservationIgnored private var filteredCache: [NetworkTransaction] = []
+    @ObservationIgnored private var filteredCacheKey: FilteredKey?
+
+    /// Call for any mutation of an existing row; appends must not, or the cache can never extend.
+    private func invalidateFilterCache() {
+        filterStamp &+= 1
+    }
+
+    /// The captured span, maintained as rows land instead of scanned per frame — the timeline
+    /// asked for `min`/`max` over every transaction on every redraw.
+    private(set) var earliestStart: Date?
+    private(set) var latestEnd: Date?
+
+    /// The timeline's x-axis domain, or nil before anything has been captured.
+    var timeSpan: ClosedRange<Date>? {
+        guard let earliestStart, let latestEnd else { return nil }
+        return earliestStart...max(latestEnd, earliestStart.addingTimeInterval(1))
     }
 
     var selected: NetworkTransaction? {
@@ -410,6 +469,13 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
         indexByID.removeAll(keepingCapacity: true)
         selectedID = nil
         selectedTimeRange = nil
+        earliestStart = nil
+        latestEnd = nil
+        evictCursor = 0
+        pendingEvictBytes = 0
+        evictSoonTask?.cancel()
+        evictSoonTask = nil
+        invalidateFilterCache()
     }
 
     func upsert(_ txn: NetworkTransaction) {
@@ -424,36 +490,102 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
             proxyNeedsSetup = false
             caInstaller?.noteInterceptionConfirmed()
         }
+        noteSpan(txn)
         if let idx = indexByID[txn.id] {
             transactions[idx] = txn
+            invalidateFilterCache()
         } else {
             indexByID[txn.id] = transactions.count
             transactions.append(txn)
-            if transactions.count > bodiesInMemory {
-                evictBodies(at: transactions.count - bodiesInMemory - 1)
+            evictBodiesIfBacklogged()
+        }
+    }
+
+    /// Keeps the timeline's domain up to date in O(1) per row.
+    private func noteSpan(_ txn: NetworkTransaction) {
+        if earliestStart == nil || txn.startedAt < earliestStart! { earliestStart = txn.startedAt }
+        let end = txn.finishedAt ?? txn.startedAt
+        if latestEnd == nil || end > latestEnd! { latestEnd = end }
+    }
+
+    /// Rows below this index have had their bodies spilled (or been considered for it).
+    @ObservationIgnored private var evictCursor = 0
+    /// Bytes still held by rows that have fallen out of the in-memory window.
+    @ObservationIgnored private var pendingEvictBytes = 0
+    @ObservationIgnored private var evictSoonTask: Task<Void, Never>?
+    /// Spill in chunks, never one row at a time. Each spill rewrites rows in place, which
+    /// re-renders the list and rebuilds the `filtered` cache — paying that per captured request
+    /// doubled a busy capture's observable churn for no benefit.
+    private let evictBatch = 200
+    /// …but a chunk must never be allowed to hold much memory, which is the point of evicting.
+    /// Whichever ceiling is hit first wins.
+    private let evictByteBudget = 2 * 1024 * 1024
+
+    private func evictBodiesIfBacklogged() {
+        guard bodyCache != nil else { return }
+        let limit = transactions.count - bodiesInMemory
+        guard limit > evictCursor else { return }
+        // Exactly one row falls out of the window per append once past it, so the running total
+        // needs no scan.
+        let newlyEligible = limit - 1
+        if newlyEligible >= 0, newlyEligible < transactions.count {
+            pendingEvictBytes += (transactions[newlyEligible].requestBody?.count ?? 0)
+                + (transactions[newlyEligible].responseBody?.count ?? 0)
+        }
+        if limit - evictCursor >= evictBatch || pendingEvictBytes >= evictByteBudget {
+            evictBodies(upTo: limit)
+            return
+        }
+        scheduleTrailingEviction()
+    }
+
+    /// Drains a backlog too small to trigger a batch, so a capture that goes quiet just over the
+    /// window still spills instead of holding those bodies for the life of the tab.
+    private func scheduleTrailingEviction() {
+        guard evictSoonTask == nil else { return }
+        evictSoonTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard let self else { return }
+            self.evictSoonTask = nil
+            guard !Task.isCancelled else { return }
+            self.evictBodies(upTo: self.transactions.count - self.bodiesInMemory)
+        }
+    }
+
+    private func evictBodies(upTo limit: Int) {
+        guard let cache = bodyCache, limit > evictCursor else { return }
+        var blobs: [(UUID, Data?, Data?)] = []
+        var stripped = false
+        for index in evictCursor..<min(limit, transactions.count) where !transactions[index].bodiesEvicted {
+            let txn = transactions[index]
+            guard txn.requestBody != nil || txn.responseBody != nil else {
+                transactions[index].bodiesEvicted = true
+                stripped = true
+                continue
             }
+            blobs.append((txn.id, txn.requestBody, txn.responseBody))
         }
-    }
-
-    private func evictBodies(at index: Int) {
-        guard let cache = bodyCache,
-              index >= 0, index < transactions.count, !transactions[index].bodiesEvicted else { return }
-        let txn = transactions[index]
-        guard txn.requestBody != nil || txn.responseBody != nil else {
-            transactions[index].bodiesEvicted = true; return
-        }
-        let id = txn.id, req = txn.requestBody, resp = txn.responseBody
+        evictCursor = min(limit, transactions.count)
+        pendingEvictBytes = 0
+        if stripped { invalidateFilterCache() }
+        guard !blobs.isEmpty else { return }
         Task {
-            await cache.save(id, req: req, resp: resp)
-            await MainActor.run { [weak self] in self?.stripBodies(id) }
+            for (id, req, resp) in blobs { await cache.save(id, req: req, resp: resp) }
+            await MainActor.run { [weak self] in self?.stripBodies(blobs.map(\.0)) }
         }
     }
 
-    private func stripBodies(_ id: UUID) {
-        guard let idx = indexByID[id] else { return }
-        transactions[idx].requestBody = nil
-        transactions[idx].responseBody = nil
-        transactions[idx].bodiesEvicted = true
+    /// One mutation for the whole batch, so the list re-renders once rather than per row.
+    private func stripBodies(_ ids: [UUID]) {
+        var changed = false
+        for id in ids {
+            guard let idx = indexByID[id] else { continue }
+            transactions[idx].requestBody = nil
+            transactions[idx].responseBody = nil
+            transactions[idx].bodiesEvicted = true
+            changed = true
+        }
+        if changed { invalidateFilterCache() }
     }
 
     /// True when a rule produced this response, so it says nothing about the network it never
@@ -481,6 +613,7 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
             transactions[i].requestBody = loaded.req
             transactions[i].responseBody = loaded.resp
             transactions[i].bodiesEvicted = false
+            invalidateFilterCache()
         }
         return (loaded.req, loaded.resp)
     }
@@ -496,6 +629,7 @@ final class NetworkSession: WorkspaceTab, CaptureSink {
                 self.transactions[i].requestBody = bodies.req
                 self.transactions[i].responseBody = bodies.resp
                 self.transactions[i].bodiesEvicted = false
+                self.invalidateFilterCache()
             }
         }
     }

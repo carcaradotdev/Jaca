@@ -97,7 +97,12 @@ final class AgentLineChannel: AgentControlWriter, @unchecked Sendable {
             return true
         }
         guard adopted else { Darwin.close(s); return nil }
-        startThread { [weak self] in self?.acceptLoop(listener: s) }
+        // Closes the listener if the channel died before the thread ran: `[weak self]` alone
+        // leaks the fd, and a leaked listening socket keeps the port claimed for the process.
+        startThread { [weak self] in
+            guard let self else { Darwin.close(s); return }
+            self.acceptLoop(listener: s)
+        }
         return UInt16(bigEndian: addr.sin_port)
     }
 
@@ -229,6 +234,10 @@ final class AgentLineChannel: AgentControlWriter, @unchecked Sendable {
         var sawBytes = false
         while !isStopped {
             let n = Darwin.recv(fd, &chunk, chunk.count, 0)
+            // `EINTR` is not EOF. Reading it as one dropped a live agent's socket, which the
+            // supervisor then answers with a `simctl` probe cycle — and, if the user has
+            // auto-reattach on, by relaunching their app underneath them.
+            if n < 0 && errno == EINTR { continue }
             if n <= 0 { break }
             if !sawBytes {
                 sawBytes = true

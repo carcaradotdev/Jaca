@@ -4,8 +4,15 @@ import Foundation
 enum AgentTransactionParser {
     static func parse(_ line: String) -> NetworkTransaction? {
         guard let data = line.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              (obj["type"] as? String) == "txn" else { return nil }
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return parse(object: obj)
+    }
+
+    /// The same parse from an already-decoded frame, so a caller that had to decode the line to
+    /// classify it doesn't pay for a second decode per transaction.
+    static func parse(object obj: [String: Any]) -> NetworkTransaction? {
+        guard (obj["type"] as? String) == "txn" else { return nil }
 
         let url = obj["url"] as? String ?? ""
         let comps = URLComponents(string: url)

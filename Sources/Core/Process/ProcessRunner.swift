@@ -126,18 +126,23 @@ final class StreamingProcess: @unchecked Sendable {
         }
 
         stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            guard let self else { return }
             let data = handle.availableData
-            if data.isEmpty { return }
-            self.consumeStdout(data)
+            // **Empty means EOF, and EOF must clear the handler.** A pipe whose writer is gone
+            // stays permanently readable, so a handler that merely returns is re-invoked as fast
+            // as the CPU allows — a measured ~2M calls/second, i.e. a whole core burnt, for as
+            // long as the handle lives. Relying on `terminationHandler` to clear it isn't enough:
+            // it lands milliseconds later at best, and never at all once this object is gone
+            // (the dispatch source outlives it, keeping the closure and the fd alive). Clearing
+            // here is unconditional and happens before the `self` check for exactly that reason.
+            if data.isEmpty { handle.readabilityHandler = nil; return }
+            self?.consumeStdout(data)
         }
 
         if let onStderrLine {
             stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                guard let self else { return }
                 let data = handle.availableData
-                if data.isEmpty { return }
-                self.consumeStderr(data, sink: onStderrLine)
+                if data.isEmpty { handle.readabilityHandler = nil; return }
+                self?.consumeStderr(data, sink: onStderrLine)
             }
         }
 
@@ -193,10 +198,19 @@ final class StreamingProcess: @unchecked Sendable {
         let cont = continuation
         continuation = nil
         lock.unlock()
-        guard cont != nil else { return }
+        // Cleared before the continuation check, not after: a second `finish()` (stop() racing
+        // terminationHandler) must still be able to take a handler down. Leaving one installed
+        // is not a leaked object — it is a dispatch source spinning on EOF forever.
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
         stderrPipe.fileHandleForReading.readabilityHandler = nil
         cont?.finish()
+    }
+
+    /// Belt-and-braces: an owner released without `stop()` would otherwise leave the pipes'
+    /// dispatch sources alive, and they spin at EOF (see `start`).
+    deinit {
+        stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
     }
 
     /// Splits complete `\n`-terminated lines out of `buffer`, leaving any partial

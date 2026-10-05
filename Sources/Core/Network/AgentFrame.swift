@@ -15,7 +15,9 @@ enum AgentFrame: Equatable {
               let type = obj["type"] as? String else { return .unrecognised(line) }
         switch type {
         case "txn":
-            guard let txn = AgentTransactionParser.parse(line) else { return .unrecognised(line) }
+            // Handed the object we already decoded: re-parsing the line was a second full JSON
+            // decode of every captured transaction, on the reader thread, for nothing.
+            guard let txn = AgentTransactionParser.parse(object: obj) else { return .unrecognised(line) }
             return .transaction(txn)
         case "hello":
             let caps = (obj["caps"] as? [Any])?.compactMap { $0 as? String } ?? []
