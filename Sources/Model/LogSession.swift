@@ -435,9 +435,9 @@ final class LogSession: WorkspaceTab {
                 $0.pids = package.isEmpty ? nil : []
                 $0.processNameQuery = ""
             case .iosDevice:
-                // The structured (LoggingSupport) source narrows to the targeted app's
-                // process itself, so no per-line LogFilter process query is needed; the
-                // label is the app's process/display name.
+                // The *source itself* is swapped per target (whole-device passive stream
+                // vs. devicectl-console launch of the bundle), so no per-line LogFilter
+                // process query is needed. The label is the app's bundle id.
                 $0.processNameQuery = ""
                 $0.pids = nil
             }
@@ -447,11 +447,11 @@ final class LogSession: WorkspaceTab {
         restartPrimaryForTargetChange()
     }
 
-    /// Physical iOS re-scopes its *primary* structured source when the targeted app
-    /// changes (unlike Android/simulator, which keep one source and filter/launch-console
-    /// on top): an empty target streams the whole device, a name scopes to that app's
-    /// process. Stopping the current source lets the reconnect loop respawn with the new
-    /// scope; the source emits its own "▶︎ structured device logs (…)" marker.
+    /// Physical iOS swaps its *primary* source when the targeted app changes (unlike
+    /// Android/simulator, which keep one source and filter on top): an empty target →
+    /// whole-device passive LoggingSupport stream; a bundle id → a devicectl-console
+    /// launch of that app (un-redacted os_log + print()). Stopping the current source
+    /// lets the reconnect loop respawn the right one; each source emits its own marker.
     private func restartPrimaryForTargetChange() {
         guard isRunning, device.platform == .iosDevice else { return }
         swappingSource = true

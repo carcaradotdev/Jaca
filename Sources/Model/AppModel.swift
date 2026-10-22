@@ -386,12 +386,19 @@ final class AppModel {
             case .android: return adb.map { AndroidLogSource(adbURL: $0, serial: device.id) }
             case .iosSimulator: return SimulatorLogSource(udid: device.id)
             case .iosDevice:
-                // Structured logs (level · subsystem · category) via Apple's private
-                // LoggingSupport engine (OSActivityStream) — the Xcode/Console-grade
-                // stream. `bundleID` here is the selected app's process/display name and
-                // narrows the whole-device stream to that app (empty = whole device).
-                // Falls back to idevicesyslog internally if the private API is unavailable.
-                return IOSDeviceOSLogSource(udid: device.id, processFilter: bundleID)
+                // Whole device → passive structured stream via Apple's LoggingSupport
+                // engine (real level · subsystem · category, no app launch); falls back to
+                // idevicesyslog internally if the private API is unavailable. Its catch:
+                // private os_log args arrive as <private> (the relay redacts them).
+                //
+                // A targeted app → launch it under devicectl's console with
+                // OS_ACTIVITY_DT_MODE=enable, which mirrors that app's os_log **un-redacted**
+                // plus print()/stdout — the Xcode-console experience, scoped to the app.
+                // `bundleID` is the app's bundle id (launching is by bundle id, so it
+                // re-launches the app each time capture starts, by design).
+                return bundleID.isEmpty
+                    ? IOSDeviceOSLogSource(udid: device.id, processFilter: nil)
+                    : IOSDeviceConsoleLogSource(udid: device.id, bundleID: bundleID)
             }
         }
         // Simulators can additionally stream the targeted app's stdout (`print()`),
