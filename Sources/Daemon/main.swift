@@ -161,6 +161,7 @@ case "serve":
             // on quit); a SIGKILLed daemon is reconciled on the next start instead.
             AdbTunnelCleanup.revertAll()
             ProxyCleanup.revertAll()
+            MacSystemProxyCleanup.revertAll()
             exit(0)
         }
         // Before anything binds or spawns, so an early SIGTERM still runs the cleanup in `onStop`.
@@ -176,6 +177,14 @@ case "serve":
             // Before listening: a client reconnecting the moment the socket appears must find
             // every area's methods registered.
             DaemonAreas.install(on: server)
+            // After `prepare`, which takes the lock, so no other jacad reconciles at the same
+            // time; before `listen`, so no capture arms a device that still holds a proxy that
+            // a killed Jaca process left behind.
+            let adb = AndroidToolchain.adbURL(override: JacaDefaults.shared.string(forKey: DevicesEngine.adbPathKey))
+            let reverted = await DeviceProxyLedger.reconcileOrphans(adbPath: adb?.path)
+            if !reverted.isEmpty { DaemonLog.info("reverted stranded device proxies on \(reverted.joined(separator: ", "))") }
+            let macReverted = await MacSystemProxy.shared.reconcileOrphan()
+            if macReverted > 0 { DaemonLog.info("reverted \(macReverted) stranded Mac system proxy settings") }
             try server.listen()
         } catch DaemonServer.StartError.alreadyRunning {
             DaemonLog.info("another jacad holds the lock; exiting")

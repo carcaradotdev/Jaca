@@ -105,6 +105,7 @@ enum TerminationCleanup {
             signal(sig) { received in
                 AdbTunnelCleanup.revertAll()
                 ProxyCleanup.revertAll()
+                MacSystemProxyCleanup.revertAll()
                 signal(received, SIG_DFL)
                 raise(received)
             }

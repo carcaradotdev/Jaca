@@ -25,17 +25,25 @@ final class UpstreamClient: @unchecked Sendable {
     private let session: URLSession
 
     init() {
+        session = URLSession(configuration: Self.makeConfiguration())
+    }
+
+    /// The session configuration. It goes direct: an empty `connectionProxyDictionary` makes
+    /// URLSession ignore the Mac system proxy. While Jaca sets that proxy for the iOS Simulator,
+    /// the system proxy is Jaca's own `ProxyServer`, so the default would send each upstream
+    /// request back into the proxy in a loop.
+    static func makeConfiguration() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         config.httpShouldUsePipelining = false
-        config.connectionProxyDictionary = [:]   // go direct; never recurse through a system proxy
+        config.connectionProxyDictionary = [:]
         config.timeoutIntervalForRequest = 60
         // The client keeps its own cookies and sends them in the request. A jar here would add
         // cookies the client never sent and keep ones it deleted.
         config.httpShouldSetCookies = false
         config.httpCookieAcceptPolicy = .never
         config.httpCookieStorage = nil
-        session = URLSession(configuration: config)
+        return config
     }
 
     /// Lets the connection pool and its threads go once the capture session that owns this client

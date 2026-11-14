@@ -59,7 +59,15 @@ extension DaemonSchema {
         "proxyNeedsSetup": .boolean, "caReady": .boolean, "selectedSourceID": .string,
         "hasSelectedMode": .boolean, "targetPackage": .string, "attachState": .interceptArmingState,
         "interceptWired": .boolean, "interceptCapabilities": .integer, "hasRunningSource": .boolean,
+        "offeredSourceIDs": .array(.string),
     ])
+
+    /// `network.mode`, the method and the retained topic.
+    static let networkMode = DaemonSchema.object(["mode": .enumeration(["agent", "mitm"]), "switching": .boolean])
+
+    static let networkInstallCAResult = DaemonSchema.object(
+        ["outcome": .enumeration(["installed", "needsUser", "failed"])],
+        optional: ["message": .string, "rebootAdvised": .boolean])
 
     static let networkSession = DaemonSchema.object(["id": .uuid, "device": .device], optional: [
         "name": .string, "state": .networkCaptureState, "transactionCount": .integer,

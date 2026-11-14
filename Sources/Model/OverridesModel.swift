@@ -48,7 +48,7 @@ final class OverridesModel {
 
     private let daemon: DaemonConnector
     /// Whether the runtime lives in `jacad` (network capture runs there). Follows
-    /// `DaemonConnector.networkRunsInDaemon`, and changes with it (`setRuntime(inDaemon:)`).
+    /// `DaemonConnector.networkRunsInDaemon` only, which the inspection mode doesn't change.
     private(set) var usesDaemon: Bool
     private var localEngine: OverridesEngine?
     private var daemonWatch: Task<Void, Never>?
@@ -63,9 +63,10 @@ final class OverridesModel {
         if usesDaemon { watchDaemon() } else { startLocalEngine() }
     }
 
-    /// Moves the runtime between this process and `jacad` when network capture moves (the HTTPS
-    /// decryption setting changed). The side giving it up stops publishing; the daemon re-reads
-    /// the library when it takes over, since the app may have edited it meanwhile.
+    /// Moves the runtime between this process and `jacad`. The app no longer calls it, because
+    /// `networkRunsInDaemon` is fixed for the run; the tests use it to check a handover. The side
+    /// giving it up stops publishing; the daemon re-reads the library when it takes over, since
+    /// the app may have edited it meanwhile.
     func setRuntime(inDaemon: Bool) {
         guard inDaemon != usesDaemon else { return }
         usesDaemon = inDaemon
@@ -283,21 +284,34 @@ final class OverridesModel {
     /// Rules that would match this request but can't run on the given transport — the "matches
     /// but can't run here" state, computed by the same clamp the runtime uses.
     func blockedReason(forURL url: String, method: String,
-                       transport: InterceptTransportID,
+                       transport: InterceptTransportID, deviceID: String? = nil,
                        capabilities: InterceptCapabilities) -> InterceptSkipReason? {
         guard let facts = OverrideMatching.facts(url: url) else { return nil }
-        guard let matched = compiled.firstMatch(facts: facts, method: method,
-                                                deviceID: nil, appID: nil) else { return nil }
+        guard let matched = compiled.firstMatch(
+            facts: facts, method: method, deviceID: nil, appID: nil,
+            transport: Self.hostFilterTransport(transport, deviceID: deviceID)) else { return nil }
         let (_, skip) = OverrideMatching.decide(matched, transport: transport,
                                                 capabilities: capabilities,
                                                 masterEnabled: masterEnabled)
         return skip
     }
 
-    /// Whether an enabled rule matches this request at all (regardless of transport).
-    func matchingRule(forURL url: String, method: String) -> OverrideRule? {
+    /// Whether an enabled rule matches this request. With a `transport`, the rule must also
+    /// pass the routed-host filter the runtime applies there (`OverrideHostFilter`), so the row
+    /// never claims a rule that the MITM proxy would skip.
+    func matchingRule(forURL url: String, method: String, transport: InterceptTransportID? = nil,
+                      deviceID: String? = nil) -> OverrideRule? {
         guard let facts = OverrideMatching.facts(url: url) else { return nil }
-        return compiled.firstMatch(facts: facts, method: method, deviceID: nil, appID: nil)?.rule
+        return compiled.firstMatch(facts: facts, method: method, deviceID: nil, appID: nil,
+                                   transport: Self.hostFilterTransport(transport, deviceID: deviceID))?.rule
+    }
+
+    /// The transport to hand `firstMatch` so it filters by host as the runtime does for
+    /// `deviceID`. The rules are matched without a device scope here, so the device only
+    /// decides whether the filter runs (This Mac's browser capture has none).
+    nonisolated static func hostFilterTransport(_ transport: InterceptTransportID?, deviceID: String?) -> InterceptTransportID? {
+        guard let transport else { return nil }
+        return OverrideHostFilter.applies(transport: transport, deviceID: deviceID) ? transport : nil
     }
 
     func arming(for target: InterceptTarget) -> InterceptArmingState {

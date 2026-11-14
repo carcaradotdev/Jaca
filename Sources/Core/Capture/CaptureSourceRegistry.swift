@@ -3,11 +3,15 @@ import Foundation
 /// The registered capture sources. Adding a new way to capture means appending a
 /// descriptor here (plus its `CaptureSource` file) — `NetworkSession` and the chooser
 /// consume this list generically, so nothing already working changes.
+///
+/// Which descriptors a device is offered, and in which order, comes from the current
+/// `HTTPDebuggingStrategy` (the network inspection mode), not from this list:
+/// - Agent mode: `agent` on Android and the iOS Simulator, `browser` on this Mac.
+/// - MITM mode: `mitm` on Android and the iOS Simulator, `companion` on a companion-only phone,
+///   `browser` on this Mac.
 @MainActor
 enum CaptureSourceRegistry {
-    // Proxy was dropped: only the on-device companion VPN can attribute traffic per app,
-    // so companion is the device-wide source. Agent stays for per-app deep-inspection.
-    static let all: [CaptureSourceDescriptor] = [companion, agent, browser]
+    static let all: [CaptureSourceDescriptor] = [companion, agent, mitm, browser]
 
     static let agent = CaptureSourceDescriptor(
         id: "agent", kind: .agent,
@@ -37,6 +41,41 @@ enum CaptureSourceRegistry {
         },
     )
 
+    /// MITM through a proxy on this Mac. One descriptor for two routes, as for the agent:
+    /// Android points its global `http_proxy` at the proxy over `adb reverse`, and the iOS
+    /// Simulator goes through the macOS system proxy.
+    static let mitm = CaptureSourceDescriptor(
+        id: HTTPDebuggingSourceID.mitm, kind: .proxy,
+        title: "Device proxy",
+        detail: InterceptTransportID.mitmProxy.captureDetail,
+        isAvailable: { device, _ in
+            (device.platform == .android && !device.isCompanion) || device.platform == .iosSimulator
+        },
+        needsPackage: false,
+        precheck: { ctx in
+            ctx.device.platform == .iosSimulator
+                ? await SimulatorProxyCaptureSource.precheck(device: ctx.device)
+                : await DeviceProxyCaptureSource.precheck(device: ctx.device, adbURL: ctx.adbURL)
+        },
+        make: { ctx -> CaptureSource in
+            if ctx.device.platform == .iosSimulator {
+                return SimulatorProxyCaptureSource(device: ctx.device, ca: ctx.ca, intercept: ctx.intercept)
+            }
+            return DeviceProxyCaptureSource(device: ctx.device, adbURL: ctx.adbURL, ca: ctx.ca,
+                                            intercept: ctx.intercept)
+        },
+    )
+
+    /// The iOS Simulator route changes the whole Mac, so its chooser row says so before the
+    /// start (`DeviceProxyCaptureSource` changes only the device).
+    static let simulatorSystemProxyNote =
+        "On the iOS Simulator this sets the Mac's system proxy while the capture runs. Other Mac apps pass through and are not recorded."   // COPY-PENDING
+
+    /// A second line under a chooser row, for a source whose effect depends on the device.
+    static func chooserNote(sourceID: String, device: Device) -> String? {
+        sourceID == HTTPDebuggingSourceID.mitm && device.platform == .iosSimulator ? simulatorSystemProxyNote : nil
+    }
+
     static let companion = CaptureSourceDescriptor(
         id: "companion", kind: .companion,
         title: "Companion stream",
@@ -64,21 +103,23 @@ enum CaptureSourceRegistry {
         make: { ctx in MacBrowserCaptureSource(ca: ctx.ca, intercept: ctx.intercept) },
     )
 
-    /// Options offered for a device, in display order. The companion (device-wide HTTPS
-    /// decryption) source is gated behind the experimental feature flag — off by default, so
-    /// network inspection offers only the in-process Agent.
-    static func options(for device: Device, context: DeviceContext?) -> [CaptureSourceDescriptor] {
-        let decryption = FeatureFlags.httpsDecryptionEnabled
-        return all.filter { $0.isAvailable(device, context) && (decryption || $0.kind != .companion) }
+    /// Options offered for a device, in the order the strategy gives. `strategy` defaults to the
+    /// persisted network inspection mode.
+    static func options(for device: Device, context: DeviceContext?,
+                        strategy: any HTTPDebuggingStrategy = HTTPDebuggingStrategies.current)
+        -> [CaptureSourceDescriptor] {
+        strategy.sourceIDs(for: device).compactMap { id in
+            all.first { $0.id == id && $0.isAvailable(device, context) }
+        }
     }
 
     static func descriptor(id: String) -> CaptureSourceDescriptor? { all.first { $0.id == id } }
 
-    /// Default option for a device when none is chosen: companion (device-wide) when
-    /// available, otherwise the first option (agent).
-    static func defaultDescriptor(for device: Device, context: DeviceContext?) -> CaptureSourceDescriptor? {
-        let opts = options(for: device, context: context)
-        return opts.first { $0.kind == .companion } ?? opts.first
+    /// Default option for a device when none is chosen: the first one offered.
+    static func defaultDescriptor(for device: Device, context: DeviceContext?,
+                                  strategy: any HTTPDebuggingStrategy = HTTPDebuggingStrategies.current)
+        -> CaptureSourceDescriptor? {
+        options(for: device, context: context, strategy: strategy).first
     }
 }
 

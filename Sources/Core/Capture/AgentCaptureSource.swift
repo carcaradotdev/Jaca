@@ -8,13 +8,16 @@ final class AgentCaptureSource: CaptureSource {
     private let serial: String
     private let package: String
     private let intercept: InterceptServices?
+    private let gate: DeviceReleaseGate
     private var controller: AgentController?
 
-    init(adbURL: URL?, serial: String, package: String, intercept: InterceptServices? = nil) {
+    init(adbURL: URL?, serial: String, package: String, intercept: InterceptServices? = nil,
+         gate: DeviceReleaseGate = .shared) {
         self.adbURL = adbURL
         self.serial = serial
         self.package = package
         self.intercept = intercept
+        self.gate = gate
     }
 
     /// The agent terminates the exchange on the desktop, so it can do everything: answer without
@@ -49,28 +52,45 @@ final class AgentCaptureSource: CaptureSource {
         controller.start()
     }
 
-    func stop() { controller?.stop(); controller = nil }
+    /// The controller removes its tunnels in a task. The gate tracks it, so the next capture on
+    /// this device arms only after the reverse and the forward are gone.
+    func stop() {
+        guard let controller else { return }
+        self.controller = nil
+        gate.track(serial: serial, task: controller.stop())
+    }
 
     // MARK: - Readiness (used as the descriptor's precheck)
 
-    /// Agent mode must reach the device to attach in-process, and the app must exist.
+    /// Agent mode must reach the device to attach in-process, and the app must exist. On
+    /// Android it also waits for the device's last teardown and refuses a device whose proxy
+    /// another live Jaca process holds (`DeviceProxyLease`).
     /// Returns a clear error message to abort, or nil when ready.
-    static func precheck(device: Device, adbURL: URL?, package: String?) async -> String? {
-        guard AgentArtifacts.isAvailable else { return AgentArtifacts.missingMessage }
-        guard await deviceAvailable(device, adbURL) else { return unavailableMessage(device) }
+    static func precheck(device: Device, adbURL: URL?, package: String?,
+                         ledger: JSONLedgerFile<DeviceProxyLedger.Entry> = DeviceProxyLedger.shared,
+                         gate: DeviceReleaseGate = .shared,
+                         environment: DeviceProxyEnvironment = .live,
+                         artifactsAvailable: Bool = AgentArtifacts.isAvailable) async -> String? {
+        guard artifactsAvailable else { return AgentArtifacts.missingMessage }
+        guard await deviceAvailable(device, adbURL, environment) else { return unavailableMessage(device) }
+        if device.platform == .android, let adbURL,
+           let refusal = await DeviceProxyLease.check(serial: device.id, adbURL: adbURL, ledger: ledger,
+                                                      gate: gate, environment: environment) {
+            return refusal
+        }
         if device.platform == .android, let pkg = package, !pkg.isEmpty,
-           await !packageInstalled(pkg, device: device, adbURL: adbURL) {
+           await !packageInstalled(pkg, device: device, adbURL: adbURL, environment) {
             return "App “\(pkg)” isn’t installed on \(device.displayModel)."
         }
         return nil
     }
 
-    private static func deviceAvailable(_ device: Device, _ adbURL: URL?) async -> Bool {
+    private static func deviceAvailable(_ device: Device, _ adbURL: URL?,
+                                        _ environment: DeviceProxyEnvironment) async -> Bool {
         switch device.platform {
         case .android:
             guard let adbURL else { return false }
-            let r = try? await CommandRunner.run(adbURL, ["-s", device.id, "get-state"])
-            return r?.exitCode == 0 && (r?.stdout.contains("device") ?? false)
+            return await DeviceProxyOps.isOnline(adbURL: adbURL, serial: device.id, environment: environment)
         case .iosSimulator:
             let r = try? await CommandRunner.run(AppleToolchain.xcrun, ["simctl", "list", "devices", "booted"])
             return r?.stdout.contains(device.id) ?? false
@@ -82,13 +102,15 @@ final class AgentCaptureSource: CaptureSource {
         }
     }
 
-    private static func packageInstalled(_ package: String, device: Device, adbURL: URL?) async -> Bool {
+    private static func packageInstalled(_ package: String, device: Device, adbURL: URL?,
+                                         _ environment: DeviceProxyEnvironment) async -> Bool {
         guard let adbURL else { return false }
-        let r = try? await CommandRunner.run(adbURL, ["-s", device.id, "shell", "pm", "list", "packages", package])
+        let r = await environment.run(adbURL, ["-s", device.id, "shell", "pm", "list", "packages", package])
         return r?.stdout.contains("package:\(package)") ?? false
     }
 
-    private static func unavailableMessage(_ device: Device) -> String {
+    /// Shared with the device proxy precheck.
+    static func unavailableMessage(_ device: Device) -> String {
         switch device.platform {
         case .android: return "\(device.displayModel) isn’t connected — plug it in and authorize USB debugging."
         case .iosSimulator: return "\(device.displayModel) isn’t booted — start the simulator and try again."

@@ -173,14 +173,13 @@ final class DaemonOverridesTests: XCTestCase {
 
     // MARK: - One switch
 
-    func test_httpsDecryption_decidesWhereNetworkRuns() {
+    func test_theNetworkArea_decidesWhereNetworkRuns() {
         let connector = DaemonConnector(paths: DaemonPaths(directory: URL(fileURLWithPath: "/nonexistent")),
                                         executable: nil, enabledAreas: [.network])
-        XCTAssertTrue(connector.networkRunsInDaemon(httpsDecryption: false))
-        XCTAssertFalse(connector.networkRunsInDaemon(httpsDecryption: true), "decryption keeps network in the app")
+        XCTAssertTrue(connector.networkRunsInDaemon(), "the inspection mode no longer keeps network in the app")
         let off = DaemonConnector(paths: DaemonPaths(directory: URL(fileURLWithPath: "/nonexistent")),
                                   executable: nil, enabledAreas: [])
-        XCTAssertFalse(off.networkRunsInDaemon(httpsDecryption: false))
+        XCTAssertFalse(off.networkRunsInDaemon())
     }
 
     /// Moving the runtime into the app and back: in the app the local engine owns the library;

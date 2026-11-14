@@ -68,6 +68,23 @@ struct CLIRunner {
             json ? printJSON(detail) : out(detail.text)
             return 0
 
+        case .netMode(let set):
+            if let set {
+                let _: RPCEmpty = try await client.call("network.setMode", NetworkArea.SetModeParams(mode: set))
+            }
+            // As the daemon holds it now.
+            let state: NetworkModeController.State = try await client.call("network.mode")
+            let mode = CLINetworkMode(state)
+            json ? printJSON(mode) : printRows([mode])
+            return 0
+
+        case .netInstallCA(let session):
+            guard let picked = pickNetworkSession(session, from: try await networkSessions()) else { return 1 }
+            let result = try await client.call("network.installCA", NetworkArea.IDParams(id: picked.id),
+                                               as: NetworkArea.InstallCAResult.self)
+            json ? printJSON(result) : printRows([result])
+            return result.outcome == .failed ? 1 : 0
+
         case .overridesList:
             let overrides = CLIOverrides(try await overridesState())
             if json {

@@ -9,9 +9,12 @@ struct NetworkSetupSheet: View {
     let session: NetworkSession
     /// Presents the automatic CA-install flow (owned by `NetworkSessionView`).
     var onInstallCA: () -> Void = {}
-    /// Abandons proxy mode and returns to the chooser to pick in-process Agent.
+    /// Leaves MITM for the in-process agent: sets the inspection mode to agent, which stops
+    /// this capture and shows the chooser.
     var onSwitchToAgent: () -> Void = {}
     @Environment(\.dismiss) private var dismiss
+    /// The last iOS Simulator install or reboot result, shown under the actions.
+    @State private var simulatorStep: SimulatorCAStep?
 
     var body: some View {
         VStack(alignment: .leading, spacing: LemonadeTheme.spaces.spacing400) {
@@ -35,6 +38,17 @@ struct NetworkSetupSheet: View {
                                       leadingIcon: .smartphone, variant: .primary, type: .solid, size: .small)
                         .fixedSize()
                 }
+                if session.device.platform == .iosSimulator {
+                    LemonadeUi.Button(label: "Install CA in Simulator",   // COPY-PENDING
+                                      onClick: installInSimulator,
+                                      leadingIcon: .smartphone, variant: .primary, type: .solid, size: .small)
+                        .fixedSize()
+                        .disabled(session.isInstallingCA)
+                }
+                if session.isInstallingCA {
+                    ProgressView().controlSize(.small)
+                        .transition(.opacity)
+                }
                 LemonadeUi.Button(label: "Export CA…", onClick: exportCA,
                                   leadingIcon: .download, variant: .neutral, type: .subtle, size: .small)
                     .fixedSize()
@@ -46,6 +60,11 @@ struct NetworkSetupSheet: View {
                 }
             }
 
+            if let step = simulatorStep {
+                simulatorStepNotice(step)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+
             ScrollView {
                 VStack(alignment: .leading, spacing: LemonadeTheme.spaces.spacing300) {
                     steps
@@ -53,6 +72,8 @@ struct NetworkSetupSheet: View {
                 }
             }
         }
+        .animation(.easeInOut(duration: 0.2), value: simulatorStep)
+        .animation(.easeInOut(duration: 0.2), value: session.isInstallingCA)
         .padding(LemonadeTheme.spaces.spacing600)
         .frame(width: 620, height: 560)
         .background(LemonadeTheme.colors.background.bgDefault)
@@ -69,8 +90,9 @@ struct NetworkSetupSheet: View {
             ])
         case .iosSimulator:
             stepSection("iOS Simulator", [
-                "Set the Mac's proxy or run the app with HTTPS_PROXY=\(session.hostAddress):\(session.boundPort).",
-                "Export the CA, then drag the .pem onto the booted simulator to install, and trust it in Settings → General → About → Certificate Trust Settings.",
+                // COPY-PENDING: the two steps below replace the manual proxy and drag-in steps.
+                "While the capture runs, Jaca points the Mac's system proxy at \(session.hostAddress):\(session.boundPort) and restores it when you stop. Only simulator traffic is decrypted; other Mac apps pass through and are not recorded.",   // COPY-PENDING
+                "Click “Install CA in Simulator”, then reboot the simulator so its apps trust Jaca's certificate.",   // COPY-PENDING
                 "ATS / cert pinning can still block interception unless the app trusts the CA.",
             ])
         case .iosDevice:
@@ -107,12 +129,83 @@ struct NetworkSetupSheet: View {
         }
     }
 
+    @ViewBuilder
+    private func simulatorStepNotice(_ step: SimulatorCAStep) -> some View {
+        switch step {
+        case .installed:
+            HStack(alignment: .center, spacing: LemonadeTheme.spaces.spacing200) {
+                LemonadeUi.Notice(
+                    content: "Jaca's certificate is installed in the simulator. Reboot the simulator so its apps trust it.",   // COPY-PENDING
+                    voice: .info
+                )
+                LemonadeUi.Button(label: "Reboot simulator",   // COPY-PENDING
+                                  onClick: rebootSimulator,
+                                  leadingIcon: .arrowRotateCw, variant: .neutral, type: .subtle, size: .small)
+                    .fixedSize()
+                    .disabled(session.isInstallingCA)
+            }
+        case .rebooted:
+            LemonadeUi.Notice(
+                content: "The simulator rebooted. Open the app again to capture its traffic.",   // COPY-PENDING
+                voice: .info
+            )
+        case .failed(let message):
+            LemonadeUi.Notice(content: message, voice: .critical)
+        }
+    }
+
+    /// Adds the CA to the simulator keychain, through `jacad` when the capture runs there.
+    private func installInSimulator() {
+        Task {
+            // nil: the daemon didn't answer, or an install already runs. Keep what is shown.
+            guard let result = await session.installCA() else { return }
+            simulatorStep = SimulatorCAStep(result)
+        }
+    }
+
+    private func rebootSimulator() {
+        Task {
+            guard let result = await session.rebootSimulator() else { return }
+            simulatorStep = SimulatorCAStep(reboot: result)
+        }
+    }
+
     private func exportCA() {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "JacaProxyCA.pem"
         panel.canCreateDirectories = true
         if panel.runModal() == .OK, let url = panel.url {
             try? session.ca.exportRootCertificate(to: url)
+        }
+    }
+}
+
+/// What the setup sheet shows after a one-click iOS Simulator CA install or reboot. Pure, so the
+/// mapping from the install result is unit-tested.
+enum SimulatorCAStep: Equatable {
+    /// The CA is in the simulator keychain. Apps see it after a reboot.
+    case installed
+    case rebooted
+    /// The installer's own message. Nothing shows when it gave none.
+    case failed(String)
+
+    /// nil when the result has nothing to show: a failure with no message.
+    init?(_ result: NetworkArea.InstallCAResult) {
+        switch result.outcome {
+        case .installed: self = .installed
+        // The simulator has no manual install; treat it as a failure with what the installer said.
+        case .needsUser, .failed:
+            guard let message = result.message, !message.isEmpty else { return nil }
+            self = .failed(message)
+        }
+    }
+
+    init?(reboot result: Result<Void, SimulatorCAError>) {
+        switch result {
+        case .success: self = .rebooted
+        case .failure(let error):
+            guard !error.message.isEmpty else { return nil }
+            self = .failed(error.message)
         }
     }
 }

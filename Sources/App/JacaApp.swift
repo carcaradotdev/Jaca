@@ -32,6 +32,19 @@ final class JacaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if !DaemonConnector.shared.networkRunsInDaemon() {
             AdbTunnelCleanup.reconcileOrphansFromPreviousRuns()
         }
+        // A killed run also leaves a device `http_proxy` or the Mac system proxy pointed at a
+        // dead port. Both reconciles check the owner pid themselves, so they never undo what a
+        // running jacad holds, and they run whatever the daemon areas are.
+        let adbPath = AndroidToolchain.adbURL(
+            override: UserDefaults.standard.string(forKey: DevicesEngine.adbPathKey))?.path
+        Task.detached {
+            let reverted = await DeviceProxyLedger.reconcileOrphans(adbPath: adbPath)
+            if !reverted.isEmpty {
+                JacaLog.info("proxy", "reverted stranded device proxies on \(reverted.joined(separator: ", "))")
+            }
+            let macReverted = await MacSystemProxy.shared.reconcileOrphan()
+            if macReverted > 0 { JacaLog.info("proxy", "reverted \(macReverted) stranded Mac system proxy settings") }
+        }
     }
 
     /// Applies the Dock/⌘-Tab preference live. Changing the policy hides the window and
@@ -68,6 +81,8 @@ final class JacaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         ProxyCleanup.revertAll()
+        // Restores the Mac system proxy when an in-process simulator capture holds it.
+        MacSystemProxyCleanup.revertAll()
         // Without this, quitting mid-capture stranded a forward in the adb server, where it
         // outlived Jaca itself.
         AdbTunnelCleanup.revertAll()

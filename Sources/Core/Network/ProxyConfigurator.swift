@@ -18,6 +18,21 @@ enum ProxyConfigurator {
         )
     }
 
+    /// Writes `value` (`host:port`) to the device's global `http_proxy`. Returns true when adb
+    /// exited 0.
+    @discardableResult
+    static func setAndroidProxyValue(adbURL: URL, serial: String, value: String) async -> Bool {
+        let r = try? await CommandRunner.run(adbURL, DeviceProxyPlan.setProxy(serial: serial, value: value))
+        return r?.exitCode == 0
+    }
+
+    /// Reads the device's global `http_proxy`, and tells an unreachable device apart from a
+    /// device with no proxy.
+    static func readAndroidProxy(adbURL: URL, serial: String) async -> AndroidProxyReading {
+        let r = try? await CommandRunner.run(adbURL, DeviceProxyPlan.readProxy(serial: serial))
+        return AndroidProxyReading.parse(exitCode: r?.exitCode, stdout: r?.stdout ?? "")
+    }
+
     /// Every settings key that has to be cleared to truly remove a device proxy. `http_proxy`
     /// alone is **not enough**: Android also stores the proxy per-network in `global_http_proxy_*`,
     /// and while those rows survive the network stays unvalidated ("connected, no internet") even
@@ -114,60 +129,171 @@ enum NetworkInterfaces {
     }
 }
 
+/// The adb argument lists for the device proxy, as pure functions so tests can assert them.
+/// Every list starts with `-s <serial>`.
+enum DeviceProxyPlan {
+    /// The value Jaca writes to `http_proxy`. The device reaches it through `adb reverse`.
+    static func loopbackValue(port: Int) -> String { "127.0.0.1:\(port)" }
+
+    static func reverseAdd(serial: String, port: Int) -> [String] {
+        AdbReverseTunnel.openArguments(serial: serial, port: port)
+    }
+
+    static func reverseRemove(serial: String, port: Int) -> [String] {
+        AdbReverseTunnel.removeArguments(serial: serial, port: port)
+    }
+
+    static func setProxy(serial: String, value: String) -> [String] {
+        ["-s", serial, "shell", "settings", "put", "global", "http_proxy", value]
+    }
+
+    /// Points the device at Jaca's proxy on `127.0.0.1:port`.
+    static func arm(serial: String, port: Int) -> [String] {
+        setProxy(serial: serial, value: loopbackValue(port: port))
+    }
+
+    static func restorePrevious(serial: String, previous: String) -> [String] {
+        setProxy(serial: serial, value: previous)
+    }
+
+    static func readProxy(serial: String) -> [String] {
+        ["-s", serial, "shell", "settings", "get", "global", "http_proxy"]
+    }
+
+    /// Removes the proxy: `http_proxy` to `:0`, then each per-network key deleted. It does not
+    /// bounce Wi-Fi; `ProxyConfigurator.clearAndroidProxy` does that after these commands.
+    static func clear(serial: String) -> [[String]] {
+        [setProxy(serial: serial, value: ":0")]
+            + ProxyConfigurator.proxySettingsKeys.map {
+                ["-s", serial, "shell", "settings", "delete", "global", $0]
+            }
+    }
+
+    /// The commands that undo `arm`: put `previous` back when it is a real proxy, else clear.
+    static func revert(serial: String, previous: String?) -> [[String]] {
+        if isRestorable(previous), let previous {
+            return [restorePrevious(serial: serial, previous: previous)]
+        }
+        return clear(serial: serial)
+    }
+
+    /// True for a value of the form `loopbackValue` writes: `127.0.0.1:<port>`.
+    static func isLoopbackValue(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("127.0.0.1:") else { return false }
+        return Int(trimmed.dropFirst("127.0.0.1:".count)) != nil
+    }
+
+    /// True when `previous` names a proxy to put back (not nil, empty, `:0` or `null`).
+    static func isRestorable(_ previous: String?) -> Bool {
+        guard let value = previous?.trimmingCharacters(in: .whitespacesAndNewlines) else { return false }
+        return !value.isEmpty && value != ":0" && value != "null"
+    }
+}
+
 /// Process-global registry of device proxies Jaca has configured, so they get
 /// reverted even when the normal per-session `stop()` teardown can't run.
 ///
 /// Covers graceful quit (`applicationWillTerminate` calls `revertAll`) and the
 /// catchable termination signals (SIGINT/SIGTERM/SIGHUP). A `SIGKILL` (Force
-/// Quit, OOM) or a hard crash runs no code by definition — the per-device
-/// "Revert" affordance in the sidebar is the backstop for that case.
+/// Quit, OOM) or a hard crash runs no code by definition. `DeviceProxyLedger.reconcileOrphans`
+/// repairs that case on the next start, and the per-device "Revert" affordance in the sidebar
+/// is the last backstop.
 enum ProxyCleanup {
-    private struct Entry: Equatable { let adbPath: String; let serial: String }
+    private struct Entry: Equatable {
+        let adbPath: String
+        let serial: String
+        let port: Int
+        let value: String
+    }
     private static let lock = NSLock()
     private static var entries: [Entry] = []
     private static var handlersInstalled = false
 
-    /// Record that `serial`'s proxy is configured and arm the signal handlers.
-    static func register(adbPath: String, serial: String) {
+    /// Record that `serial`'s proxy is set to `value` (Jaca's proxy on `port`) and arm the signal
+    /// handlers. The caller writes the `DeviceProxyLedger` entry before it changes the device.
+    static func register(adbPath: String, serial: String, port: Int, value: String) {
         lock.lock(); defer { lock.unlock() }
-        let entry = Entry(adbPath: adbPath, serial: serial)
+        let entry = Entry(adbPath: adbPath, serial: serial, port: port, value: value)
         if !entries.contains(entry) { entries.append(entry) }
         installHandlersLocked()
     }
 
-    /// Forget a proxy once it's been cleared the normal way.
+    /// Forget one proxy once it's been reverted the normal way.
+    static func deregister(adbPath: String, serial: String, port: Int) {
+        lock.lock(); defer { lock.unlock() }
+        entries.removeAll { $0.adbPath == adbPath && $0.serial == serial && $0.port == port }
+    }
+
+    /// Forget every proxy on `serial`, after the sidebar "Revert" cleared the device.
     static func deregister(adbPath: String, serial: String) {
         lock.lock(); defer { lock.unlock() }
-        entries.removeAll { $0 == Entry(adbPath: adbPath, serial: serial) }
+        entries.removeAll { $0.adbPath == adbPath && $0.serial == serial }
     }
 
-    /// Synchronously revert every still-registered proxy. Safe to call from
+    /// Synchronously revert every still-registered proxy. Compare-and-restore: a device that no
+    /// longer reads Jaca's value is left alone. The ledger entry is dropped only when the device
+    /// is off Jaca's value; when adb failed or the device is unplugged, the entry stays, so the
+    /// next start or the sidebar "Revert" can repair it. Safe to call from
     /// `applicationWillTerminate`; also invoked from the signal handlers.
     static func revertAll() {
-        lock.lock(); let snapshot = entries; lock.unlock()
-        for entry in snapshot { runClear(adbPath: entry.adbPath, serial: entry.serial) }
-    }
-
-    /// Clears every proxy key synchronously — the quit and catchable-signal path, so it has to be
-    /// as complete as the async one.
-    ///
-    /// No Wi-Fi bounce here: it needs a sleep between disable and enable, and this runs while the
-    /// process is terminating. The "Revert device proxy" affordance does the full job.
-    private static func runClear(adbPath: String, serial: String) {
-        run(adbPath, ["-s", serial, "shell", "settings", "put", "global", "http_proxy", ":0"])
-        for key in ProxyConfigurator.proxySettingsKeys {
-            run(adbPath, ["-s", serial, "shell", "settings", "delete", "global", key])
+        lock.lock(); let snapshot = entries; entries.removeAll(); lock.unlock()
+        for entry in snapshot {
+            let recorded = DeviceProxyLedger.entries(serial: entry.serial)
+            let others = Set(recorded.filter { $0.port != entry.port }.map(\.value))
+            let previous = recorded.first { $0.port == entry.port }?.previous
+            let read = { () -> AndroidProxyReading in
+                let r = run(entry.adbPath, DeviceProxyPlan.readProxy(serial: entry.serial))
+                return AndroidProxyReading.parse(exitCode: r?.status, stdout: r?.stdout ?? "")
+            }
+            let reverted = quitRevert(value: entry.value, previous: previous, otherValues: others,
+                                      serial: entry.serial, read: read,
+                                      apply: { run(entry.adbPath, $0)?.status == 0 })
+            if reverted {
+                DeviceProxyLedger.remove(serial: entry.serial, port: entry.port)
+            } else {
+                JacaLog.error("proxy", "couldn't revert the device proxy on \(entry.serial) at quit; the ledger keeps it")
+            }
         }
     }
 
-    private static func run(_ adbPath: String, _ arguments: [String]) {
+    /// The quit-time revert of one proxy, with adb as closures so tests can drive it. Returns
+    /// true when the device is off `value` afterwards (or already was).
+    static func quitRevert(value: String, previous: String?, otherValues: Set<String>, serial: String,
+                           read: () -> AndroidProxyReading, apply: ([String]) -> Bool) -> Bool {
+        let before = read()
+        guard before == .value(value) else { return DeviceProxyOps.isReverted(before, value: value) }
+        let restore = DeviceProxyLedger.restoreTarget(previous: previous, otherValues: otherValues)
+        var allApplied = true
+        for arguments in DeviceProxyPlan.revert(serial: serial, previous: restore) {
+            if !apply(arguments) { allApplied = false }
+        }
+        guard allApplied else { return false }
+        return DeviceProxyOps.isReverted(read(), value: value)
+    }
+
+    /// No Wi-Fi bounce here: it needs a sleep between disable and enable, and this runs while the
+    /// process is terminating. The "Revert device proxy" affordance does the full job.
+    /// Returns the exit status and stdout, or nil when adb is missing or couldn't launch.
+    @discardableResult
+    private static func run(_ adbPath: String, _ arguments: [String]) -> (status: Int32, stdout: String)? {
+        guard FileManager.default.isExecutableFile(atPath: adbPath) else { return nil }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: adbPath)
         process.arguments = arguments
-        process.standardOutput = nil
+        let pipe = Pipe()
+        process.standardOutput = pipe
         process.standardError = nil
-        try? process.run()
-        process.waitUntilExit()
+        do {
+            try process.run()
+            // `settings get` prints one short line, so reading to EOF before the wait can't
+            // fill the pipe and block.
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+        } catch {
+            return nil
+        }
     }
 
     private static func installHandlersLocked() {

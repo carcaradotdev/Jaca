@@ -135,15 +135,19 @@ struct OverrideMatchPreview: View {
         let index = overrides.rules.firstIndex { $0.id == draft.id }
         let earlier: Set<UUID> = index.map { Set(overrides.rules.prefix($0).filter(\.enabled).map(\.id)) } ?? []
 
+        // The routed-host filter the runtime applies on this tab's transport.
+        let transport = OverridesModel.hostFilterTransport(session.interceptTransport, deviceID: session.device.id)
         var out = MatchResult()
         for txn in session.transactions {
             guard let facts = OverrideMatching.facts(url: txn.url),
+                  OverrideHostFilter.allows(routedHosts: compiled.rule.routedHosts, host: facts.host,
+                                            transport: transport, deviceID: nil),
                   OverrideMatching.matches(compiled, facts, method: txn.method) else { continue }
             out.total += 1
             if out.examples.count < Self.exampleLimit { out.examples.append(txn) }
             guard !earlier.isEmpty,
                   let winner = snapshot.firstMatch(facts: facts, method: txn.method,
-                                                   deviceID: nil, appID: nil) else { continue }
+                                                   deviceID: nil, appID: nil, transport: transport) else { continue }
             if earlier.contains(winner.id) { out.shadowed += 1 }
         }
         return out

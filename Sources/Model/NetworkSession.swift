@@ -54,13 +54,23 @@ final class NetworkSession: WorkspaceTab {
     /// The shared response-override library — a reference to the one owner, never a copy.
     let overrides: OverridesModel?
     private let feed: NetworkFeed
+    /// The daemon a remote tab sends CA installs to.
+    private let daemon: DaemonConnector
     private var indexByID: [UUID: Int] = [:]
     private let bodyCache: NetworkBodyCache?
     private let bodiesInMemory = 1_000
 
-    /// Capture options offered for this device (from the registry), in display order.
+    /// The source ids the capture side offers for this device under the current inspection mode,
+    /// in chooser order. Mirrored from the feed state, so a mode switch re-renders the chooser.
+    private(set) var offeredSourceIDs: [String] = []
+
+    /// Capture options offered for this device, in display order. They come from the feed state
+    /// (`offeredSourceIDs`), so a remote tab shows what `jacad` offers. Before the feed has
+    /// reported any (a remote tab not yet opened), they come from the stored mode.
     var availableSources: [CaptureSourceDescriptor] {
-        CaptureSourceRegistry.options(for: device, context: deviceContext)
+        let offered = offeredSourceIDs.compactMap { CaptureSourceRegistry.descriptor(id: $0) }
+        guard offered.isEmpty else { return offered }
+        return CaptureSourceRegistry.options(for: device, context: deviceContext)
     }
     /// The chosen source's descriptor (drives badge, subtitle, empty-state text).
     var currentDescriptor: CaptureSourceDescriptor? {
@@ -125,10 +135,10 @@ final class NetworkSession: WorkspaceTab {
         }
     }
 
-    /// Whether the toolbar's proxy "Setup" affordance is relevant: only for a real ADB
-    /// device actively capturing via the MITM proxy. Companion and agent modes need no
-    /// proxy/CA setup (the companion app installs the CA itself), so it's hidden there.
-    var showsProxySetup: Bool { isADBDevice && hasSelectedMode && captureMode == .proxy }
+    /// Whether the toolbar's proxy "Setup" affordance is relevant: a proxy capture (the Android
+    /// device proxy or the iOS Simulator system proxy) whose CA isn't confirmed yet. Companion and
+    /// agent modes need no proxy/CA setup (the companion app installs the CA itself).
+    var showsProxySetup: Bool { hasSelectedMode && captureMode == .proxy && proxyNeedsSetup }
 
     /// The companion stream id for this device.
     var companionID: String { device.companionID ?? device.id }
@@ -155,7 +165,12 @@ final class NetworkSession: WorkspaceTab {
         return parts.joined(separator: " · ")
     }
 
-    var hostAddress: String { ProxyConfigurator.hostAddress(for: device) }
+    /// The proxy address the device uses. An adb device reaches the proxy over `adb reverse`, and
+    /// an iOS Simulator runs on this Mac and uses its system proxy, so both use loopback (the
+    /// simulator proxy binds 127.0.0.1 only).
+    var hostAddress: String {
+        isADBDevice || device.platform == .iosSimulator ? "127.0.0.1" : ProxyConfigurator.hostAddress(for: device)
+    }
 
     /// The rows the list shows, **cached**.
     ///
@@ -245,9 +260,7 @@ final class NetworkSession: WorkspaceTab {
         let engine = NetworkCaptureEngine(
             id: id, device: device, adbURL: adbURL, ca: ca, companion: companions?.hub,
             deviceContext: { contextSource() },
-            interceptServices: { [weak overrides] in
-                FeatureFlags.responseOverridesEnabled ? overrides?.localServices : nil
-            })
+            interceptServices: { [weak overrides] in overrides?.localServices })
         self.init(id: id, device: device, feed: engine, ca: ca, adbURL: adbURL, displayName: displayName,
                   bodyCache: bodyCache, companions: companions, overrides: overrides, isRemote: false)
         contextSource = { [weak self] in self?.deviceContext }
@@ -257,8 +270,10 @@ final class NetworkSession: WorkspaceTab {
     /// A tab over any feed (an agent capture in `jacad`, in daemon mode).
     init(id: UUID, device: Device, feed: NetworkFeed, ca: CertificateAuthority, adbURL: URL?,
          displayName: String? = nil, bodyCache: NetworkBodyCache? = nil,
-         companions: CompanionRegistry? = nil, overrides: OverridesModel? = nil, isRemote: Bool) {
+         companions: CompanionRegistry? = nil, overrides: OverridesModel? = nil, isRemote: Bool,
+         daemon: DaemonConnector? = nil) {
         self.id = id
+        self.daemon = daemon ?? .shared
         self.device = device
         self.feed = feed
         self.ca = ca
@@ -292,6 +307,7 @@ final class NetworkSession: WorkspaceTab {
         selectedSourceID = state.selectedSourceID
         hasSelectedMode = state.hasSelectedMode
         targetPackage = state.targetPackage
+        if offeredSourceIDs != state.offeredSourceIDs { offeredSourceIDs = state.offeredSourceIDs }
         attachState = state.attachState
         interceptWired = state.interceptWired
         activeInterceptCapabilities = InterceptCapabilities(rawValue: state.interceptCapabilities)
@@ -407,22 +423,16 @@ final class NetworkSession: WorkspaceTab {
     /// This Mac: open the Chrome window again after the user closed it.
     func openBrowser() { feed.openBrowser() }
 
-    /// The interception point this tab is currently capturing through.
+    /// The interception point this tab is currently capturing through. Before a source is
+    /// chosen, the first offered one. With none, the companion transport, which applies no rule,
+    /// so the UI never claims a rule fires.
     var interceptTransport: InterceptTransportID {
-        switch captureMode {
-        case .agent:
-            // Per platform, not a two-way ternary: a physical iOS device has no agent transport,
-            // and the ternary would have reported it as the Android agent.
-            switch device.platform {
-            case .android:      return .androidAgent(package: targetPackage ?? "")
-            case .iosSimulator: return .iosSimulatorAgent(bundleID: targetPackage ?? "")
-            case .iosDevice, .mac: return .mitmProxy
-            }
-        case .companion:
-            return .companionMetadata
-        default:
-            return .mitmProxy
-        }
+        // A mode switch reopens the chooser but keeps the old `selectedSourceID`; that source
+        // may not exist in the new mode, so it counts only while a source is chosen.
+        let chosen = hasSelectedMode ? selectedSourceID : nil
+        guard let sourceID = chosen ?? availableSources.first?.id else { return .companionMetadata }
+        return HTTPDebuggingStrategies.current.transport(device: device, sourceID: sourceID,
+                                                         package: targetPackage)
     }
 
     // MARK: - Source selection (generic)
@@ -434,9 +444,11 @@ final class NetworkSession: WorkspaceTab {
     }
 
     /// Restores the chosen source from persistence WITHOUT starting — a relaunched tab
-    /// comes back pre-configured so the user just presses play.
+    /// comes back pre-configured so the user just presses play. A kind the current mode doesn't
+    /// offer for this device leaves the tab on the chooser.
     func restoreMode(_ mode: CaptureMode, package: String?) {
-        feed.restoreMode(sourceID: CaptureSourceRegistry.all.first { $0.kind == mode }?.id, package: package)
+        guard let sourceID = availableSources.first(where: { $0.kind == mode })?.id else { return }
+        feed.restoreMode(sourceID: sourceID, package: package)
     }
 
     /// Returns the tab to the chooser — the "switch source" escape hatch.
@@ -726,5 +738,92 @@ final class NetworkSession: WorkspaceTab {
     func cancelCAInstall() {
         caInstaller?.cancel()
         if isRunning { stop() }
+    }
+
+    // MARK: - One-click CA install
+
+    /// True while `installCA()` or `rebootSimulator()` runs.
+    private(set) var isInstallingCA = false
+
+    /// Installs Jaca's CA on this tab's device. Only a user action calls it.
+    /// - iOS Simulator: adds the CA to the simulator keychain. Apps see it after a reboot
+    ///   (`rebootAdvised`).
+    /// - Android: installs into the system store when `adb root` works. Otherwise copies the CA
+    ///   to Download and returns `needsUser`; the CA install sheet then guides the user.
+    ///
+    /// A remote tab asks `jacad` (`network.installCA`). An in-process tab runs the same steps here.
+    /// Returns nil when the daemon can't be reached.
+    func installCA() async -> NetworkArea.InstallCAResult? {
+        guard !isInstallingCA else { return nil }
+        isInstallingCA = true
+        defer { isInstallingCA = false }
+        if isRemote {
+            do {
+                return try await daemon.request("network.installCA", NetworkArea.IDParams(id: id),
+                                                as: NetworkArea.InstallCAResult.self)
+            } catch let error as RPCError {
+                return NetworkArea.InstallCAResult(outcome: .failed, message: error.message)
+            } catch {
+                return NetworkArea.InstallCAResult(outcome: .failed, message: error.localizedDescription)
+            }
+        }
+        let result = await Self.installCALocally(device: device, ca: ca, adbURL: adbURL, install: caInstall)
+        // Hosts passed through before the install failed for want of the CA. Decrypt them again.
+        if result.outcome == .installed { localEngine?.caTrustChanged() }
+        return result
+    }
+
+    /// Reboots this tab's iOS Simulator, so its apps load a newly installed CA. Returns nil when
+    /// the daemon can't be reached, or when an install or reboot already runs.
+    func rebootSimulator() async -> Result<Void, SimulatorCAError>? {
+        guard device.platform == .iosSimulator else {
+            return .failure(SimulatorCAError(message: NetworkArea.rebootNotSimulatorMessage))
+        }
+        guard !isInstallingCA else { return nil }
+        isInstallingCA = true
+        defer { isInstallingCA = false }
+        if isRemote {
+            do {
+                let done: RPCEmpty? = try await daemon.request("network.rebootSimulator",
+                                                               NetworkArea.IDParams(id: id), as: RPCEmpty.self)
+                return done == nil ? nil : .success(())
+            } catch let error as RPCError {
+                return .failure(SimulatorCAError(message: error.message))
+            } catch {
+                return .failure(SimulatorCAError(message: error.localizedDescription))
+            }
+        }
+        let result = await caInstall.simulatorReboot(device.id)
+        if case .success = result { localEngine?.caTrustChanged() }
+        return result
+    }
+
+    /// The CA installers an in-process tab uses. Tests replace it.
+    @ObservationIgnored var caInstall: NetworkCAInstall = .live
+
+    /// The in-process copy of `NetworkArea.Captures.installCA`: same steps, same results.
+    static func installCALocally(device: Device, ca: CertificateAuthority, adbURL: URL?,
+                                 install: NetworkCAInstall) async -> NetworkArea.InstallCAResult {
+        switch device.platform {
+        case .iosSimulator:
+            return NetworkArea.installCAResult(simulator: await install.simulatorInstall(device.id, ca.rootCertificatePEM))
+        case .android where !device.isCompanion:
+            guard let adbURL else {
+                return NetworkArea.InstallCAResult(outcome: .failed, message: NetworkArea.adbMissingMessage)
+            }
+            let pem = FileManager.default.temporaryDirectory
+                .appendingPathComponent("jaca-ca-\(UUID().uuidString.prefix(8)).pem")
+            defer { try? FileManager.default.removeItem(at: pem) }
+            do { try ca.exportRootCertificate(to: pem) } catch {
+                JacaLog.error("proxy", "couldn't write the CA for \(device.id): \(error)")
+                return NetworkArea.InstallCAResult(outcome: .failed, message: NetworkArea.noCAMessage)
+            }
+            let rooted = await install.androidRooted(adbURL, device.id, pem)
+            var pushed: Bool?
+            if rooted == .notRooted { pushed = await install.androidPush(adbURL, device.id, pem) }
+            return NetworkArea.installCAResult(android: rooted, pushed: pushed)
+        default:
+            return NetworkArea.InstallCAResult(outcome: .failed, message: NetworkArea.installCAUnsupportedMessage)
+        }
     }
 }

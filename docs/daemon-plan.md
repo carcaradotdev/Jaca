@@ -6,7 +6,7 @@ areas as terminal panes, becomes a second one.
 
 Status: experimental, on branches `exp/daemon` and `exp/daemon-overrides` (the latter also
 carries response overrides; see the last section). Nothing merges to `main` until an area works
-end to end through the daemon. Last updated: 2026-10-07.
+end to end through the daemon. Last updated: 2026-11-11.
 
 ## Progress
 
@@ -19,7 +19,7 @@ end to end through the daemon. Last updated: 2026-10-07.
 | 4. Devices | Done. |
 | 5. Log streaming | Done. Physical iOS untested (no device here); the private frameworks load in `jacad`. |
 | 6. Cloud logging | Done. Tested with a scripted poller, not against GCP. |
-| 7. Network capture | Done for the in-process agent. Companion capture stays in the app (see below). |
+| 7. Network capture | Done for the in-process agent and MITM (device proxy, iOS Simulator system proxy). Companion capture stays in the app (see below). |
 | 7b. Response overrides | Done on branch `exp/daemon-overrides` (see below). |
 | 7c. Database browsing | Daemon side written (`DatabaseArea`, see "Database browsing in the daemon"). Not built or run yet; the app still browses in-process. |
 | 8. Herdr plugin, full | Partly done: `devices` (a picker popup), `logs` (the log tab's filters, package picker and status bar), `network` (agent capture with response overrides), `gradle` and `projects` panes, `tools` (a picker for Gradle and Xcode), `xcode` and `cloud` (the home and the log sessions) panes, two actions. |
@@ -470,16 +470,12 @@ the daemon's reconciliation leave each other's live tunnels alone.
 iOS Simulator with 418 while the agent capture ran in the daemon: the transactions carry the rule
 id, the hit count and `active` arming (with the rule's host) reached `overrides.state`.
 
-**One switch.** Where network capture runs is decided by Settings → Network inspection alone
-(`DaemonConnector.networkRunsInDaemon`): with "HTTPS debugging", everything network (companion and agent capture, the
-override engine) runs in the app, since decryption needs the companion links and the CA there; with
-"Agent HTTPS debugging", agent capture and overrides run in `jacad` when the `network` area is
-enabled. So there is always
-exactly one override engine and one writer of `rules.json`. Flipping the setting moves the override
-runtime (`OverridesModel.setRuntime`; the daemon re-reads the library with `overrides.reload` when it
-takes over) and replaces every open network tab on the wrong side with one on the right side, in
-place, with its source restored but stopped (restarting could relaunch the user's app) and its
-rows kept.
+**One switch.** Where network capture runs is decided by the `network` daemon area alone
+(`DaemonConnector.networkRunsInDaemon`): on, capture and the override engine run in `jacad`; off,
+they run in the app. The network inspection mode no longer moves them. Companion-only devices
+still capture in the app, because the companion links live there. So there is always exactly one
+override engine and one writer of `rules.json`. The mode and its switch are in "MITM HTTPS
+debugging in the daemon" below.
 
 **Limits.** Android divert through the daemon is untested here (no agent build). The tab migration
 on toggle has no automated test (it needs a full `AppModel`).
@@ -514,14 +510,61 @@ on toggle has no automated test (it needs a full `AppModel`).
 
 **Known limits after review.**
 - `SimulatorAppLauncher` coordinates the Logs stdout launch and the Network agent launch within
-  one process. With "HTTPS debugging" chosen, simulator log tabs run in jacad and agent capture
-  in the app, so a log tab start can relaunch the app without the agent's environment.
+  one process. With the `logs` area on and the `network` area off, simulator log tabs run in
+  jacad and agent capture in the app, so a log tab start can relaunch the app without the
+  agent's environment.
 - A log session jacad recreates after a restart re-reads the device buffer; the lines are new
   seqs, so they show again with no marker explaining it (the marker needs specified copy).
 - An unreadable `rules.json` stops override saves (to keep the user's file) with only a log
   line; showing it in the popover needs specified copy.
 - A pending call has no deadline except `hello` and the CLI's short commands; a protocol-version
   mismatch still replaces the running daemon regardless of which build is newer.
+
+## MITM HTTPS debugging in the daemon
+
+The end-to-end flow and the strategy shape are in [mitm-http-debugging.md](mitm-http-debugging.md).
+This section lists what the daemon added.
+
+**Mode owner.** With the `network` area on, `NetworkModeController` (`Core/Daemon/Areas/`) owns
+the network inspection mode. It is the only writer of `networkInspectionMode` and runs one switch
+at a time:
+
+1. Publish `network.mode` with `switching: true`.
+2. Stop each capture the new mode does not offer (`ModeSwitchPlan`) and show its chooser.
+3. Wait for the device teardowns (`DeviceReleaseGate.settleAll`, `SimulatorProxyHub.settle`).
+4. Store the mode and post `dev.srsouza.Jaca.networkInspectionModeChanged`.
+5. Publish `network.mode` and every `net.state.<id>` again (`offeredSourceIDs` changed).
+
+`network.open` and `network.select` wait for the switch. jacad also follows the notification, for
+a mode the app stored while it owned the mode. The app mirrors the topic (`RemoteNetworkMode`).
+
+**Methods and topic.**
+
+| Method | Params | Result |
+|---|---|---|
+| `network.mode` | none | `{mode: "agent" \| "mitm", switching}` |
+| `network.setMode` | `{mode}` | `{}` when the switch is done. Another name is `invalidParams`. |
+| `network.installCA` | `{id}` | `{outcome: "installed" \| "needsUser" \| "failed", message?, rebootAdvised?}` |
+| `network.rebootSimulator` | `{id}` | `{}`. `invalidParams` for a device that is not an iOS Simulator. |
+
+Retained topic `network.mode`, data `{mode, switching}`. `NetworkCaptureState` gained
+`offeredSourceIDs` (tolerant decode), which Herdr and remote GUI tabs build the chooser from.
+
+**Other changes.**
+- `network.select` refuses a source the mode does not offer on the device. Companion is refused
+  as before.
+- A restored tab whose source is not offered opens at the chooser.
+- A new capture stops the running captures whose device claims collide (`DeviceClaimArbiter`).
+- The CA loads on first use for any device, and jacad never migrates it from the Keychain
+  (`allowKeychainMigration: false`), so it shows no prompt.
+- Override services go to every capture in both modes.
+- At start, before `listen`, jacad reconciles the device proxy ledger and the Mac system proxy
+  lease. At stop it reverts its own.
+- A pending device teardown keeps the daemon busy, so it does not idle out with a device still
+  pointed at its proxy.
+
+**Limits.** The device proxy on a USB phone and the system-store install on API 34+ are not
+checked on hardware yet. A SIGKILL leaves a proxy set until the next jacad or app start.
 
 ## Database browsing in the daemon (`DatabaseArea`)
 
@@ -588,6 +631,8 @@ jaca logs tail [SESSION] [-n COUNT] [--grep PATTERN] [--level LEVEL] [--since TI
 jaca net list
 jaca net requests [SESSION] [-n COUNT] [--host HOST] [--status STATUS] [--method METHOD] [--failed]
 jaca net show REQUEST
+jaca net mode [agent | mitm]
+jaca net install-ca SESSION
 jaca overrides list
 jaca overrides add --from REQUEST [--name NAME] [--status CODE] [--body-file PATH] [--disabled]
 jaca overrides enable | disable | rm RULE
@@ -634,13 +679,18 @@ is shown empty (`CLIRedaction.placeholder`), and a request or rule that nothing 
 empty table rather than a sentence. Unknown sessions reuse `No log session <x>.` and
 `No network capture <x>.`.
 
+`jaca net mode` prints the mode as a `mode` column (`--json`: `{"mode": …}`); with an argument it
+calls `network.setMode` first. An unknown mode prints the usage and exits with 2. `jaca net
+install-ca SESSION` prints the `network.installCA` result and exits with 1 when `outcome` is
+`failed`.
+
 **Limits.**
 - Sessions exist in the daemon only for areas the app runs there, so `logs list` and `net list`
   are empty with `daemonAreas` off.
-- "HTTPS debugging" (the companion MITM mode) captures in the app, so `net list`, `net requests`
-  and `net show` have nothing to read there. Response overrides are on only with "Agent HTTPS
-  debugging", the default, where capture and the override engine run in `jacad`: the CLI reads the
-  sessions open in the app, and a rule it adds shows up in the app at once.
+- Both network inspection modes capture in `jacad`: the agent, the MITM device proxy on Android,
+  the iOS Simulator through the Mac system proxy, and This Mac's Chrome. Response overrides apply
+  in both. Companion capture (a phone with the companion app and no adb, offered only in MITM
+  mode) stays in the app, so `net list`, `net requests` and `net show` do not see it.
 - A rule body given with `--body-file` is not checked against `OverrideSeeding.warning`.
 - No command opens, starts or closes a session, or flips the master switch.
 

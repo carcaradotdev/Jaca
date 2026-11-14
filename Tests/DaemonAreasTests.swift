@@ -82,6 +82,35 @@ final class DaemonAreasTests: XCTestCase {
                        Set(DaemonArea.allCases))
     }
 
+    // MARK: - Network wiring
+
+    /// The override services reach every new capture in both modes. Under MITM a rule fires on
+    /// the device proxy, so the services must not depend on the mode.
+    @MainActor
+    func test_networkCaptures_getOverrideServicesInBothModes() async throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("ov-\(UUID().uuidString.prefix(8))")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        setenv("JACA_OVERRIDES_DIR", dir.path, 1)
+        defer {
+            unsetenv("JACA_OVERRIDES_DIR")
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let daemon = try TestDaemon()
+        let overrides = OverridesEngine()
+        let captures = NetworkArea.Captures(bus: daemon.server.bus, bodyCache: nil)
+        let controller = NetworkModeController(captures: captures, bus: daemon.server.bus,
+                                               store: .memory(.agentHTTPSDebugging), settle: {})
+        NetworkArea.install(on: daemon.server, captures: captures, controller: controller,
+                            interceptServices: DaemonAreas.interceptServices(from: overrides))
+
+        XCTAssertNotNil(captures.interceptServices(), "agent mode")
+        await controller.setMode(.mitmHTTPSDebugging)
+        XCTAssertEqual(controller.mode, .mitmHTTPSDebugging)
+        XCTAssertNotNil(captures.interceptServices(), "mitm mode")
+        await controller.setMode(.agentHTTPSDebugging)
+        XCTAssertNotNil(captures.interceptServices(), "back in agent mode")
+    }
+
     // MARK: - End to end
 
     @MainActor

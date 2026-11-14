@@ -397,13 +397,16 @@ struct OverridesPopover: View {
     }
 
     private var idleMessage: String {
-        if !FeatureFlags.responseOverridesEnabled {
-            return "Turn on Agent HTTPS debugging in Settings to apply these rules."
-        }
-        if session.captureMode != .agent {
+        Self.idleMessage(captureMode: session.captureMode, hasRules: !overrides.rules.isEmpty)
+    }
+
+    /// The idle line. Overrides run in both inspection modes, so only the companion stream,
+    /// which applies no rule, gets the agent-only line.
+    static func idleMessage(captureMode: CaptureMode, hasRules: Bool) -> String {
+        if captureMode == .companion {
             return "Overrides apply to in-process agent capture. Other transports will follow."
         }
-        return overrides.rules.isEmpty ? "" : "Start capture to apply these overrides."
+        return hasRules ? "Start capture to apply these overrides." : ""
     }
 
     /// Recovery for a device left behind by a crashed capture session. Clearing `http_proxy`

@@ -68,12 +68,35 @@ Remove it with `herdr plugin unlink dev.srsouza.jaca`.
 
 ## Network and overrides
 
-The `network` pane captures one app's requests with the in-process agent and applies response
-overrides, the app's "Agent HTTPS debugging". It is a client of jacad's `network.*` and
-`overrides.*` methods; nothing was added to the daemon for it.
+The `network` pane captures requests and applies response overrides. It is a client of jacad's
+`network.*` and `overrides.*` methods. How it captures depends on the app's network inspection
+mode, which jacad owns (`network.mode`, `network.setMode`):
 
+- Agent HTTPS debugging: the in-process agent captures one app.
+- MITM HTTPS debugging: the device proxy captures every app on an Android device or an iOS
+  Simulator through Jaca's proxy on the Mac.
+
+- **Mode**: `M` opens a menu of the two modes, on the current one. Choosing the other one calls
+  `network.setMode`, which stops the captures the new mode doesn't offer; the pane then shows
+  the chooser again. The pane reads the mode when it opens and follows the `network.mode` topic,
+  so a switch made in the app or in another pane shows here too.
+- **Chooser**: a stopped capture with nothing chosen shows a row for each source the mode offers
+  (the state's `offeredSourceIDs`): ` Inspect app ` for the agent, which opens the app list, and
+  ` Device proxy ` for the device proxy, which starts at once with no app. `↑`/`↓` move between
+  rows, `Enter` or a click chooses. A jacad that doesn't send the offered sources has the agent
+  row alone.
 - **Start**: `a` (or the app button) lists the installed apps; choosing one starts the capture.
-  `p` or `space` stops and starts it. On the iOS Simulator starting relaunches the app.
+  `p` or `space` stops and starts it. On the iOS Simulator starting relaunches the app. A device
+  proxy capture has no app: `p` starts the device proxy again, and the toolbar's mode reads
+  `proxy`.
+- **Certificate banner**: while the device proxy needs Jaca's certificate on the device and it
+  isn't there yet (`proxyNeedsSetup` and not `caReady`), a banner the width of the pane says so.
+  `I` calls `network.installCA`: jacad installs the certificate into the system store of a
+  rooted Android device, copies it to Download for the user to install on other Android devices,
+  and adds it to an iOS Simulator's keychain. The banner shows the result. After a simulator
+  install, `B` calls `network.rebootSimulator`, so the simulator's apps trust the certificate.
+  `x` dismisses the banner (`network.clearProxyNeedsSetup`). `I` also works on any device proxy
+  capture without the banner.
 - **Attach banner**: when the app came back without the agent (the user reopened it), a
   warning block under the toolbar says so, with a ` R  Relaunch & re-attach ` button (`R`). On
   the iOS Simulator, in Agent HTTPS debugging, a switch beside it turns on the app's
@@ -104,6 +127,9 @@ overrides, the app's "Agent HTTPS debugging". It is a client of jacad's `network
 - **Request menu**: a right click (or `m`) shows the app's menu: `Override response…` (or
   `Edit override “…”` and `Add another override…` when a rule already answers it), `Copy as cURL`,
   `Copy URL`, `Copy response body`, `Filter by this host`.
+- **Device picker**: the network option is `Inspect Network (Agent HTTP)` or
+  `Inspect Network (MITM HTTP)`, for the mode the picker reads with one `network.mode` call when
+  it opens.
 - **This Mac**: the device picker always lists This Mac. Its capture starts at once: jacad
   opens a separate Chrome window with its own profile, sends its traffic through a proxy on
   127.0.0.1 and applies the overrides to it. `b` (or the `Open Chrome` button) opens the window
@@ -157,7 +183,9 @@ undoes a closed tab; `⌘C` still copies a Ghostty selection when there is one.
 
 Not carried over from the app: the JSON tree view (bodies show as
 pretty-printed text), the match preview's example rows and shadow count, find in the body
-editor, the device proxy section, and companion or proxy capture. Regex patterns use Go's
+editor, the app's device proxy section, the guided certificate install for a phone without root
+(the pane copies the certificate to Download and says where to install it), and companion
+capture. Regex patterns use Go's
 engine, not the app's: lookaround and backreferences don't compile here though they run in the
 app and in jacad.
 
@@ -395,6 +423,6 @@ lines the client itself produces when Herdr or jacad returns something it can't 
 SQL bar's `⌘↩ to run · …` hint, where the key that always works is `Ctrl+R`. The ` esc close `
 and ` esc back ` buttons stand where the app's sheets have `Cancel`. The client's own error
 lines (`<method>: no reply from jacad after <time>`, `jacad closed the connection`) have no
-app copy either. The log toolbar's field placeholders are the app's with a capital first letter. In the network pane's `?` popup, `Delete request`, `Select requests`, `Select request`, `Inspect request`, `Switch tab`, `Request menu`, `Follow new requests` and `Back` are placeholders too, as is the `network` pane title. The `R` in the attach banner's ` R  Relaunch & re-attach ` button is the key, like `esc` in ` esc close `; the label after it is the app's. The switch beside it is labelled with the app's Settings title for the same setting, `Re-attach to iOS Simulator apps automatically`. In the database pane's `?` popup, `Row details` is a placeholder (the other labels are the app's, or placeholders the other panes use), as are the `database` pane title and the tab name `Jaca database - <device>`. In the Gradle and Xcode panes' `?` popups, `Select row` is a placeholder (the other labels are the app's buttons and tooltips, or the placeholders the log viewer already uses), as is the `tools` pane title, `Jaca`. Those two panes show nothing while a refresh the user asked for is running, because the app has no text for it. The `?` popup's labels are the app's where it has one; `Minimum level`, `Filter text`, `Regex`, `Package id`, `Pause / unpause`, `Scroll`, `Help` (also the popup's title and the status bar button) and `Quit` are placeholders that need specified copy. In the projects pane's `?` popup, `Expand / collapse`, `Row menu` and `Tree / List` are placeholders, as are the tab name `Projects - Jaca` and the `jaca: ` prefix in front of an error the app would swallow. The pane uses three of the app's strings where the app does not: `Herdr settings` (the button's accessibility label; its tooltip is longer), `Confirm?` as the row menu's label while Remove is armed, and the relative ages jacad does not send, which are approximated. The two action titles
+app copy either. The log toolbar's field placeholders are the app's with a capital first letter. In the network pane's `?` popup, `Delete request`, `Select requests`, `Select request`, `Inspect request`, `Switch tab`, `Request menu`, `Follow new requests` and `Back` are placeholders too, as is the `network` pane title. The `R` in the attach banner's ` R  Relaunch & re-attach ` button is the key, like `esc` in ` esc close `; the label after it is the app's. The `M` menu uses the app's Settings titles, `Agent HTTPS debugging` and `MITM HTTPS debugging`; `inspection mode` (the `?` popup's label for `M`), ` Device proxy `, the certificate banner's prompt and its `installed` and `needsUser` results, and `Inspect Network (MITM HTTP)` are specified copy. The banner's texts while an install or a reboot runs, the simulator result that offers `B reboot`, and the result after a reboot are proposals that wait for sign-off (`// COPY-PENDING` in `netmode.go`). The switch beside it is labelled with the app's Settings title for the same setting, `Re-attach to iOS Simulator apps automatically`. In the database pane's `?` popup, `Row details` is a placeholder (the other labels are the app's, or placeholders the other panes use), as are the `database` pane title and the tab name `Jaca database - <device>`. In the Gradle and Xcode panes' `?` popups, `Select row` is a placeholder (the other labels are the app's buttons and tooltips, or the placeholders the log viewer already uses), as is the `tools` pane title, `Jaca`. Those two panes show nothing while a refresh the user asked for is running, because the app has no text for it. The `?` popup's labels are the app's where it has one; `Minimum level`, `Filter text`, `Regex`, `Package id`, `Pause / unpause`, `Scroll`, `Help` (also the popup's title and the status bar button) and `Quit` are placeholders that need specified copy. In the projects pane's `?` popup, `Expand / collapse`, `Row menu` and `Tree / List` are placeholders, as are the tab name `Projects - Jaca` and the `jaca: ` prefix in front of an error the app would swallow. The pane uses three of the app's strings where the app does not: `Herdr settings` (the button's accessibility label; its tooltip is longer), `Confirm?` as the row menu's label while Remove is armed, and the relative ages jacad does not send, which are approximated. The two action titles
 and the `logs` pane title in `herdr-plugin.toml` are placeholders written for this prototype and
 need specified copy.

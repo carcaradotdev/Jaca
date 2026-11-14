@@ -49,13 +49,12 @@ final class DaemonConnector {
 
     func isEnabled(_ area: DaemonArea) -> Bool { enabledAreas.contains(area) }
 
-    /// Where network capture (and so the override runtime) runs. One switch decides it: the
-    /// HTTPS decryption setting. Decryption needs the companion links and the MITM CA, which live
-    /// in the app, so with it on everything network runs in-process; with it off, agent capture
-    /// and its overrides run in `jacad` when the `network` area is enabled. Never both, so there
-    /// is one override engine and one writer of the rule library.
-    func networkRunsInDaemon(httpsDecryption: Bool = FeatureFlags.httpsDecryptionEnabled) -> Bool {
-        isEnabled(.network) && !httpsDecryption
+    /// Where network capture (and so the override runtime) runs: in `jacad` when the `network`
+    /// area is enabled, in the app otherwise. The inspection mode does not move it. Companion-only
+    /// devices still capture in the app (`AppModel.makeNetworkSession`), because the companion
+    /// links live there. There is one override engine and one writer of the rule library.
+    func networkRunsInDaemon() -> Bool {
+        isEnabled(.network)
     }
 
     /// The areas turned on by `JACA_DAEMON_AREAS` (wins when set) or the `daemonAreas` default.

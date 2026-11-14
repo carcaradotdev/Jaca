@@ -51,9 +51,9 @@ type netViewer struct {
 	back   func() // returns to the picker when the viewer runs in its pane; nil in a tab
 	left   bool
 
-	id      string // the capture's id in jacad
-	opened  bool
-	feature bool // Agent HTTPS debugging is the app's inspection mode, so overrides apply
+	id     string // the capture's id in jacad
+	opened bool
+	mode   string // the network inspection mode (modeAgent or modeMITM), as jacad last reported it
 	// The app's "Re-attach to iOS Simulator apps automatically" setting, as last read or set
 	// here. jacad reads it each time it decides whether to relaunch.
 	autoReattach bool
@@ -95,6 +95,11 @@ type netViewer struct {
 	menu  *popupMenu
 	apps  appPicker
 
+	chooserRow  int   // the selected row of the capture chooser
+	chooserHits []hit // its rows as last drawn: x0..x1 are the first and last screen row of each
+
+	setup setupBanner
+
 	overrides overridesState
 	rules     ruleSet
 	ovui      overridesUI
@@ -127,21 +132,30 @@ func runNetworkPane() int {
 
 func newNetViewer(p *pane, d device, back func()) *netViewer {
 	v := &netViewer{p: p, device: d, back: back, id: newUUID(), index: map[string]int{},
-		bodies: map[string]*netBodies{}, bodyFinal: map[string]bool{}, fetching: map[string]bool{}, removed: map[string]bool{}, feature: true}
+		bodies: map[string]*netBodies{}, bodyFinal: map[string]bool{}, fetching: map[string]bool{}, removed: map[string]bool{}, mode: modeAgent}
 	v.open()
 	return v
 }
 
 func (v *netViewer) topics() []string {
-	return []string{"net.txns." + v.id, "net.state." + v.id, "overrides.state"}
+	return []string{"net.txns." + v.id, "net.state." + v.id, "overrides.state", "network.mode"}
 }
 
-// agentDebuggingEnabled reads the app's Network inspection setting: overrides apply in Agent HTTPS
-// debugging, the default, and not in HTTPS decryption. jacad reads the same setting and exposes
-// no method for it.
-func agentDebuggingEnabled() bool {
-	out, err := exec.Command("defaults", "read", "dev.srsouza.Jaca", "networkInspectionMode").Output()
-	return err != nil || strings.TrimSpace(string(out)) != "httpsDecryption"
+// setMode takes a mode jacad reported. A name this client doesn't know leaves the mode as it was.
+func (v *netViewer) setMode(st netModeState) {
+	if st.Mode == modeAgent || st.Mode == modeMITM {
+		v.mode = st.Mode
+	}
+}
+
+// refetchMode reads the mode again, after updates of its topic were skipped.
+func (v *netViewer) refetchMode() {
+	go func() {
+		var st netModeState
+		if v.p.c.CallTimeout("network.mode", nil, &st, syncTimeout) == nil {
+			v.p.post(func() { v.setMode(st) })
+		}
+	}()
 }
 
 // open subscribes, then opens the capture stopped (starting can relaunch the user's app, so that
@@ -172,7 +186,7 @@ func (v *netViewer) open() {
 			err = c.CallTimeout("network.transactions", map[string]any{"id": id}, &txns, time.Minute)
 			_ = c.CallTimeout("overrides.state", nil, &ov, syncTimeout)
 		}
-		feature := agentDebuggingEnabled()
+		mode := fetchMode(c)
 		auto, _, _ := readDefault(autoReattachKey)
 		delivered := v.p.post(func() {
 			if err != nil {
@@ -183,7 +197,7 @@ func (v *netViewer) open() {
 				go v.closeRemote()
 			case created:
 				// The capture exists even if reading its requests failed: it is this pane's to close.
-				v.opened, v.feature, v.state, v.autoReattach = true, feature, info.State, auto == "1"
+				v.opened, v.mode, v.state, v.autoReattach = true, mode, info.State, auto == "1"
 				v.p.setLive("network.close", id)
 				v.setOverrides(ov)
 				v.upsert(txns)
@@ -245,6 +259,11 @@ func (v *netViewer) handleEvent(ev event) {
 		if json.Unmarshal(ev.Data, &ov) == nil {
 			v.setOverrides(ov)
 		}
+	case "network.mode":
+		var st netModeState
+		if json.Unmarshal(ev.Data, &st) == nil {
+			v.setMode(st)
+		}
 	case "events.dropped":
 		var note droppedNote
 		if json.Unmarshal(ev.Data, &note) != nil {
@@ -276,6 +295,8 @@ func (v *netViewer) handleEvent(ev event) {
 					v.p.post(func() { v.setOverrides(ov) })
 				}
 			}()
+		case "network.mode":
+			v.refetchMode()
 		}
 	}
 }
@@ -650,7 +671,71 @@ func (v *netViewer) arming() armingState {
 	return v.state.AttachState
 }
 
-func (v *netViewer) transport() transport { return transportFor(v.device.Platform) }
+// transport is the interception point of the capture's source: the chosen one, else the first
+// one offered.
+func (v *netViewer) transport() transport {
+	return transportFor(v.device.Platform, v.sourceID())
+}
+
+// sourceID is the capture's chosen source, else the first one offered, "" when neither is known.
+//
+// A mode switch reopens the chooser but keeps SelectedSourceID, which the new mode may not
+// offer, so it counts only while HasSelectedMode is set.
+func (v *netViewer) sourceID() string {
+	if v.state.HasSelectedMode && v.state.SelectedSourceID != "" {
+		return v.state.SelectedSourceID
+	}
+	if len(v.state.OfferedSourceIDs) > 0 {
+		return v.state.OfferedSourceIDs[0]
+	}
+	return ""
+}
+
+// chooserSources are the chooser's rows: the offered sources this client can start, agent and
+// mitm. A jacad that doesn't send the offered sources only has the agent.
+func (v *netViewer) chooserSources() []string {
+	if v.state.OfferedSourceIDs == nil {
+		return []string{sourceAgent}
+	}
+	var out []string
+	for _, id := range v.state.OfferedSourceIDs {
+		if id == sourceAgent || id == sourceMITM {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// offers is whether the chooser has a row for a source.
+func (v *netViewer) offers(sourceID string) bool {
+	for _, id := range v.chooserSources() {
+		if id == sourceID {
+			return true
+		}
+	}
+	return false
+}
+
+// choose starts a row of the chooser: the app list for the agent, the device proxy for mitm.
+func (v *netViewer) choose(row int) {
+	sources := v.chooserSources()
+	if len(sources) == 0 {
+		return
+	}
+	v.chooserRow = clampIndex(row, len(sources))
+	switch sources[v.chooserRow] {
+	case sourceMITM:
+		v.selectMITM()
+	default:
+		v.openApps()
+	}
+}
+
+// selectMITM captures the whole device through the device proxy. There is no app to choose.
+func (v *netViewer) selectMITM() {
+	v.err = ""
+	v.call("network.select", map[string]any{"id": v.id, "sourceID": sourceMITM})
+}
 
 // showsBanner is the app's attach banner: a running capture whose app is closed or came back
 // without the agent.
@@ -678,11 +763,15 @@ func (v *netViewer) toggle() {
 		v.call("network.stop", map[string]any{"id": v.id})
 	case v.device.isMac():
 		v.err = ""
-		v.call("network.select", map[string]any{"id": v.id, "sourceID": "browser"})
-	case v.state.TargetPackage != "":
+		v.call("network.select", map[string]any{"id": v.id, "sourceID": sourceBrowser})
+	case v.state.SelectedSourceID == sourceMITM && v.offers(sourceMITM):
+		v.selectMITM()
+	case v.state.TargetPackage != "" && v.offers(sourceAgent):
 		v.setTarget(v.state.TargetPackage)
-	default:
+	case v.offers(sourceAgent):
 		v.openApps()
+	case v.offers(sourceMITM):
+		v.selectMITM()
 	}
 }
 
@@ -772,9 +861,6 @@ type overrideBadge struct {
 }
 
 func (v *netViewer) badge(t netTransaction) overrideBadge {
-	if !v.feature {
-		return overrideBadge{}
-	}
 	if t.OverriddenByRuleID != "" {
 		for _, r := range v.overrides.Rules {
 			if strings.EqualFold(r.ID, t.OverriddenByRuleID) {
@@ -785,7 +871,7 @@ func (v *netViewer) badge(t netTransaction) overrideBadge {
 	if !v.overrides.MasterEnabled {
 		return overrideBadge{}
 	}
-	rule, ok := v.rules.matchingRule(t.URL, t.Method)
+	rule, ok := v.matchingRule(t)
 	if !ok {
 		return overrideBadge{}
 	}
@@ -800,9 +886,14 @@ func (v *netViewer) badge(t netTransaction) overrideBadge {
 	return overrideBadge{"willApply", rule.displayName()}
 }
 
+// matchingRule is the rule that would answer t on this capture's transport.
+func (v *netViewer) matchingRule(t netTransaction) (overrideRule, bool) {
+	return v.rules.matchingRuleOn(t.URL, t.Method, v.transport(), v.device.ID)
+}
+
 // gateReason is why this request can't be overridden, "" when it can.
 func (v *netViewer) gateReason(t netTransaction) string {
-	return rowGateReason(v.feature, v.transport(), t, v.state.HasRunningSource, v.arming())
+	return rowGateReason(v.transport(), t, v.state.HasRunningSource, v.arming())
 }
 
 // overrideRequest opens the editor for a request: on the rule that already answers it, unless
@@ -812,7 +903,7 @@ func (v *netViewer) overrideRequest(t netTransaction, another bool) {
 		v.err = reason
 		return
 	}
-	if existing, ok := v.rules.matchingRule(t.URL, t.Method); ok && !another {
+	if existing, ok := v.matchingRule(t); ok && !another {
 		v.openEditor(existing, false, "")
 		return
 	}
@@ -833,7 +924,7 @@ func (v *netViewer) overrideRequest(t netTransaction, another bool) {
 // openRowMenu shows the app's request menu (NetworkSessionView.rowMenu) at a cell.
 func (v *netViewer) openRowMenu(t netTransaction, x, y int) {
 	first := "Override response…"
-	existing, matched := v.rules.matchingRule(t.URL, t.Method)
+	existing, matched := v.matchingRule(t)
 	if matched {
 		first = "Edit override “" + existing.displayName() + "”"
 	}
@@ -868,8 +959,8 @@ func (v *netViewer) openBrowser() {
 }
 
 func (v *netViewer) openApps() {
-	if v.device.isMac() {
-		return // no apps: the capture is the Chrome window
+	if v.device.isMac() || !v.offers(sourceAgent) {
+		return // no apps: the capture is the Chrome window, or the whole device
 	}
 	v.focus = netApps
 	v.apps.open(v.p, v.device.ID)
@@ -934,6 +1025,10 @@ func (v *netViewer) handleKey(k []byte) bool {
 		v.page(1)
 	case isArrowRight(k) && v.detail:
 		v.detailFocus = true
+	case isUp(k) && v.showsChooser():
+		v.chooserRow = max(0, v.chooserRow-1)
+	case isDown(k) && v.showsChooser():
+		v.chooserRow = clampIndex(v.chooserRow+1, len(v.chooserSources()))
 	case isUp(k):
 		v.selectRow(max(0, row-1))
 	case isDown(k):
@@ -941,7 +1036,7 @@ func (v *netViewer) handleKey(k []byte) bool {
 	case isEnter(k):
 		switch {
 		case v.showsChooser():
-			v.openApps()
+			v.choose(v.chooserRow)
 		case row < 0:
 			v.selectRow(len(v.visible) - 1)
 			v.openDetail(true)
@@ -1004,6 +1099,14 @@ func (v *netViewer) handleKey(k []byte) bool {
 		v.removeSelected()
 	case k[0] == 'R':
 		v.relaunch()
+	case k[0] == 'M':
+		v.openModeMenu()
+	case k[0] == 'I':
+		v.installCA()
+	case k[0] == 'x' && v.showsSetupBanner():
+		v.dismissSetup()
+	case k[0] == 'B' && v.setup.offerReboot:
+		v.rebootSimulator()
 	case k[0] == '?':
 		v.focus = netHelp
 	}
@@ -1403,7 +1506,11 @@ func (v *netViewer) mouse(m mouseEvent) {
 	case inDetail:
 	case v.showsChooser() && m.button == 0 && m.y >= v.listTop:
 		v.focus = netList
-		v.openApps()
+		for i, h := range v.chooserHits {
+			if m.y >= h.x0 && m.y <= h.x1 {
+				v.choose(i)
+			}
+		}
 	case m.y >= v.listTop && row >= 0 && row < len(v.visible) && m.y < v.listTop+v.listRows:
 		v.focus = netList
 		v.selectRow(row)
@@ -1438,14 +1545,19 @@ func (v *netViewer) helpKeys() [][2]string {
 		{"Backspace", "Delete request"},
 		{"m", "Request menu"},
 		{"G", "Follow new requests"},
+		{"M", "inspection mode"},
 	}
 	if v.state.IsRunning {
 		keys[0][1] = "Stop capture"
 	}
-	if v.device.isMac() {
+	switch {
+	case v.device.isMac():
 		keys[2] = [2]string{"b", "Open Chrome"}
+	case !v.offers(sourceAgent):
+		keys = append(keys[:2], keys[3:]...) // the device proxy has no app to choose
 	}
-	if v.device.Platform == "iosSimulator" {
+	// R acts only on a detached agent; a simulator on the MITM proxy never detaches.
+	if v.device.Platform == "iosSimulator" && v.offers(sourceAgent) {
 		keys = append(keys, [2]string{"R", "Relaunch & re-attach"})
 	}
 	return append(keys, [2]string{"?", "Help"}, [2]string{"q", "Quit"})
@@ -1476,6 +1588,11 @@ func (v *netViewer) draw() {
 	v.bannerHits = v.bannerHits[:0]
 	if v.showsBanner() {
 		for _, row := range v.banner(cols, rows >= 24, len(frame)+1) {
+			line(row)
+		}
+	}
+	if v.showsSetupBanner() {
+		for _, row := range v.setupBanner(cols) {
 			line(row)
 		}
 	}
@@ -1638,6 +1755,8 @@ func (v *netViewer) toolbar(cols, height int) []string {
 		if v.state.IsRunning {
 			b.chip("Open Chrome", sgrBold, v.openBrowser)
 		}
+	case v.sourceID() == sourceMITM:
+		mode = "proxy" // the whole device: there is no app to choose
 	default:
 		app := "Inspect app"
 		if pkg := v.state.TargetPackage; pkg != "" {
@@ -1691,7 +1810,7 @@ func (v *netViewer) relaunch() {
 // offersAutoReattach is whether the banner shows the app's setting for relaunching without
 // asking: it exists for the iOS Simulator, and only in Agent HTTPS debugging.
 func (v *netViewer) offersAutoReattach() bool {
-	return v.device.Platform == "iosSimulator" && v.feature && v.arming().State == "detached"
+	return v.device.Platform == "iosSimulator" && v.mode == modeAgent && v.arming().State == "detached"
 }
 
 // toggleAutoReattach flips the app's setting. It shows the new value at once and goes back if
@@ -1841,18 +1960,10 @@ func (v *netViewer) listColumn(w, n int) []string {
 	out = append(out, cells(func(int) string { return headerStyle }, "", "STATUS", "METHOD", "HOST", "PATH", " SIZE", " TIME"))
 
 	room := n - 1
+	v.chooserHits = v.chooserHits[:0]
 	switch {
 	case v.showsChooser():
-		// The app's capture chooser, for the in-process agent.
-		for _, s := range []string{"",
-			"  " + sgrBold + clip(sanitize(v.device.displayModel()), w-2) + sgrReset,
-			"  " + sgrDim + clip("Choose how to capture traffic", w-2) + sgrReset, "",
-			"  " + sgrRev + " Inspect app " + sgrReset, "",
-			"  " + sgrDim + clip("Inspect one debuggable app in-process — call stacks behind each request, no CA.", w-2) + sgrReset} {
-			if len(out) < n {
-				out = append(out, padStyled(s, w))
-			}
-		}
+		out = v.chooserRows(out, w, n)
 	case len(v.visible) == 0:
 		text := "Capture stopped"
 		switch {

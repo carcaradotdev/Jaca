@@ -831,9 +831,9 @@ func containsString(list []string, s string) bool {
 	return false
 }
 
-// transport is the capture transport a rule runs on (InterceptTransportID): "androidAgent" or
-// "iosSimulatorAgent" here. The other two exist so every sentence keeps the arm the app has.
-// An unknown value reads as the proxy.
+// transport is the capture transport a rule runs on (InterceptTransportID). jacad captures
+// with the two agents and with Jaca's proxy; companion metadata exists so every sentence keeps
+// the arm the app has. An unknown value reads as the proxy.
 type transport string
 
 const (
@@ -843,9 +843,17 @@ const (
 	transportCompanionMetadata transport = "companionMetadata"
 )
 
-// transportFor is NetworkSession.interceptTransport for agent capture: the agent transport of
-// the device's platform, and the proxy for a platform with no agent (a physical iOS device).
-func transportFor(platform string) transport {
+// transportFor is HTTPDebuggingSources.transport: the interception point of a capture source on
+// a platform. The device proxy and This Mac's Chrome go through Jaca's proxy, and the companion
+// app sends flow metadata. The agent, or no source chosen yet, is the agent transport of the
+// platform, and the proxy for a platform with no agent (a physical iOS device).
+func transportFor(platform, sourceID string) transport {
+	switch sourceID {
+	case sourceMITM, sourceBrowser:
+		return transportMITMProxy
+	case sourceCompanion:
+		return transportCompanionMetadata
+	}
 	switch platform {
 	case "android":
 		return transportAndroidAgent

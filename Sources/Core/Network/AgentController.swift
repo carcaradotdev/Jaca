@@ -246,7 +246,10 @@ final class AgentController: @unchecked Sendable {
     ///
     /// Order matters: disarm and drop the reverse tunnel *before* removing the forward, so the
     /// control channel is still open when the disarm frame is written.
-    func stop() {
+    ///
+    /// Returns the teardown task, so the caller can let `DeviceReleaseGate` track it.
+    @discardableResult
+    func stop() -> Task<Void, Never> {
         stopped = true
         let coordinator = agentHTTP
         let p = forwardedPort
@@ -262,7 +265,7 @@ final class AgentController: @unchecked Sendable {
         coordinator?.beginStop()
 
         channel.stopAccepting()
-        Task {
+        return Task {
             await coordinator?.stop()                       // route off, reverse removed, server closed
             await self.channel.flush()                      // the disarm frame has reached send(2)
             self.channel.close()

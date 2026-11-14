@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -16,7 +17,7 @@ func testNetViewer(t *testing.T) *netViewer {
 	quit := &pane{work: make(chan func()), done: make(chan struct{})}
 	close(quit.done)
 	v := &netViewer{p: quit, device: device{ID: "emulator-5554", Platform: "android", Model: "Pixel 8"}, id: newUUID(),
-		index: map[string]int{}, bodies: map[string]*netBodies{}, bodyFinal: map[string]bool{}, fetching: map[string]bool{}, removed: map[string]bool{}, feature: true, opened: true}
+		index: map[string]int{}, bodies: map[string]*netBodies{}, bodyFinal: map[string]bool{}, fetching: map[string]bool{}, removed: map[string]bool{}, mode: modeAgent, opened: true}
 	var txns []netTransaction
 	if err := json.Unmarshal([]byte(`[
 		{"id":"A","method":"GET","url":"https://api.example.com/users/42?expand=1","host":"api.example.com","scheme":"https",
@@ -826,5 +827,281 @@ func TestNetDetailSelection(t *testing.T) {
 	v.mouse(at(button, v.detailMeta[button].x1-1, 0, true))
 	if got := <-copied; !strings.Contains(got, ": ") {
 		t.Errorf("the button copied %q", got)
+	}
+}
+
+// An update of the network.mode topic sets the mode; a name this client doesn't know is ignored.
+func TestModeTopic(t *testing.T) {
+	v := testNetViewer(t)
+	v.handleEvent(event{Topic: "network.mode", Data: json.RawMessage(`{"mode":"mitm","switching":false}`)})
+	if v.mode != modeMITM {
+		t.Fatalf("mode = %q, want mitm", v.mode)
+	}
+	v.handleEvent(event{Topic: "network.mode", Data: json.RawMessage(`{"mode":"later","switching":true}`)})
+	if v.mode != modeMITM {
+		t.Errorf("an unknown mode changed it to %q", v.mode)
+	}
+	if !reflect.DeepEqual(v.topics()[len(v.topics())-1], "network.mode") {
+		t.Errorf("topics %v leave out network.mode", v.topics())
+	}
+	// The simulator's auto re-attach switch exists in Agent HTTPS debugging only.
+	v.device.Platform = "iosSimulator"
+	v.state.AttachState = armingState{State: "detached", AppID: "com.example.app"}
+	if v.offersAutoReattach() {
+		t.Error("MITM mode offers auto re-attach")
+	}
+	v.handleEvent(event{Topic: "network.mode", Data: json.RawMessage(`{"mode":"agent","switching":false}`)})
+	if !v.offersAutoReattach() {
+		t.Error("Agent mode doesn't offer auto re-attach")
+	}
+}
+
+// M opens the two modes; choosing the other one calls network.setMode with its wire name.
+func TestModeMenu(t *testing.T) {
+	v := testNetViewer(t)
+	c, calls := pipeClient(t)
+	v.p.c = c
+	v.handleKey([]byte("M"))
+	if v.focus != netMenu || v.menu == nil || len(v.menu.items) != 2 {
+		t.Fatalf("M: focus %v, menu %+v", v.focus, v.menu)
+	}
+	if v.menu.items[0].label != "Agent HTTPS debugging" || v.menu.items[1].label != "MITM HTTPS debugging" || v.menu.selected != 0 {
+		t.Errorf("menu items %q, %q, selected %d", v.menu.items[0].label, v.menu.items[1].label, v.menu.selected)
+	}
+	v.handleKey([]byte("\x1b[B"))
+	v.handleKey([]byte{'\r'})
+	got := waitCalls(t, calls, 1)
+	if got[0]["method"] != "network.setMode" || !reflect.DeepEqual(got[0]["params"], map[string]any{"mode": "mitm"}) {
+		t.Errorf("call: %v", got[0])
+	}
+	// Choosing the current mode calls nothing.
+	v.handleKey([]byte("M"))
+	v.handleKey([]byte{'\r'})
+	time.Sleep(50 * time.Millisecond)
+	if n := len(calls()); n != 1 {
+		t.Errorf("the current mode made %d calls", n)
+	}
+	found := false
+	for _, k := range v.helpKeys() {
+		found = found || (k[0] == "M" && k[1] == "inspection mode")
+	}
+	if !found {
+		t.Error("the help keys leave out M")
+	}
+}
+
+// The chooser shows a row for each offered source this client can start. Enter on the device
+// proxy selects it with no package; Enter on the agent opens the app list.
+func TestChooserRowsByOffered(t *testing.T) {
+	v := testNetViewer(t)
+	v.txns, v.visible, v.index = nil, nil, map[string]int{}
+	v.state = netState{OfferedSourceIDs: []string{"mitm"}}
+	if !v.showsChooser() {
+		t.Fatal("no chooser")
+	}
+	v.listTop = 4
+	text := strings.Join(stripAll(v.listColumn(100, 20)), "\n")
+	if !strings.Contains(text, " Device proxy ") || strings.Contains(text, "Inspect app") ||
+		!strings.Contains(text, "Decrypt HTTPS device-wide through a proxy the device is set to trust.") {
+		t.Errorf("mitm chooser:\n%s", text)
+	}
+	if v.transport() != transportMITMProxy {
+		t.Errorf("transport before a choice = %q", v.transport())
+	}
+	c, calls := pipeClient(t)
+	v.p.c = c
+	v.handleKey([]byte{'\r'})
+	got := waitCalls(t, calls, 1)
+	if got[0]["method"] != "network.select" || !reflect.DeepEqual(got[0]["params"], map[string]any{"id": v.id, "sourceID": "mitm"}) {
+		t.Errorf("Enter on the device proxy: %v", got[0])
+	}
+	if v.focus == netApps {
+		t.Error("the device proxy opened the app list")
+	}
+
+	// Both offered: two rows, Down moves to the second, and a click on a row chooses it.
+	v.state = netState{OfferedSourceIDs: []string{"agent", "mitm", "companion"}}
+	v.chooserRow = 0
+	v.chooserHits = nil
+	text = strings.Join(stripAll(v.listColumn(100, 30)), "\n")
+	if !strings.Contains(text, " Inspect app ") || !strings.Contains(text, " Device proxy ") || len(v.chooserHits) != 2 {
+		t.Fatalf("two-row chooser (%d hits):\n%s", len(v.chooserHits), text)
+	}
+	v.handleKey([]byte("\x1b[B"))
+	if v.chooserRow != 1 {
+		t.Errorf("Down moved to row %d", v.chooserRow)
+	}
+	v.handleKey([]byte("\x1b[B"))
+	if v.chooserRow != 1 {
+		t.Errorf("Down past the end moved to row %d", v.chooserRow)
+	}
+	v.mouse(mouseEvent{button: 0, x: 4, y: v.chooserHits[0].x0, press: true})
+	if v.focus != netApps {
+		t.Errorf("a click on Inspect app: focus %v", v.focus)
+	}
+	v.focus = netList
+
+	// A jacad without offered sources has the agent alone; a device with none shows no rows.
+	v.state = netState{}
+	if got := v.chooserSources(); !reflect.DeepEqual(got, []string{"agent"}) {
+		t.Errorf("old jacad: %v", got)
+	}
+	v.state = netState{OfferedSourceIDs: []string{}}
+	v.chooserHits = nil
+	if text := strings.Join(stripAll(v.listColumn(100, 20)), "\n"); strings.Contains(text, "Choose how") || len(v.chooserHits) != 0 {
+		t.Errorf("no sources:\n%s", text)
+	}
+	v.handleKey([]byte{'\r'})
+	v.handleKey([]byte("a"))
+	if v.focus == netApps {
+		t.Error("the app list opened with no agent offered")
+	}
+}
+
+// p starts a stopped device proxy capture again, with no package.
+func TestToggleRestartsDeviceProxy(t *testing.T) {
+	v := testNetViewer(t)
+	v.state = netState{HasSelectedMode: true, SelectedSourceID: "mitm", OfferedSourceIDs: []string{"mitm"}}
+	c, calls := pipeClient(t)
+	v.p.c = c
+	v.handleKey([]byte("p"))
+	got := waitCalls(t, calls, 1)
+	if got[0]["method"] != "network.select" || !reflect.DeepEqual(got[0]["params"], map[string]any{"id": v.id, "sourceID": "mitm"}) {
+		t.Errorf("p: %v", got[0])
+	}
+}
+
+// I installs the certificate through jacad, on Android and on the iOS Simulator.
+func TestInstallCAKey(t *testing.T) {
+	for _, platform := range []string{"android", "iosSimulator"} {
+		v := testNetViewer(t)
+		v.device.Platform = platform
+		v.state = netState{IsRunning: true, SelectedSourceID: "mitm", ProxyNeedsSetup: true}
+		c, calls := pipeClient(t)
+		v.p.c = c
+		v.handleKey([]byte("I"))
+		got := waitCalls(t, calls, 1)
+		if got[0]["method"] != "network.installCA" || !reflect.DeepEqual(got[0]["params"], map[string]any{"id": v.id}) {
+			t.Errorf("%s: I called %v", platform, got[0])
+		}
+		if v.setup.busy == "" || !v.showsSetupBanner() {
+			t.Errorf("%s: no progress in the banner", platform)
+		}
+		// A second I while the first runs calls nothing.
+		v.handleKey([]byte("I"))
+		time.Sleep(50 * time.Millisecond)
+		if n := len(calls()); n != 1 {
+			t.Errorf("%s: %d calls after a second I", platform, n)
+		}
+	}
+	// No certificate to install on a physical iOS device, or for an agent capture with no banner.
+	v := testNetViewer(t)
+	c, calls := pipeClient(t)
+	v.p.c = c
+	v.handleKey([]byte("I"))
+	v.device.Platform = "iosDevice"
+	v.state = netState{SelectedSourceID: "mitm", ProxyNeedsSetup: true}
+	v.handleKey([]byte("I"))
+	time.Sleep(50 * time.Millisecond)
+	if n := len(calls()); n != 0 {
+		t.Errorf("%d calls, want none: %v", n, calls())
+	}
+}
+
+// x dismisses the prompt here and in jacad.
+func TestDismissSetupBanner(t *testing.T) {
+	v := testNetViewer(t)
+	v.state = netState{IsRunning: true, SelectedSourceID: "mitm", ProxyNeedsSetup: true}
+	c, calls := pipeClient(t)
+	v.p.c = c
+	if !v.showsSetupBanner() {
+		t.Fatal("no banner")
+	}
+	v.handleKey([]byte("x"))
+	got := waitCalls(t, calls, 1)
+	if got[0]["method"] != "network.clearProxyNeedsSetup" || v.showsSetupBanner() {
+		t.Errorf("x: %v, banner %v", got[0], v.showsSetupBanner())
+	}
+	// With the certificate ready there is no prompt.
+	v.state = netState{ProxyNeedsSetup: true, CAReady: true}
+	if v.showsSetupBanner() {
+		t.Error("banner with the certificate ready")
+	}
+}
+
+// What each network.installCA outcome shows, and the reboot a simulator install offers.
+func TestInstallOutcome(t *testing.T) {
+	if got := installOutcome(installCAResult{Outcome: "installed"}, nil); got.outcome != "Jaca's certificate is installed in the device's system store." || got.offerReboot || got.failed {
+		t.Errorf("installed: %+v", got)
+	}
+	if got := installOutcome(installCAResult{Outcome: "needsUser"}, nil); !strings.HasPrefix(got.outcome, "Jaca copied its certificate to Download/JacaProxyCA.pem.") {
+		t.Errorf("needsUser: %+v", got)
+	}
+	if got := installOutcome(installCAResult{Outcome: "failed", Message: "Couldn't copy the certificate to the device."}, nil); !got.failed || got.outcome != "Couldn't copy the certificate to the device." {
+		t.Errorf("failed: %+v", got)
+	}
+	if got := installOutcome(installCAResult{}, errors.New("network.installCA: no reply")); !got.failed || got.outcome == "" {
+		t.Errorf("call error: %+v", got)
+	}
+	if got := installOutcome(installCAResult{Outcome: "later"}, nil); got != (setupBanner{}) {
+		t.Errorf("unknown outcome: %+v", got)
+	}
+	sim := installOutcome(installCAResult{Outcome: "installed", RebootAdvised: true}, nil)
+	if !sim.offerReboot {
+		t.Fatalf("simulator install: %+v", sim)
+	}
+	v := testNetViewer(t)
+	v.device.Platform = "iosSimulator"
+	v.setup = sim
+	c, calls := pipeClient(t)
+	v.p.c = c
+	v.handleKey([]byte("B"))
+	got := waitCalls(t, calls, 1)
+	if got[0]["method"] != "network.rebootSimulator" || !reflect.DeepEqual(got[0]["params"], map[string]any{"id": v.id}) {
+		t.Errorf("B: %v", got[0])
+	}
+}
+
+func stripAll(rows []string) []string {
+	out := make([]string, len(rows))
+	for i, r := range rows {
+		out[i] = stripSGR(r)
+	}
+	return out
+}
+
+// A mode switch reopens the chooser and keeps the old SelectedSourceID. The transport then
+// follows the first offered source, not the stale one.
+func TestSourceIDIgnoresAStaleSelectionAtTheChooser(t *testing.T) {
+	v := testNetViewer(t)
+	v.state = netState{HasSelectedMode: false, SelectedSourceID: "agent", OfferedSourceIDs: []string{"mitm"}}
+	if got := v.sourceID(); got != "mitm" {
+		t.Errorf("sourceID = %q, want mitm", got)
+	}
+	v.state.HasSelectedMode, v.state.SelectedSourceID = true, "mitm"
+	if got := v.sourceID(); got != "mitm" {
+		t.Errorf("chosen sourceID = %q, want mitm", got)
+	}
+}
+
+// R re-attaches a detached agent, so the help lists it only where the agent is offered.
+func TestHelpListsRelaunchOnlyForTheSimulatorAgent(t *testing.T) {
+	v := testNetViewer(t)
+	v.device = device{ID: "SIM-1", Platform: "iosSimulator", Model: "iPhone"}
+	has := func() bool {
+		for _, k := range v.helpKeys() {
+			if k[0] == "R" {
+				return true
+			}
+		}
+		return false
+	}
+	v.state = netState{OfferedSourceIDs: []string{"mitm"}}
+	if has() {
+		t.Error("the MITM simulator capture lists R")
+	}
+	v.state = netState{OfferedSourceIDs: []string{"agent"}}
+	if !has() {
+		t.Error("the agent simulator capture leaves out R")
 	}
 }

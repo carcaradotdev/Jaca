@@ -20,7 +20,7 @@ func TestThisMacIsListedWithItsOneOption(t *testing.T) {
 	if !thisMac.isReady() || thisMac.platformName() != "macOS" {
 		t.Errorf("This Mac: ready %v, platform %q", thisMac.isReady(), thisMac.platformName())
 	}
-	if got := optionsFor(thisMac); !reflect.DeepEqual(got, []deviceOption{{"Inspect Network (Chrome)", "network", "Jaca network - "}}) {
+	if got := optionsFor(thisMac, modeAgent); !reflect.DeepEqual(got, []deviceOption{{"Inspect Network (Chrome)", "network", "Jaca network - "}}) {
 		t.Errorf("options: %+v", got)
 	}
 }

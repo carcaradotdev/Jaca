@@ -19,10 +19,12 @@ open in the app and what it changes shows up there.
    not installed: `./scripts/install-cli.sh` (from the Jaca repo) puts it on PATH.
 2. `jaca logs list` and `jaca net list` show the open sessions. Empty tables mean nothing is open
    in the daemon: the user has to open a log or network tab in Jaca first. Sessions only live in
-   the daemon when the app runs with daemon areas on (`defaults read dev.srsouza.Jaca daemonAreas`),
-   and network capture only when Settings → Network inspection is "Agent HTTPS debugging" (the
-   default; "HTTPS debugging" captures inside the app, out of reach).
-   Don't change either setting yourself; tell the user what is missing.
+   the daemon when the app runs with daemon areas on (`defaults read dev.srsouza.Jaca daemonAreas`).
+   Both network inspection modes capture in the daemon. Only companion capture (a phone with the
+   Jaca app and no adb) stays inside the app, out of reach.
+3. `jaca net mode` prints the network inspection mode: `agent` (the in-process agent, one app)
+   or `mitm` (a proxy that captures every app on an Android device or an iOS Simulator).
+   Don't change the daemon areas or the mode yourself; tell the user what is missing.
 
 ## Rules of the road
 
@@ -95,7 +97,9 @@ jaca overrides rmgroup Deals                                   # its rules stay,
   it under another base URL (`http://localhost:3000/private-api/lending/v1/…`). The device's
   host stays routed. An id the path names stays: a rule per mock deal keeps telling its deals
   apart. Generalize the rule made from the **device's** request, not the browser's: the
-  browser's path carries the proxy prefix, which the device's path does not.
+  browser's path carries the proxy prefix, which the device's path does not. In `mitm` mode the
+  routed host limits the rule on a device, not in This Mac's Chrome capture, so the generalized
+  rule still answers the browser.
 - **A new rule is enabled and answers matching requests at once**, for every device and app. Pass
   `--disabled` unless the user asked for the override to take effect now, and say which pattern
   it matches when you report it.
@@ -107,14 +111,33 @@ jaca overrides rmgroup Deals                                   # its rules stay,
 - A rule only takes effect while a capture that supports overrides is running for that app; a
   rule with `hitCount` 0 after the app made the request has not matched (check the pattern and
   method) or nothing is armed.
-- Overrides apply only with Settings → Network inspection on "Agent HTTPS debugging" (the
-  default). With "HTTPS debugging" the app captures in-process: `net list` is empty, there is no
-  request to make a rule from, and existing rules answer nothing. Tell the user which mode is
-  needed instead of adding rules.
+- Overrides apply in both modes. In `mitm` mode a rule with routed hosts fires only on those
+  hosts on a device (This Mac's Chrome capture is not limited), and a rule scoped to one app
+  does not fire. Companion capture applies no rule.
+
+## Network inspection mode and the CA
+
+```bash
+jaca net mode --json             # {"mode":"agent"} or {"mode":"mitm"}
+jaca net mode mitm               # switch; only when the user asks
+jaca net install-ca pixel --json # put Jaca's CA on the capture's device
+```
+
+- `jaca net mode agent|mitm` switches the mode for every device. The switch stops each capture
+  the new mode does not offer and shows its chooser; it never starts one. Change the mode only
+  when the user asks for it. Otherwise tell the user which mode the task needs.
+- In `mitm` mode an HTTPS request that never shows up often means the device does not trust
+  Jaca's CA, or the app pins its certificate (Jaca then passes that host through).
+- `install-ca` changes the device. Run it only when the user asks. `outcome` is `installed`,
+  `needsUser` (the CA is in the phone's Download folder; the user installs it in Settings) or
+  `failed` with a `message`. `rebootAdvised: true` (iOS Simulator) means the simulator must
+  reboot before its apps trust the CA: tell the user, and let them reboot it from the app or
+  Herdr.
 
 ## Anything else
 
 `jaca call METHOD [PARAMS_JSON]`, `jaca watch TOPIC...` and `jaca describe` are the raw daemon
 client: `describe` lists every method with its schema. Prefer the subcommands; reach for `call`
 only for something they don't cover, and never for `daemon.shutdown`, `network.close`,
-`logs.close` or `overrides.setMaster` unless the user asks.
+`logs.close`, `overrides.setMaster`, `network.setMode`, `network.installCA` or
+`network.rebootSimulator` unless the user asks.

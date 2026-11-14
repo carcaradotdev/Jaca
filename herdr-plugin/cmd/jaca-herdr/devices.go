@@ -83,16 +83,21 @@ type deviceOption struct {
 	tab        string
 }
 
-// optionsFor are the options of a device. Network inspection runs the in-process agent, which
-// exists for Android and the iOS Simulator only. This Mac has one option: its Chrome window.
-func optionsFor(d device) []deviceOption {
+// optionsFor are the options of a device in a network inspection mode (modeAgent or modeMITM).
+// Network inspection runs the in-process agent or the device proxy, which exist for Android and
+// the iOS Simulator only. This Mac has one option: its Chrome window.
+func optionsFor(d device, mode string) []deviceOption {
 	if d.Platform == "mac" {
 		return []deviceOption{{"Inspect Network (Chrome)", "network", "Jaca network - "}}
 	}
 	options := []deviceOption{{"Start Logcat", "logs", "Jaca log - "}}
 	if d.Platform == "android" || d.Platform == "iosSimulator" {
-		// Named for how it captures: an inspector without the agent may sit beside it later.
-		options = append(options, deviceOption{"Inspect Network (Agent HTTP)", "network", "Jaca network - "})
+		// Named for how it captures, which the mode decides.
+		title := "Inspect Network (Agent HTTP)"
+		if mode == modeMITM {
+			title = "Inspect Network (MITM HTTP)"
+		}
+		options = append(options, deviceOption{title, "network", "Jaca network - "})
 	}
 	// Offered for every device, as in the app: where it can't be done jacad says so.
 	options = append(options, deviceOption{"Browse Database", "database", "Jaca database - "})
@@ -104,6 +109,7 @@ func optionsFor(d device) []deviceOption {
 type devicePicker struct {
 	p      *pane
 	launch bool
+	mode   string // the network inspection mode, read once when the picker opens
 
 	devices  []device
 	loaded   bool
@@ -133,7 +139,18 @@ func runPicker(launch bool) int {
 		fmt.Fprintln(os.Stderr, "jaca:", err)
 		return 1
 	}
-	return runPane(c, func(p *pane) screen { return &devicePicker{p: p, launch: launch} })
+	mode := fetchMode(c)
+	return runPane(c, func(p *pane) screen { return &devicePicker{p: p, launch: launch, mode: mode} })
+}
+
+// fetchMode reads the network inspection mode with network.mode. A jacad that doesn't answer,
+// or one from before the mode, captures with the agent, so that is the mode then.
+func fetchMode(c *client) string {
+	var st netModeState
+	if c.CallTimeout("network.mode", nil, &st, syncTimeout) != nil || (st.Mode != modeAgent && st.Mode != modeMITM) {
+		return modeAgent
+	}
+	return st.Mode
 }
 
 func (d *devicePicker) handleEvent(ev event) {
@@ -193,7 +210,7 @@ func (d *devicePicker) handleKey(k []byte) bool {
 
 func (d *devicePicker) move(by int) {
 	if d.chosen != nil {
-		d.option = clampIndex(d.option+by, len(optionsFor(*d.chosen)))
+		d.option = clampIndex(d.option+by, len(optionsFor(*d.chosen, d.mode)))
 		return
 	}
 	d.selected = clampIndex(d.selected+by, len(d.devices))
@@ -212,7 +229,7 @@ func (d *devicePicker) confirm() {
 		return
 	}
 	dev := *d.chosen
-	options := optionsFor(dev)
+	options := optionsFor(dev, d.mode)
 	option := options[clampIndex(d.option, len(options))]
 	if !d.launch {
 		switch option.entrypoint {
@@ -277,7 +294,7 @@ func (d *devicePicker) draw() {
 		if d.err != "" {
 			line(sgrRed + fit(sanitize(d.err), cols) + sgrReset)
 		}
-		for i, option := range optionsFor(*d.chosen) {
+		for i, option := range optionsFor(*d.chosen, d.mode) {
 			if i >= room {
 				break
 			}

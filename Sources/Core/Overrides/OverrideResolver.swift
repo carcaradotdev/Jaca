@@ -30,7 +30,8 @@ final class OverrideResolver: InterceptResolving, @unchecked Sendable {
         guard let facts = request.facts else { return (.proceed, .noRuleMatched) }
 
         guard let matched = snapshot.firstMatch(facts: facts, method: request.method,
-                                                deviceID: request.deviceID, appID: request.appID)
+                                                deviceID: request.deviceID, appID: request.appID,
+                                                transport: request.transport)
         else {
             return (.proceed, .noRuleMatched)
         }

@@ -14,6 +14,20 @@ enum NetworkInspectionMode: String, CaseIterable, Sendable {
 
     static let `default`: NetworkInspectionMode = .agentHTTPSDebugging
 
+    /// The name on the daemon socket, in Herdr and in the CLI. The raw value stays the stored form.
+    var wireName: String {
+        switch self {
+        case .agentHTTPSDebugging: return "agent"
+        case .mitmHTTPSDebugging: return "mitm"
+        }
+    }
+
+    /// nil for a name no mode has.
+    init?(wireName: String) {
+        guard let mode = Self.allCases.first(where: { $0.wireName == wireName }) else { return nil }
+        self = mode
+    }
+
     /// The mode for what's stored. `stored` wins when it names a current mode. A build briefly
     /// offered "off", which is now the default; anything else unreadable falls back to the two
     /// toggles this replaced. Decryption-only was the one way to opt out of agent mode, so it's the

@@ -215,3 +215,101 @@ final class LiveAgentCaptureTests: XCTestCase {
         XCTAssertTrue(reattached, "agent did not re-attach + capture after the app restarted")
     }
 }
+
+/// The agent precheck on Android shares the device proxy's lease check, and the agent stop is
+/// tracked by the release gate. adb is a closure, so no device is touched.
+@MainActor
+final class AgentCapturePrecheckTests: XCTestCase {
+    private let adbURL = URL(fileURLWithPath: "/fake/adb")
+    private let ownPid: Int32 = 4_200
+
+    private func temporaryLedger() -> (JSONLedgerFile<DeviceProxyLedger.Entry>, URL) {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("jaca-agent-precheck-\(UUID().uuidString)", isDirectory: true)
+        return (JSONLedgerFile(fileURL: dir.appendingPathComponent("device-proxies.json")), dir)
+    }
+
+    /// An online device that has every package and answers every other call with success.
+    private func environment(alive: Set<Int32>) -> DeviceProxyEnvironment {
+        let live = alive.union([ownPid])
+        return DeviceProxyEnvironment(
+            run: { _, arguments in
+                if arguments.last == "get-state" {
+                    return CommandRunner.Result(exitCode: 0, stdout: "device\n", stderr: "")
+                }
+                if arguments.contains("packages"), let pkg = arguments.last {
+                    return CommandRunner.Result(exitCode: 0, stdout: "package:\(pkg)\n", stderr: "")
+                }
+                return CommandRunner.Result(exitCode: 0, stdout: "", stderr: "")
+            },
+            pause: { _ in },
+            pidAlive: { live.contains($0) },
+            ownPid: ownPid,
+            now: { Date() },
+            isExecutable: { _ in true },
+            cleanup: .none)
+    }
+
+    func test_precheck_refusesADeviceWhoseProxyAnotherLiveProcessHolds() async {
+        let (ledger, dir) = temporaryLedger()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let device = Device(id: "emulator-agent-\(UUID().uuidString.prefix(6))", platform: .android,
+                            model: "Pixel", state: .connected)
+        DeviceProxyLedger.add(DeviceProxyLedger.Entry(
+            serial: device.id, adbPath: adbURL.path, port: 6_001, value: "127.0.0.1:6001",
+            previous: nil, pid: 8_888), in: ledger)
+
+        let message = await AgentCaptureSource.precheck(
+            device: device, adbURL: adbURL, package: "com.example", ledger: ledger,
+            gate: DeviceReleaseGate(), environment: environment(alive: [8_888]), artifactsAvailable: true)
+
+        XCTAssertEqual(message, "Another Jaca process is using this device's proxy. Stop that capture first.")
+    }
+
+    func test_precheck_passesWithNoLease() async {
+        let (ledger, dir) = temporaryLedger()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let device = Device(id: "emulator-agent-\(UUID().uuidString.prefix(6))", platform: .android,
+                            model: "Pixel", state: .connected)
+
+        let message = await AgentCaptureSource.precheck(
+            device: device, adbURL: adbURL, package: "com.example", ledger: ledger,
+            gate: DeviceReleaseGate(), environment: environment(alive: []), artifactsAvailable: true)
+
+        XCTAssertNil(message)
+    }
+
+    func test_precheck_waitsForThePendingTeardownOfTheDevice() async {
+        let (ledger, dir) = temporaryLedger()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let device = Device(id: "emulator-agent-\(UUID().uuidString.prefix(6))", platform: .android,
+                            model: "Pixel", state: .connected)
+        let gate = DeviceReleaseGate()
+        let order = OrderLog()
+        gate.track(serial: device.id, task: Task {
+            try? await Task.sleep(for: .milliseconds(50))
+            order.append("teardown")
+        })
+
+        _ = await AgentCaptureSource.precheck(
+            device: device, adbURL: adbURL, package: "com.example", ledger: ledger,
+            gate: gate, environment: environment(alive: []), artifactsAvailable: true)
+        order.append("precheck")
+
+        XCTAssertEqual(order.items, ["teardown", "precheck"])
+    }
+
+    func test_stop_beforeStart_tracksNothing() {
+        let gate = DeviceReleaseGate()
+        let source = AgentCaptureSource(adbURL: adbURL, serial: "emulator-x", package: "com.example", gate: gate)
+        source.stop()
+        XCTAssertFalse(gate.isPending(serial: "emulator-x"))
+    }
+}
+
+private final class OrderLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _items: [String] = []
+    var items: [String] { lock.lock(); defer { lock.unlock() }; return _items }
+    func append(_ item: String) { lock.lock(); _items.append(item); lock.unlock() }
+}

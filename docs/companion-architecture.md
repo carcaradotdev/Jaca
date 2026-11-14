@@ -5,7 +5,7 @@ the first QR scan to decrypted traffic on screen. Decryption happens on the desk
 CA private key never leaves the Mac.
 
 This is a living document. When the flow or the wire protocol changes, update the diagrams
-and the step list here in the same change. Last updated: 2026-06-15.
+and the step list here in the same change. Last updated: 2026-11-11.
 
 ## The two sides
 
@@ -20,6 +20,15 @@ forwards the intercepted connection to the desktop proxy so the desktop can decr
 The phone is the gRPC server and the desktop is the gRPC client. That is backwards from how
 people usually picture it, and it matters: the desktop reaches out to the phone, not the
 other way around.
+
+## When the desktop offers it
+
+Companion capture is offered only in MITM HTTPS debugging, and only for a companion-only phone:
+a phone that Jaca reaches through the companion app and not through adb. A phone with adb gets
+the device proxy instead (see [mitm-http-debugging.md](mitm-http-debugging.md)), so a VPN capture
+and a global proxy never run on one phone. In Agent HTTPS debugging a companion-only phone has
+no capture source. Companion capture always runs in the app, also when `jacad` runs the
+`network` area, because the gRPC links and the CA live in the app.
 
 ## Channels between them
 

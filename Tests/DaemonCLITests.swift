@@ -29,6 +29,8 @@ final class DaemonCLITests: XCTestCase {
     private var overrides: OverridesEngine!
     private var logs: LogsArea.Registry!
     private var logSource: ScriptedLogSource!
+    private var modeStore: NetworkModeStore!
+    private var modeController: NetworkModeController!
 
     private let pixel = Device(id: "emu-1", platform: .android, model: "Pixel", state: .connected)
     private let phone = Device(id: "sim-1", platform: .iosSimulator, model: "iPhone", state: .booted)
@@ -43,7 +45,10 @@ final class DaemonCLITests: XCTestCase {
                                         bodyCache: NetworkBodyCache(directory: dir.appendingPathComponent("bodies")),
                                         bodiesInMemory: 2)
         overrides = OverridesArea.install(on: daemon.server, captures: captures)
-        NetworkArea.install(on: daemon.server, captures: captures)
+        // The mode lives in memory, so `jaca net mode mitm` never writes the user's setting.
+        modeStore = .memory(.agentHTTPSDebugging)
+        modeController = NetworkModeController(captures: captures, bus: daemon.server.bus, store: modeStore, settle: {})
+        NetworkArea.install(on: daemon.server, captures: captures, controller: modeController)
         let source = ScriptedLogSource()
         logSource = source
         logs = LogsArea.Registry(bus: daemon.server.bus, history: nil, replayCap: 1_000) { id, _, device, package, seqStart in
@@ -59,6 +64,7 @@ final class DaemonCLITests: XCTestCase {
     }
 
     override func tearDown() async throws {
+        modeController = nil
         daemon = nil
         unsetenv("JACA_OVERRIDES_DIR")
         try? FileManager.default.removeItem(at: dir)
@@ -642,6 +648,57 @@ final class DaemonCLITests: XCTestCase {
         XCTAssertNotNil(asJSON[0]["params"])
     }
 
+    // MARK: - Network mode and CA install
+
+    func test_jaca_netMode_printsAndSwitchesTheMode() async throws {
+        let before = try await run("net mode")
+        XCTAssertEqual(before.status, 0, before.printed.errText)
+        XCTAssertEqual(before.printed.outText, "mode\nagent")
+
+        let switched = try await run("net mode mitm")
+        XCTAssertEqual(switched.status, 0, switched.printed.errText)
+        XCTAssertEqual(switched.printed.outText, "mode\nmitm")
+        XCTAssertEqual(modeController.mode, .mitmHTTPSDebugging)
+        XCTAssertEqual(modeStore.read(), .mitmHTTPSDebugging)
+
+        let asJSON = try await run("net mode --json")
+        XCTAssertEqual(asJSON.status, 0, asJSON.printed.errText)
+        XCTAssertEqual(asJSON.printed.outText, #"{"mode":"mitm"}"#)
+
+        let back = try await run("net mode agent --json")
+        XCTAssertEqual(back.printed.outText, #"{"mode":"agent"}"#)
+        XCTAssertEqual(modeStore.read(), .agentHTTPSDebugging)
+    }
+
+    func test_jaca_netInstallCA_runsTheInstallForThePickedCapture() async throws {
+        try await openCaptures()
+        let caDir = dir.appendingPathComponent("ca")
+        let ca = try CertificateAuthority(directory: caDir)
+        captures.loadCA = { ca }
+        captures.resolveADB = { URL(fileURLWithPath: "/fake/adb") }
+        let installs = InstallLog()
+        captures.caInstall = NetworkCAInstall(
+            androidRooted: { _, serial, _ in installs.add("rooted \(serial)"); return .failed("boom") },
+            androidPush: { _, serial, _ in installs.add("push \(serial)"); return true },
+            simulatorInstall: { udid, _ in installs.add("sim \(udid)"); return .success(()) },
+            simulatorReboot: { udid in installs.add("reboot \(udid)"); return .success(()) })
+
+        let simulator = try await run("net install-ca sim-1")
+        XCTAssertEqual(simulator.status, 0, simulator.printed.errText)
+        XCTAssertEqual(simulator.printed.outText, "outcome    rebootAdvised  message\ninstalled  true")
+
+        let android = try await run("net install-ca emu-1 --json")
+        XCTAssertEqual(android.status, 1, "a failed install exits with status 1")
+        let object = try XCTUnwrap(try json(android.printed) as? [String: Any])
+        XCTAssertEqual(object["outcome"] as? String, "failed")
+        XCTAssertEqual(object["message"] as? String, "boom")
+
+        let unknown = try await run("net install-ca nothing")
+        XCTAssertEqual(unknown.status, 1)
+        XCTAssertEqual(unknown.printed.errText, "jaca: No network capture nothing.")
+        XCTAssertEqual(installs.entries, ["sim sim-1", "rooted emu-1"])
+    }
+
     // MARK: - The binary
 
     /// `jacad` run through a symlink named `jaca` is the command line, and talks to the daemon in
@@ -699,4 +756,12 @@ final class DaemonCLITests: XCTestCase {
         XCTAssertEqual(status.status, 0, status.err)
         XCTAssertTrue(status.out.contains("\"protocolVersion\""), status.out)
     }
+}
+
+/// The CA installs a test asked for, in order.
+private final class InstallLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var list: [String] = []
+    func add(_ entry: String) { lock.withLock { list.append(entry) } }
+    var entries: [String] { lock.withLock { list } }
 }

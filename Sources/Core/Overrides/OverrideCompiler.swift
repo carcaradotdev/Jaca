@@ -12,19 +12,30 @@ struct OverrideRuleSet: Sendable {
     static let empty = OverrideRuleSet(rules: [], masterEnabled: true)
 
     /// The first enabled rule matching this request, or nil.
-    func firstMatch(facts: URLFacts, method: String, deviceID: String?, appID: String?) -> CompiledRule? {
-        rules.first { compiled in
-            compiled.rule.scope.matches(deviceID: deviceID, appID: appID)
-                && OverrideMatching.matches(compiled, facts, method: method)
-        }
+    ///
+    /// `transport` is where the request was intercepted. Under `.mitmProxy` on a device a rule
+    /// fires only on its routed hosts (see `OverrideHostFilter`). A nil transport applies no
+    /// host filter.
+    func firstMatch(facts: URLFacts, method: String, deviceID: String?, appID: String?,
+                    transport: InterceptTransportID? = nil) -> CompiledRule? {
+        rules.first { applies($0, facts: facts, method: method, deviceID: deviceID, appID: appID,
+                              transport: transport) }
     }
 
     /// Every enabled rule matching this request, in precedence order — the editor's shadow list.
-    func allMatches(facts: URLFacts, method: String, deviceID: String?, appID: String?) -> [CompiledRule] {
-        rules.filter { compiled in
-            compiled.rule.scope.matches(deviceID: deviceID, appID: appID)
-                && OverrideMatching.matches(compiled, facts, method: method)
-        }
+    /// `transport` filters as in `firstMatch`.
+    func allMatches(facts: URLFacts, method: String, deviceID: String?, appID: String?,
+                    transport: InterceptTransportID? = nil) -> [CompiledRule] {
+        rules.filter { applies($0, facts: facts, method: method, deviceID: deviceID, appID: appID,
+                               transport: transport) }
+    }
+
+    private func applies(_ compiled: CompiledRule, facts: URLFacts, method: String, deviceID: String?,
+                         appID: String?, transport: InterceptTransportID?) -> Bool {
+        compiled.rule.scope.matches(deviceID: deviceID, appID: appID)
+            && OverrideHostFilter.allows(routedHosts: compiled.rule.routedHosts, host: facts.host,
+                                         transport: transport, deviceID: deviceID)
+            && OverrideMatching.matches(compiled, facts, method: method)
     }
 
     /// The hosts device transports must route through the Mac. The feature's blast radius, so
@@ -36,6 +47,45 @@ struct OverrideRuleSet: Sendable {
             hosts.formUnion(compiled.rule.routedHosts)
         }
         return hosts
+    }
+}
+
+/// Limits a rule to its routed hosts under MITM.
+///
+/// An agent transport sends only the routed hosts to the Mac, so the agent needs no filter. A
+/// per-rule filter there would also change which rule wins. The MITM proxy of a device (Android
+/// device proxy, iOS Simulator) sees every host, so there a rule with routed hosts fires only on
+/// those hosts. A rule with no routed hosts fires on every host.
+///
+/// This Mac's Chrome capture also uses `.mitmProxy`, but is not filtered: a generalized rule
+/// (`**/lending/v1/…`) keeps the device's host as its routed host and must still answer the
+/// browser's request to a dev server on another host (`localhost:3000`).
+enum OverrideHostFilter {
+
+    static func allows(routedHosts: Set<String>, host: String,
+                       transport: InterceptTransportID?, deviceID: String?) -> Bool {
+        guard applies(transport: transport, deviceID: deviceID), !routedHosts.isEmpty else { return true }
+        let requestHost = normalize(host)
+        return routedHosts.contains { normalize($0) == requestHost }
+    }
+
+    /// Whether the routed-host filter runs for a request intercepted at `transport` from
+    /// `deviceID`.
+    static func applies(transport: InterceptTransportID?, deviceID: String?) -> Bool {
+        transport == .mitmProxy && deviceID != Device.thisMac.id
+    }
+
+    /// Lower-cases a host and removes a `:port` suffix. An IPv6 literal keeps its colons; only a
+    /// bracketed form (`[::1]:8080`) loses its port and brackets.
+    static func normalize(_ host: String) -> String {
+        var h = host.trimmingCharacters(in: .whitespaces).lowercased()
+        if h.hasPrefix("["), let close = h.firstIndex(of: "]") {
+            return String(h[h.index(after: h.startIndex)..<close])
+        }
+        if h.filter({ $0 == ":" }).count == 1, let colon = h.firstIndex(of: ":") {
+            h = String(h[..<colon])
+        }
+        return h
     }
 }
 

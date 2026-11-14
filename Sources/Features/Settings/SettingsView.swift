@@ -48,9 +48,9 @@ struct SettingsView: View {
                     }
 
                     section("Network inspection") {
-                        // One choice rather than two toggles: overrides only run in the in-process
-                        // agent, which the companion capture replaces, so both on was a combination
-                        // where neither worked as described. No "off": the agent captures either way.
+                        // One choice of how capture works: the in-process agent or a proxy on this
+                        // Mac. Overrides run in both. No "off": a tab captures either way. The choice
+                        // stays disabled while a switch stops captures.
                         modeOption(.agentHTTPSDebugging, title: "Agent HTTPS debugging", detail:
                             "Lets you answer a matched request from a rule instead of the " +
                             "real server — right-click any captured request, or use the Overrides button " +
@@ -62,16 +62,21 @@ struct SettingsView: View {
                             "and the agent stops diverting on its own if Jaca goes away.") {
                             simulatorReattachSetting
                         }
-                        modeOption(.mitmHTTPSDebugging, title: "HTTPS debugging", detail:
-                            "Off by default. Network inspection uses the in-process Agent — per-app, with " +
-                            "call stacks, no certificate needed — which covers most debugging.\n\n" +
-                            "Turn this on to also capture whole-device traffic via the companion app and " +
-                            "decrypt HTTPS. It works as a man-in-the-middle (MITM): the companion app routes " +
-                            "the device's traffic through Jaca, which decrypts it and re-encrypts it on its " +
-                            "way to the server. Limitations: it installs a CA on the device; apps that use " +
-                            "certificate pinning (many banking and secure apps) won't be decrypted and may " +
-                            "stop working; traffic over QUIC (HTTP/3) can't be decrypted. Experimental and " +
-                            "may be unreliable.")
+                        modeOption(.mitmHTTPSDebugging, title: "MITM HTTPS debugging", detail:
+                            // Approved text, but its first and last sentences are no longer true: the iOS
+                            // Simulator also uses MITM now. A replacement waits for approval.
+                            "Captures every app on an Android device through a proxy on your Mac, and decrypts HTTPS with Jaca's certificate. Overrides, delays and groups work as in Agent HTTPS debugging. The device must trust Jaca's certificate: on an emulator Jaca can install it; on a phone you install it once. Apps that pin certificates pass through without decryption. HTTP/2, gRPC and WebSockets over TLS aren't supported. The iOS Simulator keeps using the in-process Agent.")   // COPY-PENDING
+
+                        caption("Switching stops the running captures.")
+
+                        if let error = model.networkModeError {
+                            LemonadeUi.Text(
+                                "Couldn’t switch the mode: \(error)",   // COPY-PENDING
+                                textStyle: LemonadeTypography.shared.bodyXSmallRegular,
+                                color: LemonadeTheme.colors.content.contentCritical
+                            )
+                            .transition(.opacity)
+                        }
 
                         Divider().overlay(LemonadeTheme.colors.border.borderNeutralLow)
 
@@ -209,7 +214,13 @@ struct SettingsView: View {
     private func modeOption<Nested: View>(_ mode: NetworkInspectionMode, title: String, detail: String?,
                                           @ViewBuilder nested: () -> Nested) -> some View {
         let selected = model.networkInspectionMode == mode
-        let select = { withAnimation(.easeInOut(duration: 0.2)) { model.networkInspectionMode = mode } }
+        // A switch stops captures and waits for their devices; a second choice meanwhile would
+        // only queue behind it, so the options stay disabled until it is done.
+        let switching = model.isSwitchingNetworkMode
+        let select = {
+            guard !model.isSwitchingNetworkMode else { return }
+            withAnimation(.easeInOut(duration: 0.2)) { model.networkInspectionMode = mode }
+        }
         return HStack(alignment: .top, spacing: LemonadeTheme.spaces.spacing300) {
             LemonadeUi.RadioButton(checked: selected, onRadioButtonClicked: select)
             VStack(alignment: .leading, spacing: LemonadeTheme.spaces.spacing300) {
@@ -232,6 +243,9 @@ struct SettingsView: View {
                 }
             }
         }
+        .disabled(switching)
+        .opacity(switching ? 0.5 : 1)
+        .animation(.easeInOut(duration: 0.2), value: switching)
     }
 
     /// Nested under Agent HTTPS debugging: re-attaching re-injects the agent, so it has no meaning

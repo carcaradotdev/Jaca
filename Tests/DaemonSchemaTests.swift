@@ -118,9 +118,28 @@ final class DaemonSchemaTests: XCTestCase {
             state.selectedSourceID = "agent"
             state.targetPackage = "com.x"
             state.attachState = arming
+            state.offeredSourceIDs = ["mitm", "browser"]
             try assertDescribed(state, by: .networkCaptureState, "NetworkCaptureState")
             try assertDescribed(NetworkArea.Session(id: UUID(), name: "Sim", device: device, state: state, transactionCount: 2),
                                 by: .networkSession, "NetworkArea.Session")
+        }
+
+        for mode in NetworkInspectionMode.allCases {
+            for switching in [false, true] {
+                try assertDescribed(NetworkModeController.State(mode: mode.wireName, switching: switching),
+                                    by: .networkMode, "network.mode \(mode.wireName)")
+            }
+        }
+        try assertDescribed(NetworkArea.SetModeParams(mode: "mitm"),
+                            by: .object(["mode": .enumeration(["agent", "mitm"])]), "network.setMode params")
+        let installResults = [
+            NetworkArea.InstallCAResult(outcome: .installed),
+            NetworkArea.InstallCAResult(outcome: .installed, rebootAdvised: true),
+            NetworkArea.InstallCAResult(outcome: .needsUser),
+            NetworkArea.InstallCAResult(outcome: .failed, message: "m"),
+        ]
+        for result in installResults {
+            try assertDescribed(result, by: .networkInstallCAResult, "network.installCA \(result.outcome)")
         }
 
         try assertDescribed(transaction, by: .networkTransaction, "NetworkTransaction")
@@ -243,6 +262,16 @@ final class DaemonSchemaTests: XCTestCase {
         for name in CLIUsage.entries.flatMap(\.methods) {
             XCTAssertTrue(described.contains { $0.name == name }, "\(name) is behind a jaca command")
         }
+        let mode = try XCTUnwrap(described.first { $0.name == "network.mode" })
+        XCTAssertEqual(mode.result, .networkMode)
+        let setMode = try XCTUnwrap(described.first { $0.name == "network.setMode" })
+        XCTAssertEqual(setMode.params?.required, ["mode"])
+        let installCA = try XCTUnwrap(described.first { $0.name == "network.installCA" })
+        XCTAssertEqual(installCA.params?.required, ["id"])
+        XCTAssertEqual(installCA.result, .networkInstallCAResult)
+        XCTAssertNotNil(described.first { $0.name == "network.rebootSimulator" })
+        XCTAssertTrue(catalog.topics.contains { $0.name == NetworkModeController.topic && $0.retained })
+
         let create = try XCTUnwrap(described.first { $0.name == "overrides.createFromTransaction" })
         XCTAssertEqual(create.params?.required, ["id", "transaction"])
         XCTAssertEqual(create.result?.oneOf?.first?.properties?["rule"], .overrideRule)

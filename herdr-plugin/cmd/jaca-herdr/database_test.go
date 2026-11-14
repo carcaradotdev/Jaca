@@ -1548,7 +1548,7 @@ func TestDatabaseInputNeverPanics(t *testing.T) {
 func TestDatabaseDeviceOption(t *testing.T) {
 	titles := func(d device) []string {
 		var out []string
-		for _, option := range optionsFor(d) {
+		for _, option := range optionsFor(d, modeAgent) {
 			out = append(out, option.title)
 		}
 		return out
@@ -1562,7 +1562,7 @@ func TestDatabaseDeviceOption(t *testing.T) {
 			t.Errorf("%s offers %v, want %v", platform, got, want)
 		}
 	}
-	options := optionsFor(device{Platform: "android"})
+	options := optionsFor(device{Platform: "android"}, modeAgent)
 	if last := options[len(options)-1]; last.entrypoint != "database" || last.tab != "Jaca database - " {
 		t.Errorf("the database option is %+v", last)
 	}

@@ -6,9 +6,10 @@ import Foundation
 struct CaptureContext {
     let device: Device
     let adbURL: URL?
-    /// The MITM CA. Only companion capture decrypts; `jacad` never loads one (reading or minting
-    /// the CA from the daemon could prompt for the Keychain or diverge from the app's CA), and
-    /// companion capture never runs there, so it's nil in the daemon.
+    /// The MITM CA. The proxy sources (device proxy, Simulator proxy, this Mac's browser) and
+    /// companion capture decrypt with it. `jacad` reads it from disk when a capture needs it and
+    /// never prompts for the Keychain. nil when it couldn't be read; a source that needs it then
+    /// says so in its status.
     let ca: CertificateAuthority?
     let deviceContext: DeviceContext?
     /// Agent mode: the debuggable app to attach to.
@@ -57,6 +58,10 @@ protocol CaptureSource: AnyObject {
     /// Whether the rules run on this source's traffic now. An agent source is wired once its
     /// coordinator arms; a proxy source as soon as it listens with override services.
     var interceptWired: Bool { get }
+
+    /// The user installed Jaca's CA on the device. A source that passes hosts through after a
+    /// failed handshake forgets them, so the next connection to each one is decrypted.
+    func caTrustChanged()
 }
 
 extension CaptureSink {
@@ -67,6 +72,7 @@ extension CaptureSource {
     var interceptCapabilities: InterceptCapabilities { [] }
     var arming: AgentHTTPCoordinator? { nil }
     var interceptWired: Bool { arming != nil }
+    func caTrustChanged() {}
 }
 
 /// Static, selectable description of a capture option for a device. Drives the chooser

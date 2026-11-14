@@ -194,13 +194,38 @@ final class CLIOutputTests: XCTestCase {
         rule.action = .respond(OverrideResponseSpec(statusCode: 418, headers: [], body: .inline("{}")))
         let row = CLIRule(rule, hitCount: 3)
         XCTAssertEqual(row.cells.count, CLIRule.header.count)
-        XCTAssertEqual(row.cells, [String(rule.id.uuidString.prefix(8)), "true", "3", "respond", "418", "GET,POST", "https://a/*", "Stub"])
+        XCTAssertEqual(row.cells, [String(rule.id.uuidString.prefix(8)), "true", "3", "respond", "418", "GET,POST", "", "https://a/*", "Stub"])
 
         let txn = transaction()
         let request = NetworkArea.Row(txn, session: UUID())
         XCTAssertEqual(request.cells.count, NetworkArea.Row.header.count)
         XCTAssertEqual(request.durationMs, 123)
         XCTAssertEqual(Array(request.cells[2...6]), ["POST", "500", "123", "0", "https://api.example.com/login"])
+    }
+
+    // MARK: - Network mode and CA install
+
+    func test_networkMode_tableAndJSON() throws {
+        let mode = CLINetworkMode(NetworkModeController.State(mode: "mitm", switching: false))
+        XCTAssertEqual(CLITable.render(CLINetworkMode.header, [mode.cells]), "mode\nmitm")
+        let text = String(decoding: try JSONEncoder.daemon.encode(mode), as: UTF8.self)
+        XCTAssertEqual(text, #"{"mode":"mitm"}"#)
+    }
+
+    func test_installCAResult_tableAndJSON() throws {
+        let simulator = NetworkArea.InstallCAResult(outcome: .installed, rebootAdvised: true)
+        let failed = NetworkArea.InstallCAResult(outcome: .failed, message: "not booted")
+        XCTAssertEqual(simulator.cells.count, NetworkArea.InstallCAResult.header.count)
+        XCTAssertEqual(CLITable.render(NetworkArea.InstallCAResult.header,
+                                       [simulator.cells, failed.cells, NetworkArea.InstallCAResult(outcome: .needsUser).cells]), """
+        outcome    rebootAdvised  message
+        installed  true
+        failed                    not booted
+        needsUser
+        """)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder.daemon.encode(simulator)) as? [String: Any])
+        XCTAssertEqual(object["outcome"] as? String, "installed")
+        XCTAssertEqual(object["rebootAdvised"] as? Bool, true)
     }
 
     // MARK: - Searches

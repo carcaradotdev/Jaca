@@ -19,6 +19,9 @@ enum CLICommand: Equatable {
     case netList
     case netRequests(session: String?, host: String?, status: [NetworkStatusRange], method: String?, failed: Bool, count: Int?)
     case netShow(request: String)
+    /// `set` nil: print the network inspection mode. Otherwise a wire name, "agent" or "mitm".
+    case netMode(set: String?)
+    case netInstallCA(session: String)
     case overridesList
     case overridesAdd(from: String, name: String?, statusCode: Int?, bodyFile: String?, disabled: Bool, generalize: Bool)
     case overridesGeneralize(rule: String)
@@ -58,6 +61,8 @@ enum CLIUsage {
               arguments: "[SESSION] [-n COUNT] [--host HOST] [--status STATUS] [--method METHOD] [--failed]",
               methods: ["network.search"]),
         Entry(path: ["net", "show"], arguments: "REQUEST", methods: ["network.transaction"]),
+        Entry(path: ["net", "mode"], arguments: "[agent | mitm]", methods: ["network.mode", "network.setMode"]),
+        Entry(path: ["net", "install-ca"], arguments: "SESSION", methods: ["network.installCA"]),
         Entry(path: ["overrides", "list"], arguments: "", methods: ["overrides.state"]),
         Entry(path: ["overrides", "add"],
               arguments: "--from REQUEST [--name NAME] [--status CODE] [--body-file PATH] [--disabled] [--generalize]",
@@ -190,6 +195,14 @@ enum CLIParser {
         case ["net", "show"]:
             guard let a = scan(arguments, positionals: 1), let request = a.positionals.first else { return nil }
             return .netShow(request: request)
+        case ["net", "mode"]:
+            guard let a = scan(arguments, positionals: 1) else { return nil }
+            guard let mode = a.positionals.first else { return .netMode(set: nil) }
+            guard NetworkInspectionMode(wireName: mode) != nil else { return nil }
+            return .netMode(set: mode)
+        case ["net", "install-ca"]:
+            guard let a = scan(arguments, positionals: 1), let session = a.positionals.first else { return nil }
+            return .netInstallCA(session: session)
         case ["overrides", "list"]:
             guard scan(arguments, positionals: 0) != nil else { return nil }
             return .overridesList

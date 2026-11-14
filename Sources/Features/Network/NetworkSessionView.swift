@@ -6,6 +6,9 @@ import AppKit
 /// pane (overview / headers / bodies / timing) for the selected transaction.
 struct NetworkSessionView: View {
     @Bindable var session: NetworkSession
+    /// The global network inspection mode (`AppModel.networkInspectionMode`). The setup sheet's
+    /// "Switch to Agent" sets it.
+    @Binding var inspectionMode: NetworkInspectionMode
     @State private var showSetup = false
     @State private var showCAInstall = false
     @State private var showCompanionCA = false
@@ -57,16 +60,17 @@ struct NetworkSessionView: View {
                 showCompanionCA = true
             }
         }
-        // Proxy started but HTTPS isn't decrypting yet → guide the user to set up
-        // the CA (or switch to Agent). One-shot: cleared once consumed.
-        .onChange(of: session.proxyNeedsSetup) { _, needs in
-            if needs { showSetup = true; session.proxyNeedsSetup = false }
+        // A proxy capture runs but HTTPS isn't decrypting yet → guide the user to set up the
+        // CA (or switch to Agent). The sheet opens once per transition; the toolbar "Setup"
+        // button stays until the first decrypted request clears the flag.
+        .onChange(of: session.showsProxySetup) { _, shows in
+            if shows { showSetup = true }
         }
         .sheet(isPresented: $showSetup) {
             NetworkSetupSheet(
                 session: session,
                 onInstallCA: { showSetup = false; openCAInstall() },
-                onSwitchToAgent: { showSetup = false; session.reopenModeChooser() }
+                onSwitchToAgent: { showSetup = false; switchToAgent() }
             )
         }
         .sheet(isPresented: $showCAInstall) {
@@ -87,6 +91,17 @@ struct NetworkSessionView: View {
                     }
                 )
             }
+        }
+    }
+
+    /// Leaves MITM for the in-process agent. The mode is global, so this switches every tab:
+    /// the switch stops each capture the agent mode doesn't offer and shows its chooser. In agent
+    /// mode already, only this tab returns to its chooser.
+    private func switchToAgent() {
+        if inspectionMode == .agentHTTPSDebugging {
+            session.reopenModeChooser()
+        } else {
+            inspectionMode = .agentHTTPSDebugging
         }
     }
 
@@ -135,7 +150,12 @@ struct NetworkSessionView: View {
                 }
             } else {
                 VStack(spacing: LemonadeTheme.spaces.spacing200) {
-                    let hasCompanion = session.availableSources.contains { $0.kind == .companion }
+                    let rows = CaptureChooserRows(sources: session.availableSources)
+                    let hasCompanion = rows.hasCompanion
+                    ForEach(rows.proxySources, id: \.id) { descriptor in
+                        proxySourceRow(descriptor)
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
                     if hasCompanion {
                         LemonadeUi.Button(label: "Start companion capture", onClick: { session.startCompanionCapture() },
                                           leadingIcon: .smartphone, variant: .primary, type: .solid, size: .medium)
@@ -157,7 +177,10 @@ struct NetworkSessionView: View {
                                     .frame(maxWidth: 420)
                             }
                         }
-                    } else if session.companionCaptureEnabled && !session.agentAvailable && session.device.platform != .iosSimulator {
+                    } else if CaptureChooserRows.showsMobileAppHint(
+                        companionCaptureEnabled: session.companionCaptureEnabled,
+                        agentAvailable: session.agentAvailable, isADBDevice: session.isADBDevice,
+                        platform: session.device.platform, offersProxy: !rows.proxySources.isEmpty) {
                         LemonadeUi.Text("Install the Jaca mobile app on this device to capture its traffic, then it appears here automatically.",
                                         textStyle: LemonadeTypography.shared.bodySmallRegular,
                                         textAlign: .center,
@@ -165,7 +188,7 @@ struct NetworkSessionView: View {
                             .frame(maxWidth: 420)
                     }
 
-                    if session.canPickAgentApp {
+                    if rows.offersAgent && session.canPickAgentApp {
                         if hasCompanion {
                             LemonadeUi.Text("— or —",
                                             textStyle: LemonadeTypography.shared.bodyXSmallOverline,
@@ -178,7 +201,7 @@ struct NetworkSessionView: View {
                                         textAlign: .center,
                                         color: LemonadeTheme.colors.content.contentTertiary)
                             .frame(maxWidth: 420)
-                    } else if let reason = session.agentUnavailableReason {
+                    } else if rows.offersAgent, let reason = session.agentUnavailableReason {
                         // The in-process agent must never silently vanish: when a device that
                         // should support it can't (artifacts not built, adb missing, …), say why.
                         if hasCompanion {
@@ -190,6 +213,8 @@ struct NetworkSessionView: View {
                         agentUnavailableNotice(reason)
                     }
                 }
+                // A mode switch changes the offered sources while the chooser is on screen.
+                .animation(.easeInOut(duration: 0.25), value: session.availableSources.map(\.id))
             }
 
             if let status = session.statusMessage {
@@ -204,6 +229,29 @@ struct NetworkSessionView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(LemonadeTheme.colors.background.bgDefault)
         .accessibilityIdentifier("networkCaptureChooser")
+    }
+
+    /// One proxy capture source (the `mitm` device proxy): the descriptor's title as the action,
+    /// its detail under it.
+    private func proxySourceRow(_ descriptor: CaptureSourceDescriptor) -> some View {
+        VStack(spacing: LemonadeTheme.spaces.spacing200) {
+            LemonadeUi.Button(label: descriptor.title, onClick: { session.select(descriptor) },
+                              leadingIcon: .smartphone, variant: .primary, type: .solid, size: .medium)
+                .fixedSize()
+                .accessibilityIdentifier("captureSource-\(descriptor.id)")
+            LemonadeUi.Text(descriptor.detail,
+                            textStyle: LemonadeTypography.shared.bodyXSmallRegular,
+                            textAlign: .center,
+                            color: LemonadeTheme.colors.content.contentTertiary)
+                .frame(maxWidth: 420)
+            if let note = CaptureSourceRegistry.chooserNote(sourceID: descriptor.id, device: session.device) {
+                LemonadeUi.Text(note,
+                                textStyle: LemonadeTypography.shared.bodyXSmallRegular,
+                                textAlign: .center,
+                                color: LemonadeTheme.colors.content.contentTertiary)
+                    .frame(maxWidth: 420)
+            }
+        }
     }
 
     /// Explains why the in-process agent option is unavailable, with the remedy (build
@@ -265,7 +313,7 @@ struct NetworkSessionView: View {
 
             LemonadeUi.IconButton(icon: .trash, contentDescription: "Clear") { session.clear() }
 
-            if session.canPickAgentApp {
+            if session.canPickAgentApp && CaptureChooserRows(sources: session.availableSources).offersAgent {
                 NetworkAppPicker(session: session)
             }
 
@@ -290,12 +338,13 @@ struct NetworkSessionView: View {
                                 color: LemonadeTheme.colors.content.contentSecondary, maxLines: 1)
             }
             LemonadeUi.IconButton(icon: .download, contentDescription: "Export HAR") { exportHAR() }
-            // Proxy/CA setup only applies to a real ADB device capturing via the proxy.
-            // Companion and agent modes need no proxy setup (the companion app installs its
-            // own CA), and a companion-only device has no adb to set up — so hide it there.
+            // Proxy/CA setup applies only to a proxy capture (the Android device proxy or the
+            // iOS Simulator system proxy) that hasn't decrypted HTTPS yet. Companion and agent
+            // modes need no proxy setup (the companion app installs its own CA).
             if session.showsProxySetup {
                 LemonadeUi.Button(label: "Setup", onClick: { showSetup = true },
                                   leadingIcon: .circleInfo, variant: .neutral, type: .subtle, size: .small)
+                    .transition(.opacity)
             }
             // This Mac: bring the Chrome window back after it was closed.
             if session.captureMode == .browser && session.isRunning {
@@ -307,6 +356,7 @@ struct NetworkSessionView: View {
         .padding(.horizontal, LemonadeTheme.spaces.spacing300)
         .padding(.vertical, LemonadeTheme.spaces.spacing200)
         .background(LemonadeTheme.colors.background.bgElevated)
+        .animation(.easeInOut(duration: 0.2), value: session.showsProxySetup)
     }
 
     private var modeBadge: some View {
@@ -384,7 +434,9 @@ struct NetworkSessionView: View {
     @ViewBuilder
     private func rowMenu(for txn: NetworkTransaction) -> some View {
         let blocked = overrideUnavailableReason(for: txn)
-        let existing = session.overrides?.matchingRule(forURL: txn.url, method: txn.method)
+        let existing = session.overrides?.matchingRule(forURL: txn.url, method: txn.method,
+                                                       transport: session.interceptTransport,
+                                                       deviceID: session.device.id)
 
         Button(existing == nil ? "Override response…" : "Edit override “\(existing!.displayName)”") {
             session.selectedID = txn.id
@@ -434,7 +486,7 @@ struct NetworkSessionView: View {
                                           arming: armingState,
                                           hasRunningSource: session.hasRunningSource,
                                           overridesAvailable: session.overrides != nil,
-                                          featureEnabled: FeatureFlags.responseOverridesEnabled,
+                                          featureEnabled: true,
                                           url: txn.url,
                                           httpStack: txn.httpStack)
     }
@@ -453,12 +505,14 @@ struct NetworkSessionView: View {
 
     /// The row's override badge state, read from the shared model.
     private func overrideBadge(for txn: NetworkTransaction) -> NetworkRowView.OverrideBadge {
-        guard let overrides = session.overrides, FeatureFlags.responseOverridesEnabled else { return .none }
+        guard let overrides = session.overrides else { return .none }
         if let applied = overrides.appliedRule(for: txn) {
             return .applied(applied.displayName)
         }
         guard overrides.masterEnabled,
-              let matching = overrides.matchingRule(forURL: txn.url, method: txn.method)
+              let matching = overrides.matchingRule(forURL: txn.url, method: txn.method,
+                                                    transport: session.interceptTransport,
+                                                    deviceID: session.device.id)
         else { return .none }
 
         // A matching rule that isn't armed must not promise "applies on the next request" —
@@ -470,6 +524,7 @@ struct NetworkSessionView: View {
         if session.hasRunningSource,
            let skip = overrides.blockedReason(forURL: txn.url, method: txn.method,
                                               transport: session.interceptTransport,
+                                              deviceID: session.device.id,
                                               capabilities: session.activeInterceptCapabilities) {
             return .blocked(skip.message)
         }
@@ -828,5 +883,31 @@ private struct CompanionStatusBanner: View {
         if !capturing { return "The VPN isn't running — open the Jaca app on the device and start capture." }
         if !decrypting { return "Open the Jaca app and tap Install certificate to decrypt HTTPS — it confirms here automatically." }
         return "Capturing decrypted traffic from \(session.device.displayModel)."
+    }
+}
+
+/// Which capture-chooser sections to show for the sources the current mode offers. Pure, so the
+/// mode-dependent rows are unit-tested without the view.
+struct CaptureChooserRows {
+    /// Proxy sources (the `mitm` device proxy), one button each, in offered order.
+    let proxySources: [CaptureSourceDescriptor]
+    let hasCompanion: Bool
+    /// Whether the mode offers the in-process agent. MITM mode doesn't, even where the agent is
+    /// built, so the app picker stays hidden there.
+    let offersAgent: Bool
+
+    init(sources: [CaptureSourceDescriptor]) {
+        proxySources = sources.filter { $0.kind == .proxy }
+        hasCompanion = sources.contains { $0.kind == .companion }
+        offersAgent = sources.contains { $0.kind == .agent }
+    }
+
+    /// The "install the Jaca mobile app" hint. An adb device captures through the device proxy,
+    /// never the companion, so it never sees the hint; nor does a device with a proxy row, the
+    /// iOS Simulator, or a device the agent covers.
+    static func showsMobileAppHint(companionCaptureEnabled: Bool, agentAvailable: Bool, isADBDevice: Bool,
+                                   platform: DevicePlatform, offersProxy: Bool) -> Bool {
+        companionCaptureEnabled && !agentAvailable && !isADBDevice && !offersProxy
+            && platform != .iosSimulator
     }
 }

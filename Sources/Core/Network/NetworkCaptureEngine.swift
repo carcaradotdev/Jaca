@@ -25,6 +25,9 @@ struct NetworkCaptureState: Codable, Equatable, Sendable {
     var interceptCapabilities = 0
     /// Whether any capture source is running.
     var hasRunningSource = false
+    /// The capture source ids the current network inspection mode offers for this device, in
+    /// chooser order. Clients build the chooser from it, so none of them repeats the strategy.
+    var offeredSourceIDs: [String] = []
 }
 
 extension NetworkCaptureState {
@@ -32,6 +35,7 @@ extension NetworkCaptureState {
         case isRunning, isConnecting, statusMessage, boundPort, proxyNeedsSetup, caReady
         case selectedSourceID, hasSelectedMode, targetPackage
         case attachState, interceptWired, interceptCapabilities, hasRunningSource
+        case offeredSourceIDs
     }
 
     init(from decoder: Decoder) throws {
@@ -49,7 +53,8 @@ extension NetworkCaptureState {
             attachState: (try? c.decodeIfPresent(InterceptArmingState.self, forKey: .attachState)) ?? .idle,
             interceptWired: try c.decodeIfPresent(Bool.self, forKey: .interceptWired) ?? false,
             interceptCapabilities: try c.decodeIfPresent(Int.self, forKey: .interceptCapabilities) ?? 0,
-            hasRunningSource: try c.decodeIfPresent(Bool.self, forKey: .hasRunningSource) ?? false
+            hasRunningSource: try c.decodeIfPresent(Bool.self, forKey: .hasRunningSource) ?? false,
+            offeredSourceIDs: (try? c.decodeIfPresent([String].self, forKey: .offeredSourceIDs)) ?? []
         )
     }
 }
@@ -96,7 +101,8 @@ protocol NetworkFeed: AnyObject {
 /// `CaptureSourceRegistry`, prechecking and running it, and receiving its events as the
 /// `CaptureSink`. Transactions are handed on as they arrive.
 ///
-/// The app runs one per network tab when the daemon is off; `jacad` runs agent captures.
+/// The app runs one per network tab when the daemon is off; `jacad` runs one per capture when
+/// the network area is on.
 @MainActor
 final class NetworkCaptureEngine: NetworkFeed, CaptureSink {
     let id: UUID
@@ -112,7 +118,9 @@ final class NetworkCaptureEngine: NetworkFeed, CaptureSink {
     var harSource: (() -> [NetworkTransaction])?
 
     private let adbURL: URL?
-    private let ca: CertificateAuthority?
+    /// Read when a source is built, so a capture opened before the CA loaded (or before a mode
+    /// switch made it need one) still finds it.
+    private let ca: () -> CertificateAuthority?
     private let companion: CompanionHub?
     private let deviceContext: () -> DeviceContext?
     /// Override services for a new source, or nil when overrides are off.
@@ -120,8 +128,18 @@ final class NetworkCaptureEngine: NetworkFeed, CaptureSink {
     private var current: CaptureSource? {
         didSet { publishSourceFacts() }
     }
+    /// Counts starts and stops. A precheck launches its source only while the count is still
+    /// the one it began with, so a stop during the precheck cancels the launch.
+    private var startGeneration = 0
 
-    init(id: UUID = UUID(), device: Device, adbURL: URL?, ca: CertificateAuthority?,
+    /// Asked before a source is chosen and started, with this engine's id, the source and the
+    /// package. False refuses the start and leaves the state as it is. The owner of several
+    /// in-process engines uses it to refuse a start during a mode switch and to stop the other
+    /// captures whose claim on the device collides (`DeviceClaimArbiter`). jacad does both in
+    /// `NetworkArea`, so it leaves this nil.
+    var startGate: ((_ id: UUID, _ sourceID: String, _ package: String?) -> Bool)?
+
+    init(id: UUID = UUID(), device: Device, adbURL: URL?, ca: @escaping () -> CertificateAuthority?,
          companion: CompanionHub?, deviceContext: @escaping () -> DeviceContext?,
          interceptServices: @escaping () -> InterceptServices? = { nil }) {
         self.id = id
@@ -131,6 +149,22 @@ final class NetworkCaptureEngine: NetworkFeed, CaptureSink {
         self.companion = companion
         self.deviceContext = deviceContext
         self.interceptServices = interceptServices
+        refreshOffered()
+    }
+
+    /// An engine with a CA that is already loaded (or known to be missing).
+    convenience init(id: UUID = UUID(), device: Device, adbURL: URL?, ca: CertificateAuthority?,
+                     companion: CompanionHub?, deviceContext: @escaping () -> DeviceContext?,
+                     interceptServices: @escaping () -> InterceptServices? = { nil }) {
+        self.init(id: id, device: device, adbURL: adbURL, ca: { ca }, companion: companion,
+                  deviceContext: deviceContext, interceptServices: interceptServices)
+    }
+
+    /// Reads the offered source ids from the current strategy into the state. Call it after the
+    /// network inspection mode changes. jacad passes the strategy of the mode it owns.
+    func refreshOffered(strategy: any HTTPDebuggingStrategy = HTTPDebuggingStrategies.current) {
+        state.offeredSourceIDs = CaptureSourceRegistry.options(for: device, context: deviceContext(),
+                                                               strategy: strategy).map(\.id)
     }
 
     /// The facts about the running source the toolbar and banner need.
@@ -148,6 +182,8 @@ final class NetworkCaptureEngine: NetworkFeed, CaptureSink {
 
     func select(sourceID: String, package: String?) {
         guard let descriptor = CaptureSourceRegistry.descriptor(id: sourceID) else { return }
+        let gatedPackage = descriptor.needsPackage ? package : nil
+        if let startGate, !startGate(id, descriptor.id, gatedPackage) { return }
         if state.isRunning { stop() }
         state.targetPackage = descriptor.needsPackage ? package : nil
         state.selectedSourceID = descriptor.id
@@ -158,7 +194,7 @@ final class NetworkCaptureEngine: NetworkFeed, CaptureSink {
     func restoreMode(sourceID: String?, package: String?) {
         guard let sourceID, let descriptor = CaptureSourceRegistry.descriptor(id: sourceID) else { return }
         state.selectedSourceID = descriptor.id
-        state.targetPackage = descriptor.kind == .agent ? package : nil
+        state.targetPackage = descriptor.needsPackage ? package : nil
         state.hasSelectedMode = true
     }
 
@@ -180,10 +216,17 @@ final class NetworkCaptureEngine: NetworkFeed, CaptureSink {
         // A source that needs the device reachable (agent) verifies first and surfaces a
         // clear message instead of silently failing.
         state.isConnecting = true
+        startGeneration &+= 1
+        let generation = startGeneration
         Task { @MainActor in
             let error = await precheck(makeContext())
+            // A stop or a newer start during the precheck owns the state now.
+            guard generation == startGeneration else { return }
             state.isConnecting = false
             if let error { state.statusMessage = error; return }
+            // A mode switch can show the chooser while the precheck runs. Then the source is
+            // no longer chosen, and must not start.
+            guard state.hasSelectedMode, state.selectedSourceID == descriptor.id else { return }
             launch(descriptor)
         }
     }
@@ -198,7 +241,7 @@ final class NetworkCaptureEngine: NetworkFeed, CaptureSink {
     }
 
     private func makeContext() -> CaptureContext {
-        CaptureContext(device: device, adbURL: adbURL, ca: ca, deviceContext: deviceContext(),
+        CaptureContext(device: device, adbURL: adbURL, ca: ca(), deviceContext: deviceContext(),
                        targetPackage: state.targetPackage, companion: companion,
                        intercept: interceptServices())
     }
@@ -213,6 +256,11 @@ final class NetworkCaptureEngine: NetworkFeed, CaptureSink {
         source.start(into: self)
     }
 
+    /// The user installed Jaca's CA on this capture's device.
+    func caTrustChanged() {
+        current?.caTrustChanged()
+    }
+
     func relaunchToAttach() {
         (current as? IOSSimulatorAgentCaptureSource)?.relaunchToAttach()
     }
@@ -222,6 +270,12 @@ final class NetworkCaptureEngine: NetworkFeed, CaptureSink {
     }
 
     func stop() {
+        if state.isConnecting, !state.isRunning {
+            // Cancel the launch that waits for its precheck.
+            startGeneration &+= 1
+            state.isConnecting = false
+            return
+        }
         guard state.isRunning else { return }
         state.isRunning = false
         state.proxyNeedsSetup = false
@@ -246,8 +300,9 @@ final class NetworkCaptureEngine: NetworkFeed, CaptureSink {
     func capture(didReceive transaction: NetworkTransaction) {
         // Proof the CA is trusted only when the bytes came back decrypted with our CA: a
         // fabricated override never touched TLS, and the agent never uses the CA.
-        let mode = currentDescriptor?.kind ?? .proxy
-        if transaction.scheme == "https", transaction.error == nil, mode.decryptsWithOurCA,
+        // An unknown source proves nothing.
+        let decrypted = currentDescriptor?.kind.decryptsWithOurCA ?? false
+        if transaction.scheme == "https", transaction.error == nil, decrypted,
            !transaction.wasOverridden {
             state.caReady = true
             state.proxyNeedsSetup = false

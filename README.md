@@ -43,9 +43,10 @@ SwiftUI and the [Lemonade design system](../lemonade-design-system).
    `HttpURLConnection`/`HttpsURLConnection` (http and https) and both **OkHttp3
    and OkHttp2**, including request bodies. This is how Android Studio's Network
    Inspector works; Jaca reimplements it.
-2. **MITM proxy** (everything else): a local HTTPS-intercepting proxy. Works for
-   any app that trusts the proxy's CA; blocked by pinning. Captures full
-   request/response, headers, bodies, and timing.
+2. **MITM proxy** (every app on an Android device or an iOS Simulator): a local
+   HTTPS-intercepting proxy. Works for any app that trusts Jaca's CA; a pinned
+   host passes through without decryption. Captures full request/response,
+   headers, bodies, and timing. See [MITM HTTPS debugging](docs/mitm-http-debugging.md).
 3. **On-device companion app** (Android, no cable): a Compose Multiplatform app you
    install on the phone captures *all* its traffic with a `VpnService` + a userspace
    TCP/IP stack, attributes each flow to the owning app, and streams it to Jaca
@@ -129,15 +130,48 @@ host app's. So the layer is split exactly like AOSP does it:
 - `agent/kotlin` — the actual capture logic in **Kotlin**, loaded on a separate
   `DexClassLoader` (with its own bundled stdlib, isolated from the app's).
 
-### Network capture: the proxy
+### Network capture: the two modes
 
-For any other app, `Sources/Core/Network/ProxyServer.swift` is a swift-nio MITM
-proxy. It generates a root CA and per-host leaf certs on the fly (swift-certificates),
-terminates the client's TLS, and forwards upstream via `URLSession`. `NetworkSession`
-auto-configures the Android device proxy (`10.0.2.2` for emulators, the Mac's LAN
-IP for hardware) and the Setup sheet walks you through installing the CA.
+Settings → Network inspection picks the mode for every device. Herdr (`M`) and
+`jaca net mode [agent | mitm]` set the same value.
 
-`NetworkSession` decides per tab: debuggable target app → agent; otherwise → proxy.
+- **Agent HTTPS debugging** (default): the in-process agent above, one app at a
+  time.
+- **MITM HTTPS debugging**: `Sources/Core/Network/ProxyServer.swift`, a swift-nio
+  MITM proxy, captures every app on the device. It mints per-host leaf certs from
+  Jaca's root CA and forwards upstream via `URLSession`.
+
+A switch stops each capture whose source the new mode does not offer and shows its
+chooser. It never starts a capture.
+
+**Android (emulator or USB).** The proxy listens on `127.0.0.1:P` on the Mac.
+`adb reverse tcp:P tcp:P` makes that port the device's own loopback, and
+`settings put global http_proxy 127.0.0.1:P` sends the device's traffic to it. The
+proxy never listens on the LAN. A phone with only the companion app gets the
+companion capture instead.
+
+**iOS Simulator.** Jaca points the macOS web and secure web proxy at
+`127.0.0.1:P` with `networksetup`. It decrypts only connections from simulator
+processes (found by pid through libproc) and relays every other Mac connection
+raw, without recording it.
+
+**CA install.** The capture never installs the CA; the user starts it from the
+setup sheet, Herdr (`I`) or `jaca net install-ca`:
+- iOS Simulator: `simctl keychain add-root-cert`, then an offered reboot.
+- Android where `adb root` works: a headless install into the system store.
+- Other Android phones: the CA goes to Download and the guided install sheet
+  takes over.
+
+**Revert and ledger.** Before it changes a device, Jaca writes what it had to
+`~/.jaca/network/device-proxies.json` (Android) or `~/.jaca/mac-system-proxy.json`
+(the Mac system proxy). Stop puts the previous value back. After a crash, jacad
+start and app start restore an entry whose owner process is dead, but only while
+the setting still reads Jaca's value. The sidebar Revert banner is the last
+backstop.
+
+**Gaps.** No call stacks, no app-scoped rules, no HTTP/2, gRPC, `wss` or
+streaming, and pinned hosts pass through. A physical iOS device has no MITM
+capture. Full flow: [docs/mitm-http-debugging.md](docs/mitm-http-debugging.md).
 
 ---
 
@@ -296,11 +330,13 @@ Honest about what each capture mode can and can't do:
   on the list. Captured bodies are capped at ~1 MB each. Currently pushes the
   `arm64-v8a` build (device-ABI auto-select is pending). It's the only mode that
   gives you the request call stack.
-- **Proxy:** works for any app, but the app must trust the installed CA — release
-  builds that pin certificates or don't trust user CAs can't be decrypted. No call
-  stack (impossible from outside the process).
-- **iOS network:** there is no system-level inspector like Android's, so iOS is
-  proxy-only with the same CA/pinning caveats.
+- **Proxy (MITM HTTPS debugging):** works for any app, but the app must trust the
+  installed CA — release builds that pin certificates or don't trust user CAs
+  pass through without decryption. No call stack (impossible from outside the
+  process). HTTP/2, gRPC and WebSockets over TLS aren't supported. On the iOS
+  Simulator it changes the Mac system proxy while a capture runs.
+- **iOS network:** the iOS Simulator has the agent and the Mac system proxy. A
+  physical iOS device has no capture yet.
 - **Physical iOS logs:** need `idevicesyslog` (`brew install libimobiledevice`);
   you get the device syslog, not a clean per-app stream like Android.
 

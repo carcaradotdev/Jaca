@@ -56,6 +56,26 @@ final class CLIParserTests: XCTestCase {
         XCTAssertEqual(parse("overrides ungroup 9c").command, .overridesSetGroup(rule: "9c", group: nil))
     }
 
+    func test_netMode_readsOrSetsAWireName() {
+        XCTAssertEqual(parse("net mode").command, .netMode(set: nil))
+        XCTAssertEqual(parse("net mode mitm").command, .netMode(set: "mitm"))
+        XCTAssertEqual(parse("net mode agent --json").command, .netMode(set: "agent"))
+        XCTAssertTrue(parse("net mode agent --json").json)
+    }
+
+    /// `jaca net mode bogus` is a usage error, which `jaca` exits with status 2.
+    func test_netMode_anUnknownModeIsUsage() {
+        for line in ["net mode bogus", "net mode MITM", "net mode agent mitm", "net mode --mode mitm"] {
+            XCTAssertEqual(parse(line).command, .usage(path: ["net", "mode"]), line)
+        }
+    }
+
+    func test_netInstallCA_namesACapture() {
+        XCTAssertEqual(parse("net install-ca 3fa2").command, .netInstallCA(session: "3fa2"))
+        XCTAssertEqual(parse("net install-ca").command, .usage(path: ["net", "install-ca"]))
+        XCTAssertEqual(parse("net install-ca a b").command, .usage(path: ["net", "install-ca"]))
+    }
+
     /// A value with spaces arrives as one argument; a name that starts with a dash goes after `--`.
     func test_valuesWithSpacesAndDashes() {
         XCTAssertEqual(CLIParser.parse(["overrides", "enable", "GET users"]).command,
@@ -159,6 +179,10 @@ final class CLIParserTests: XCTestCase {
         }
         XCTAssertEqual(CLIUsage.text(under: ["net", "show"], program: "jaca"),
                        "usage: jaca net show REQUEST\n       jaca ... [--json] [--raw] [--no-spawn] [--help]")
+        XCTAssertEqual(CLIUsage.text(under: ["net", "mode"], program: "jaca"),
+                       "usage: jaca net mode [agent | mitm]\n       jaca ... [--json] [--raw] [--no-spawn] [--help]")
+        XCTAssertEqual(CLIUsage.methods(under: ["net", "mode"]), ["network.mode", "network.setMode"])
+        XCTAssertEqual(CLIUsage.methods(under: ["net", "install-ca"]), ["network.installCA"])
         XCTAssertEqual(CLIUsage.methods(under: ["overrides"]),
                        ["overrides.state", "overrides.createFromTransaction", "overrides.save",
                         "overrides.setEnabled", "overrides.saveGroup", "overrides.remove",

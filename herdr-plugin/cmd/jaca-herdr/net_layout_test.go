@@ -192,3 +192,38 @@ func TestAttachBanner(t *testing.T) {
 		t.Errorf("the Android banner offers the simulator setting: %q", rows[1])
 	}
 }
+
+// The certificate banner fills the pane's width on every row, and wraps a long outcome.
+func TestSetupBannerWidth(t *testing.T) {
+	v := testNetViewer(t)
+	v.state = netState{IsRunning: true, SelectedSourceID: "mitm", ProxyNeedsSetup: true}
+	for _, cols := range []int{150, 80, 40, 3} {
+		rows := v.setupBanner(cols)
+		if len(rows) == 0 {
+			t.Fatalf("%d cols: no rows", cols)
+		}
+		for _, row := range rows {
+			if got := plainWidth(row); got != cols {
+				t.Errorf("%d cols: banner row is %d cells: %q", cols, got, stripSGR(row))
+			}
+		}
+	}
+	if row := stripSGR(v.setupBanner(150)[0]); !strings.Contains(row, "Install Jaca's certificate on the device: I install · x dismiss") {
+		t.Errorf("prompt: %q", row)
+	}
+	v.setup = installOutcome(installCAResult{Outcome: "needsUser"}, nil)
+	rows := v.setupBanner(60)
+	if len(rows) < 2 || len(rows) > setupBannerMaxRows {
+		t.Errorf("a long outcome in 60 cols takes %d rows", len(rows))
+	}
+	// Drawn, the banner sits above the list, which moves down to make room.
+	setTermSize(t, 30, 120)
+	v.opened = true
+	v.draw()
+	withBanner := v.listTop
+	v.setup, v.state.ProxyNeedsSetup = setupBanner{}, false
+	v.draw()
+	if withBanner <= v.listTop {
+		t.Errorf("the list starts at row %d with the banner and %d without", withBanner, v.listTop)
+	}
+}

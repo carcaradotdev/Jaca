@@ -11,6 +11,12 @@ import NIOTLS
 /// then the origin), emitting a `NetworkTransaction` per request/response. A tunnel that
 /// doesn't start with TLS (Chrome sends a `ws://` WebSocket through `CONNECT` too) is relayed
 /// to its target unread.
+///
+/// Two hooks narrow what it decrypts:
+/// - `shouldDecrypt(host)`: a TLS tunnel to a host it rejects is relayed raw (a pinned app).
+/// - `clientPolicy`: decides per client connection. `.relayRaw` forwards that client's traffic
+///   without decrypting it and without a transaction (a Mac app on the system proxy);
+///   `.intercept(target:)` decrypts it and attributes it to that target (one simulator).
 final class ProxyServer: @unchecked Sendable {
     let port: Int
     private let ca: CertificateAuthority
@@ -21,6 +27,9 @@ final class ProxyServer: @unchecked Sendable {
     private let pipeline: InterceptPipeline
     private let target: ProxyInterceptTarget
     private let bindHost: String
+    private let shouldDecrypt: @Sendable (String) -> Bool
+    private let clientPolicy: (@Sendable (ProxyClientInfo) -> ProxyClientPolicy)?
+    private let targetHooks: ProxyTargetHooks?
     private let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
     private var channel: Channel?
 
@@ -30,38 +39,84 @@ final class ProxyServer: @unchecked Sendable {
     /// `pipeline` defaults to no rules: every request goes to the origin, redirects unfollowed
     /// so the client re-requests each hop through the proxy. `bindHost` is every interface by
     /// default, for a device on the LAN; a proxy only this Mac uses binds loopback.
+    ///
+    /// `shouldDecrypt` is asked once per TLS tunnel with the `CONNECT` host; false relays the
+    /// tunnel raw. `clientPolicy` is asked once per accepted client connection, on
+    /// `policyQueue` (never on the event loop); nil treats every client as
+    /// `.intercept(target: target)`.
     init(port: Int, ca: CertificateAuthority,
          pipeline: InterceptPipeline? = nil,
          target: ProxyInterceptTarget = ProxyInterceptTarget(),
          bindHost: String = "0.0.0.0",
+         shouldDecrypt: @escaping @Sendable (String) -> Bool = { _ in true },
+         clientPolicy: (@Sendable (ProxyClientInfo) -> ProxyClientPolicy)? = nil,
          onTransaction: @escaping @Sendable (NetworkTransaction) -> Void,
-         onHandshake: (@Sendable (String, Bool) -> Void)? = nil) {
+         onHandshake: (@Sendable (String, Bool) -> Void)? = nil,
+         targetHooks: ProxyTargetHooks? = nil) {
         self.port = port
         self.ca = ca
         self.pipeline = pipeline
             ?? InterceptPipeline(origin: OriginClient(upstream: UpstreamClient(), policy: .doNotFollow))
         self.target = target
         self.bindHost = bindHost
+        self.shouldDecrypt = shouldDecrypt
+        self.clientPolicy = clientPolicy
         self.onTransaction = onTransaction
         self.onHandshake = onHandshake
+        self.targetHooks = targetHooks
     }
 
     func start() throws {
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.backlog, value: 256)
             .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-            .childChannelInitializer { [ca, pipeline, target, onTransaction, onHandshake] channel in
-                channel.pipeline.addHandler(HTTPResponseEncoder(), name: "encoder").flatMap {
+            .childChannelInitializer { [ca, pipeline, target, shouldDecrypt, clientPolicy, onTransaction, onHandshake, targetHooks] channel in
+                // The channel is not registered until this future completes, so no byte is read
+                // before the policy is known. The hook can be slow (a libproc scan), so it runs on
+                // its own queue and never blocks the event loop that serves other clients.
+                let info = ProxyServer.clientInfo(channel)
+                let decided: EventLoopFuture<ProxyClientPolicy>
+                if let clientPolicy {
+                    let promise = channel.eventLoop.makePromise(of: ProxyClientPolicy.self)
+                    ProxyServer.policyQueue.async { promise.succeed(clientPolicy(info)) }
+                    decided = promise.futureResult
+                } else {
+                    decided = channel.eventLoop.makeSucceededFuture(.intercept(target: target))
+                }
+                return decided.flatMap { policy in
+                let connection: ProxyHandler.Connection
+                let emit: @Sendable (NetworkTransaction) -> Void
+                let report: (@Sendable (String, Bool) -> Void)?
+                switch policy {
+                case .intercept(let target):
+                    if let hooks = targetHooks {
+                        connection = ProxyHandler.Connection(target: target, raw: false, shouldDecrypt: {
+                            shouldDecrypt($0) && hooks.shouldDecrypt(target, $0)
+                        })
+                        emit = { onTransaction($0); hooks.onTransaction(target, $0) }
+                        report = { onHandshake?($0, $1); hooks.onHandshake(target, $0, $1) }
+                    } else {
+                        connection = ProxyHandler.Connection(target: target, raw: false, shouldDecrypt: shouldDecrypt)
+                        emit = onTransaction
+                        report = onHandshake
+                    }
+                case .relayRaw:
+                    connection = ProxyHandler.Connection(target: target, raw: true, shouldDecrypt: { _ in false })
+                    emit = onTransaction
+                    report = onHandshake
+                }
+                return channel.pipeline.addHandler(HTTPResponseEncoder(), name: "encoder").flatMap {
                     channel.pipeline.addHandler(
                         ByteToMessageHandler(HTTPRequestDecoder(leftOverBytesStrategy: .forwardBytes)),
                         name: "decoder"
                     )
                 }.flatMap {
                     channel.pipeline.addHandler(
-                        ProxyHandler(ca: ca, pipeline: pipeline, target: target, onTransaction: onTransaction,
-                                     onHandshake: onHandshake, mode: .initial),
+                        ProxyHandler(ca: ca, pipeline: pipeline, connection: connection,
+                                     onTransaction: emit, onHandshake: report, mode: .initial),
                         name: "proxy"
                     )
+                }
                 }
             }
             .childChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
@@ -81,6 +136,26 @@ final class ProxyServer: @unchecked Sendable {
         channel?.close(promise: nil)
         channel = nil
         DispatchQueue.global(qos: .utility).async { try? group.syncShutdownGracefully() }
+    }
+
+    /// Where `clientPolicy` runs. Concurrent, so one slow lookup does not delay the next client.
+    static let policyQueue = DispatchQueue(label: "jaca.proxy.client-policy", qos: .userInitiated,
+                                           attributes: .concurrent)
+
+    /// The client and local addresses of an accepted connection. Empty host and 0 ports when
+    /// the socket has no address (it closed before the initializer ran).
+    static func clientInfo(_ channel: Channel) -> ProxyClientInfo {
+        ProxyClientInfo(remoteHost: channel.remoteAddress?.ipAddress ?? "",
+                        remotePort: channel.remoteAddress?.port ?? 0,
+                        localPort: channel.localAddress?.port ?? 0)
+    }
+
+    /// The policy for one client: the hook's answer, or `.intercept(target: defaultTarget)` when
+    /// there is no hook.
+    static func resolvePolicy(_ hook: (@Sendable (ProxyClientInfo) -> ProxyClientPolicy)?,
+                              info: ProxyClientInfo,
+                              defaultTarget: ProxyInterceptTarget) -> ProxyClientPolicy {
+        hook?(info) ?? .intercept(target: defaultTarget)
     }
 
     /// The host and port of a `CONNECT` target: "host:port", or "[v6]:port". 443 when the
@@ -107,6 +182,36 @@ struct ProxyInterceptTarget: Sendable, Equatable {
     var appID: String?
 }
 
+/// Hooks that also receive the target of an intercepted client. One proxy that serves several
+/// devices uses them to route each transaction and handshake to the capture of its device.
+struct ProxyTargetHooks: Sendable {
+    /// Asked with `shouldDecrypt`; a TLS tunnel is decrypted only when both return true.
+    var shouldDecrypt: @Sendable (ProxyInterceptTarget, String) -> Bool
+    /// Called after `onTransaction`, with the same transaction.
+    var onTransaction: @Sendable (ProxyInterceptTarget, NetworkTransaction) -> Void
+    /// Called after `onHandshake`, with the same host and result.
+    var onHandshake: @Sendable (ProxyInterceptTarget, String, Bool) -> Void
+}
+
+/// One accepted client connection, as `ProxyServer.clientPolicy` sees it.
+struct ProxyClientInfo: Sendable, Equatable {
+    /// The client's IP address ("127.0.0.1", "::1").
+    var remoteHost: String
+    /// The client's source port. With `remoteHost` it finds the client socket's process.
+    var remotePort: Int
+    /// The proxy port the client connected to.
+    var localPort: Int
+}
+
+/// What `ProxyServer` does with one client connection.
+enum ProxyClientPolicy: Sendable, Equatable {
+    /// Decrypt and record its requests, attributed to `target`.
+    case intercept(target: ProxyInterceptTarget)
+    /// Forward its `CONNECT` tunnels and absolute-URI requests to the origin as they are: no
+    /// decryption, no override rules, no transaction.
+    case relayRaw
+}
+
 // MARK: - Handler
 
 private final class ProxyHandler: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
@@ -118,9 +223,18 @@ private final class ProxyHandler: ChannelInboundHandler, RemovableChannelHandler
         case tls(host: String, port: Int)  // after CONNECT + TLS upgrade; origin-form requests
     }
 
+    /// What the client policy decided for this client connection.
+    struct Connection: Sendable {
+        var target: ProxyInterceptTarget
+        /// Relay without decryption, rules or transactions.
+        var raw: Bool
+        var shouldDecrypt: @Sendable (String) -> Bool
+    }
+
     private let ca: CertificateAuthority
     private let pipeline: InterceptPipeline
-    private let target: ProxyInterceptTarget
+    private let connection: Connection
+    private var target: ProxyInterceptTarget { connection.target }
     private let onTransaction: @Sendable (NetworkTransaction) -> Void
     private let onHandshake: (@Sendable (String, Bool) -> Void)?
     private let mode: Mode
@@ -128,12 +242,12 @@ private final class ProxyHandler: ChannelInboundHandler, RemovableChannelHandler
     private var requestHead: HTTPRequestHead?
     private var bodyBuffer = Data()
 
-    init(ca: CertificateAuthority, pipeline: InterceptPipeline, target: ProxyInterceptTarget,
+    init(ca: CertificateAuthority, pipeline: InterceptPipeline, connection: Connection,
          onTransaction: @escaping @Sendable (NetworkTransaction) -> Void,
          onHandshake: (@Sendable (String, Bool) -> Void)?, mode: Mode) {
         self.ca = ca
         self.pipeline = pipeline
-        self.target = target
+        self.connection = connection
         self.onTransaction = onTransaction
         self.onHandshake = onHandshake
         self.mode = mode
@@ -152,6 +266,8 @@ private final class ProxyHandler: ChannelInboundHandler, RemovableChannelHandler
             guard let head = requestHead else { return }
             if head.method == .CONNECT {
                 handleConnect(context: context, head: head)
+            } else if connection.raw {
+                forwardRaw(context: context, head: head, body: bodyBuffer)
             } else {
                 forward(context: context, head: head, body: bodyBuffer)
             }
@@ -182,7 +298,8 @@ private final class ProxyHandler: ChannelInboundHandler, RemovableChannelHandler
     /// Swaps the HTTP handlers for a sniffer that reads the tunnel's first bytes.
     private func startTunnel(channel: Channel, host: String, port: Int) {
         let pipeline = channel.pipeline
-        let sniffer = TunnelSniffer(host: host, port: port, tls: { [self] in try tlsHandlers(host: host, port: port) })
+        let sniffer = TunnelSniffer(host: host, port: port, shouldDecrypt: connection.shouldDecrypt,
+                                    tls: { [self] in try tlsHandlers(host: host, port: port) })
         pipeline.removeHandler(name: "decoder")
             .flatMap { pipeline.removeHandler(name: "encoder") }
             .flatMap { pipeline.removeHandler(name: "proxy") }
@@ -204,7 +321,7 @@ private final class ProxyHandler: ChannelInboundHandler, RemovableChannelHandler
             HandshakeObserver(host: host, report: onHandshake),
             HTTPResponseEncoder(),
             ByteToMessageHandler(HTTPRequestDecoder(leftOverBytesStrategy: .forwardBytes)),
-            ProxyHandler(ca: ca, pipeline: self.pipeline, target: target, onTransaction: onTransaction,
+            ProxyHandler(ca: ca, pipeline: self.pipeline, connection: connection, onTransaction: onTransaction,
                          onHandshake: onHandshake, mode: .tls(host: host, port: port)),
         ]
     }
@@ -266,6 +383,32 @@ private final class ProxyHandler: ChannelInboundHandler, RemovableChannelHandler
         }
     }
 
+    /// A plain-HTTP request of a `.relayRaw` client: fetched from the origin and written back,
+    /// with no rules and no transaction. Each request is fetched on its own, because one client
+    /// connection can carry requests for different hosts.
+    private func forwardRaw(context: ChannelHandlerContext, head: HTTPRequestHead, body: Data) {
+        guard URL(string: head.uri)?.host != nil else {
+            writeError(context: context, message: "Invalid URL: \(head.uri)")
+            return
+        }
+        let request = InterceptedRequest(
+            method: head.method.rawValue, url: head.uri,
+            headers: head.headers.map { HeaderPair(name: $0.name, value: $0.value) },
+            body: body.isEmpty ? nil : body, transport: .mitmProxy
+        )
+        let channel = context.channel
+        Task {
+            let response = await ProxyHandler.rawOrigin.perform(request)
+            channel.eventLoop.execute {
+                HTTPWireFormat.writeResponse(channel: channel, response: response)
+            }
+        }
+    }
+
+    /// The origin for `.relayRaw` requests. It never follows redirects, so the client sees each
+    /// hop as it would without a proxy.
+    private static let rawOrigin = OriginClient(upstream: UpstreamClient(), policy: .doNotFollow)
+
     private func writeError(context: ChannelHandlerContext, message: String) {
         var headers = HTTPHeaders()
         let body = Data(message.utf8)
@@ -286,9 +429,10 @@ private final class ProxyHandler: ChannelInboundHandler, RemovableChannelHandler
 
 // MARK: - Tunnel
 
-/// The first handler of a `CONNECT` tunnel. TLS (a handshake record, 0x16) gets the decrypting
-/// handlers; anything else is a protocol the proxy doesn't read, such as a `ws://` WebSocket,
-/// and is relayed to the target as it is, without a transaction.
+/// The first handler of a `CONNECT` tunnel. TLS (a handshake record, 0x16) to a host that
+/// `shouldDecrypt` accepts gets the decrypting handlers. Anything else is relayed to the target as
+/// it is, without a transaction: TLS to a passed-through host, or a protocol the proxy doesn't
+/// read, such as a `ws://` WebSocket.
 private final class TunnelSniffer: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
     typealias InboundIn = ByteBuffer
 
@@ -296,12 +440,15 @@ private final class TunnelSniffer: ChannelInboundHandler, RemovableChannelHandle
 
     private let host: String
     private let port: Int
+    private let shouldDecrypt: @Sendable (String) -> Bool
     private let tls: () throws -> [ChannelHandler]
     private var state = State.waiting
 
-    init(host: String, port: Int, tls: @escaping () throws -> [ChannelHandler]) {
+    init(host: String, port: Int, shouldDecrypt: @escaping @Sendable (String) -> Bool,
+         tls: @escaping () throws -> [ChannelHandler]) {
         self.host = host
         self.port = port
+        self.shouldDecrypt = shouldDecrypt
         self.tls = tls
     }
 
@@ -315,7 +462,11 @@ private final class TunnelSniffer: ChannelInboundHandler, RemovableChannelHandle
         case .waiting:
             let buffer = unwrapInboundIn(data)
             guard let first = buffer.getInteger(at: buffer.readerIndex, as: UInt8.self) else { return }
-            if first == 0x16 { decrypt(context: context, data: data) } else { relay(context: context, first: buffer) }
+            if first == 0x16, shouldDecrypt(host) {
+                decrypt(context: context, data: data)
+            } else {
+                relay(context: context, first: buffer)
+            }
         }
     }
 

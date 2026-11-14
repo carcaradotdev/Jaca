@@ -1,7 +1,8 @@
 import Foundation
 
-/// Network captures in the daemon (in-process agent capture and this Mac's Chrome window;
-/// companion capture stays in the app). Each capture keeps its transactions, with bodies beyond the newest `bodiesInMemory`
+/// Network captures in the daemon (the in-process agent, the device proxy, the iOS Simulator
+/// through the Mac system proxy, and this Mac's Chrome window; companion capture stays in the
+/// app). Each capture keeps its transactions, with bodies beyond the newest `bodiesInMemory`
 /// spilled to `NetworkBodyCache`. Clients get upserts **without bodies** on `net.txns.<id>` and
 /// fetch a transaction's bodies with `network.body` when they show it.
 enum NetworkArea {
@@ -15,6 +16,20 @@ enum NetworkArea {
     }
     struct SelectParams: Codable, Sendable { var id: UUID; var sourceID: String; var package: String? }
     struct IDParams: Codable, Sendable { var id: UUID }
+    struct SetModeParams: Codable, Sendable {
+        /// A wire name: "agent" or "mitm".
+        var mode: String
+    }
+    /// What `network.installCA` did.
+    struct InstallCAResult: Codable, Sendable, Equatable {
+        enum Outcome: String, Codable, Sendable { case installed, needsUser, failed }
+        var outcome: Outcome
+        /// Why the install failed. nil unless `outcome` is `failed`.
+        var message: String?
+        /// iOS Simulator: apps see the new certificate only after a reboot
+        /// (`network.rebootSimulator`). nil on other devices.
+        var rebootAdvised: Bool?
+    }
     struct BodyParams: Codable, Sendable { var id: UUID; var transaction: UUID }
     struct Bodies: Codable, Sendable, Equatable { var request: Data?; var response: Data? }
     struct SessionInfo: Codable, Sendable, Equatable {
@@ -77,13 +92,86 @@ enum NetworkArea {
     static let defaultSearchRows = 100
     static let maxSearchRows = 1_000
 
-    /// The running captures a new capture of `package` on `deviceID` replaces: every other one
-    /// of the same app on the same device. A capture with no app chosen replaces none.
-    static func capturesToStop(_ sessions: [(id: UUID, deviceID: String, package: String?, isRunning: Bool)],
-                               starting id: UUID, package: String?, on deviceID: String) -> [UUID] {
-        guard let package else { return [] }
-        return sessions.filter { $0.id != id && $0.isRunning && $0.deviceID == deviceID && $0.package == package }
-            .map(\.id)
+    static let companionInAppMessage = "Companion capture runs in the app, not in jacad."
+    static let sourceNotOfferedMessage = "This capture source isn't available in the current network inspection mode."
+    static let unknownModeMessage = "Unknown mode. Use agent or mitm."
+
+    /// The error `network.select` gives for `sourceID` on `device`, or nil when the source may
+    /// start. Companion capture needs the CA and the gRPC links, which stay in the app, so jacad
+    /// refuses it even where the mode offers it.
+    @MainActor
+    static func selectRefusal(sourceID: String, device: Device, strategy: any HTTPDebuggingStrategy) -> String? {
+        if sourceID == HTTPDebuggingSourceID.companion
+            || CaptureSourceRegistry.descriptor(id: sourceID)?.kind == .companion {
+            return companionInAppMessage
+        }
+        return strategy.sourceIDs(for: device).contains(sourceID) ? nil : sourceNotOfferedMessage
+    }
+
+    /// One running capture, as `capturesToStop` sees it.
+    struct RunningCapture: Sendable {
+        var id: UUID
+        var device: Device
+        var sourceID: String
+        var package: String?
+    }
+
+    /// The running captures that capture `id` replaces when it starts `sourceID` on `device`:
+    /// each one whose claim on the same device collides with the new claim
+    /// (`DeviceClaimArbiter`). Pass only running captures.
+    static func capturesToStop(running: [RunningCapture], starting id: UUID, on device: Device, sourceID: String,
+                               package: String?, strategy: any HTTPDebuggingStrategy) -> [UUID] {
+        let claim = strategy.claim(device: device, sourceID: sourceID, package: package)
+        let held = running.map {
+            DeviceClaimArbiter.Running(id: $0.id, deviceID: $0.device.id,
+                                       claim: strategy.claim(device: $0.device, sourceID: $0.sourceID, package: $0.package))
+        }
+        return DeviceClaimArbiter.decide(running: held, starting: id, deviceID: device.id, claim: claim)
+    }
+
+    static let noCAMessage = "Couldn’t read Jaca’s certificate. Check ~/.jaca/jacad.log."
+    static let adbMissingMessage = "adb not found. Set its path in Settings or install Android platform-tools."
+    static let pushFailedMessage = "Couldn't copy the certificate to the device."
+    static let installCAUnsupportedMessage = "Jaca can install its certificate only on an Android device or an iOS Simulator."   // COPY-PENDING
+    static let rebootNotSimulatorMessage = "Only an iOS Simulator can be rebooted from here."   // COPY-PENDING
+
+    /// The `network.installCA` result of an Android install. `pushed` is whether the copy to
+    /// Download worked; nil when no copy was tried.
+    static func installCAResult(android outcome: HeadlessCAOutcome, pushed: Bool?) -> InstallCAResult {
+        switch outcome {
+        case .installed:
+            return InstallCAResult(outcome: .installed)
+        case .failed(let message):
+            return InstallCAResult(outcome: .failed, message: message)
+        case .notRooted:
+            return pushed == true
+                ? InstallCAResult(outcome: .needsUser)
+                : InstallCAResult(outcome: .failed, message: pushFailedMessage)
+        }
+    }
+
+    /// The `network.installCA` result of a simulator install. A reboot is advised after it.
+    static func installCAResult(simulator result: Result<Void, SimulatorCAError>) -> InstallCAResult {
+        switch result {
+        case .success: return InstallCAResult(outcome: .installed, rebootAdvised: true)
+        case .failure(let error): return InstallCAResult(outcome: .failed, message: error.message)
+        }
+    }
+
+    /// The source a restored tab keeps: nil when the mode no longer offers it, or when it is
+    /// companion capture, which stays in the app. Such a tab opens at the chooser.
+    @MainActor
+    static func restoredSourceID(_ sourceID: String?, device: Device, strategy: any HTTPDebuggingStrategy) -> String? {
+        guard let sourceID else { return nil }
+        return selectRefusal(sourceID: sourceID, device: device, strategy: strategy) == nil ? sourceID : nil
+    }
+
+    /// The mode a `network.setMode` wire name names. Throws `invalidParams` for any other name.
+    static func mode(wireName: String) throws -> NetworkInspectionMode {
+        guard let mode = NetworkInspectionMode(wireName: wireName) else {
+            throw RPCError.invalidParams(unknownModeMessage)
+        }
+        return mode
     }
 
     static func transactionsTopic(_ id: UUID) -> String { "net.txns.\(id.uuidString)" }
@@ -119,15 +207,24 @@ enum NetworkArea {
         private var spillGeneration = 0
         /// Override services for a new capture source (nil when overrides are off).
         var interceptServices: () -> InterceptServices? = { nil }
-        /// The app's CA, read when the first capture of this Mac's browser opens. Only that
-        /// capture terminates TLS here; the agent captures don't need it.
+        /// The app's CA, read the first time a capture source or `network.installCA` needs it.
+        /// jacad never migrates a key from the Keychain, so it never shows a Keychain prompt.
         var loadCA: () -> CertificateAuthority? = {
-            do { return try CertificateAuthority() } catch {
+            do { return try CertificateAuthority(allowKeychainMigration: false) } catch {
                 DaemonLog.error("couldn't read the CA: \(error)")
                 return nil
             }
         }
         private var ca: CertificateAuthority?
+        /// The owner of the network inspection mode. nil in tests that install no controller;
+        /// then the persisted mode applies.
+        weak var modeController: NetworkModeController?
+        /// The CA installers `network.installCA` runs.
+        var caInstall: NetworkCAInstall = .live
+        /// adb, as Settings sets it.
+        var resolveADB: () -> URL? = {
+            AndroidToolchain.adbURL(override: JacaDefaults.shared.string(forKey: DevicesEngine.adbPathKey))
+        }
 
         init(bus: DaemonEventBus, bodyCache: NetworkBodyCache? = NetworkBodyCache(name: "net-bodies-jacad"),
              bodiesInMemory: Int = 1_000, orphanTimeout: TimeInterval = 600) {
@@ -137,19 +234,47 @@ enum NetworkArea {
             self.orphanTimeout = orphanTimeout
         }
 
-        var isBusy: Bool { sessions.values.contains { $0.engine.state.isRunning } }
+        var isBusy: Bool {
+            sessions.values.contains { $0.engine.state.isRunning } || (modeController?.isSwitching ?? false)
+        }
+
+        /// The strategy of the current network inspection mode.
+        var strategy: any HTTPDebuggingStrategy { modeController?.strategy ?? HTTPDebuggingStrategies.current }
+
+        /// Returns when no mode switch is queued or running.
+        func idle() async { await modeController?.idle() }
+
+        /// The CA, loaded on first use. A failed load is tried again next time, so a CA that the
+        /// app writes later is found without a restart.
+        func currentCA() -> CertificateAuthority? {
+            if ca == nil { ca = loadCA() }
+            return ca
+        }
+
+        /// `open`, after any mode switch in progress.
+        func openWhenIdle(_ p: OpenParams) async -> SessionInfo {
+            await idle()
+            return open(p)
+        }
+
+        /// `select`, after any mode switch in progress.
+        func selectWhenIdle(_ id: UUID, sourceID: String, package: String?) async throws {
+            await idle()
+            try select(id, sourceID: sourceID, package: package)
+        }
 
         func open(_ p: OpenParams) -> SessionInfo {
             if let existing = sessions[p.id] {
                 return SessionInfo(id: p.id, state: existing.engine.state, existed: true)
             }
-            let adb = AndroidToolchain.adbURL(override: JacaDefaults.shared.string(forKey: DevicesEngine.adbPathKey))
+            let adb = resolveADB()
             let context = context(for: p.device, adbURL: adb)
             let intercept = interceptServices
-            if p.device.platform == .mac, ca == nil { ca = loadCA() }
             let engine = NetworkCaptureEngine(id: p.id, device: p.device, adbURL: adb,
-                                              ca: p.device.platform == .mac ? ca : nil, companion: nil,
+                                              ca: { [weak self] in self?.currentCA() }, companion: nil,
                                               deviceContext: { context }, interceptServices: { intercept() })
+            let strategy = self.strategy
+            engine.refreshOffered(strategy: strategy)
             let hosted = Hosted(engine: engine, device: p.device)
             sessions[p.id] = hosted
             let id = p.id, bus = self.bus
@@ -159,35 +284,120 @@ enum NetworkArea {
                 self.scheduleFlush()
             }
             engine.onState = { bus.publish(NetworkArea.stateTopic(id), $0, retain: true) }
-            // Companion capture stays in the app (see `network.select`): such a tab reopens at the chooser.
-            let sourceID = p.sourceID.flatMap { CaptureSourceRegistry.descriptor(id: $0)?.kind == .companion ? nil : $0 }
+            // A source the mode no longer offers, or companion capture (it stays in the app, see
+            // `network.select`): such a tab reopens at the chooser.
+            let sourceID = NetworkArea.restoredSourceID(p.sourceID, device: p.device, strategy: strategy)
             engine.restoreMode(sourceID: sourceID, package: p.package)
             bus.publish(NetworkArea.stateTopic(id), engine.state, retain: true)
-            if p.autoStart == true {
-                stopOthers(capturing: engine.state.targetPackage, on: p.device.id, except: id)
+            if p.autoStart == true, let sourceID {
+                stopOthers(starting: id, on: p.device, sourceID: sourceID, package: engine.state.targetPackage)
                 engine.resume()
             }
             return SessionInfo(id: id, state: engine.state, existed: false)
         }
 
-        /// Starts a capture: first stops every other capture of the same app on the same device.
-        /// The app's agent serves one capture at a time, so two of them take its connection from
-        /// each other, and the control frames that route overridden hosts get lost. The newest
-        /// one wins; the stopped ones keep what they recorded.
+        /// Starts a capture: first stops every running capture whose claim on the same device
+        /// collides with it (`DeviceClaimArbiter`). Two agent captures of one app take the
+        /// agent's connection from each other, and a device proxy changes the whole device. The
+        /// newest one wins; the stopped ones keep what they recorded.
+        ///
+        /// Throws `invalidParams` for a source the current mode does not offer on the device.
         func select(_ id: UUID, sourceID: String, package: String?) throws {
             let hosted = try session(id)
-            stopOthers(capturing: package, on: hosted.device.id, except: id)
+            if let refusal = NetworkArea.selectRefusal(sourceID: sourceID, device: hosted.device, strategy: strategy) {
+                throw RPCError.invalidParams(refusal)
+            }
+            let needsPackage = CaptureSourceRegistry.descriptor(id: sourceID)?.needsPackage ?? false
+            stopOthers(starting: id, on: hosted.device, sourceID: sourceID, package: needsPackage ? package : nil)
             hosted.engine.select(sourceID: sourceID, package: package)
         }
 
-        private func stopOthers(capturing package: String?, on deviceID: String, except id: UUID) {
-            let running = sessions.map { (id: $0.key, deviceID: $0.value.device.id,
-                                          package: $0.value.engine.state.targetPackage,
-                                          isRunning: $0.value.engine.state.isRunning) }
-            for other in NetworkArea.capturesToStop(running, starting: id, package: package, on: deviceID) {
-                DaemonLog.info("stopping network capture \(other): capture \(id) starts on \(package ?? "")")
+        private func stopOthers(starting id: UUID, on device: Device, sourceID: String, package: String?) {
+            let running: [NetworkArea.RunningCapture] = sessions.compactMap { otherID, hosted in
+                let state = hosted.engine.state
+                // A capture in its precheck counts too: it arms when the precheck ends.
+                guard state.isRunning || state.isConnecting, let otherSource = state.selectedSourceID else { return nil }
+                return NetworkArea.RunningCapture(id: otherID, device: hosted.device, sourceID: otherSource,
+                                                  package: state.targetPackage)
+            }
+            let stop = NetworkArea.capturesToStop(running: running, starting: id, on: device, sourceID: sourceID,
+                                                  package: package, strategy: strategy)
+            for other in stop {
+                DaemonLog.info("stopping network capture \(other): capture \(id) starts \(sourceID) on \(device.id)")
                 sessions[other]?.engine.stop()
             }
+        }
+
+        /// Every open capture, as a mode switch sees it. A capture at the chooser has no source.
+        func modeSwitchCaptures() -> [ModeSwitchPlan.Capture] {
+            sessions.map { id, hosted in
+                let state = hosted.engine.state
+                return ModeSwitchPlan.Capture(id: id, device: hosted.device,
+                                              sourceID: state.hasSelectedMode ? state.selectedSourceID : nil)
+            }
+        }
+
+        /// Reads the offered sources of every capture again, and publishes each state, after a
+        /// mode switch.
+        func refreshOffered() {
+            let strategy = self.strategy
+            for (id, hosted) in sessions {
+                hosted.engine.refreshOffered(strategy: strategy)
+                bus.publish(NetworkArea.stateTopic(id), hosted.engine.state, retain: true)
+            }
+        }
+
+        /// Installs Jaca's CA on the capture's device. Only a user action calls it.
+        /// - iOS Simulator: adds the CA to the simulator keychain. Apps see it after a reboot.
+        /// - Android: installs into the system store when `adb root` works. Otherwise copies the
+        ///   CA to Download for a manual install, and returns `needsUser`.
+        func installCA(_ id: UUID) async throws -> InstallCAResult {
+            let result = try await installCAOnDevice(id)
+            // Hosts passed through before the install failed for want of the CA. Decrypt them again.
+            if result.outcome == .installed { sessions[id]?.engine.caTrustChanged() }
+            return result
+        }
+
+        private func installCAOnDevice(_ id: UUID) async throws -> InstallCAResult {
+            let device = try session(id).device
+            guard device.platform == .android || device.platform == .iosSimulator else {
+                return InstallCAResult(outcome: .failed, message: NetworkArea.installCAUnsupportedMessage)
+            }
+            guard let ca = currentCA() else {
+                return InstallCAResult(outcome: .failed, message: NetworkArea.noCAMessage)
+            }
+            let install = caInstall
+            if device.platform == .iosSimulator {
+                let result = await install.simulatorInstall(device.id, ca.rootCertificatePEM)
+                return NetworkArea.installCAResult(simulator: result)
+            }
+            guard let adb = resolveADB() else {
+                return InstallCAResult(outcome: .failed, message: NetworkArea.adbMissingMessage)
+            }
+            let pem = FileManager.default.temporaryDirectory
+                .appendingPathComponent("jaca-ca-\(UUID().uuidString.prefix(8)).pem")
+            defer { try? FileManager.default.removeItem(at: pem) }
+            do { try ca.exportRootCertificate(to: pem) } catch {
+                DaemonLog.error("couldn't write the CA for \(device.id): \(error)")
+                return InstallCAResult(outcome: .failed, message: NetworkArea.noCAMessage)
+            }
+            let rooted = await install.androidRooted(adb, device.id, pem)
+            var pushed: Bool?
+            if rooted == .notRooted { pushed = await install.androidPush(adb, device.id, pem) }
+            return NetworkArea.installCAResult(android: rooted, pushed: pushed)
+        }
+
+        /// Reboots the capture's iOS Simulator, so its apps load a newly installed CA.
+        func rebootSimulator(_ id: UUID) async throws {
+            let device = try session(id).device
+            guard device.platform == .iosSimulator else {
+                throw RPCError.invalidParams(NetworkArea.rebootNotSimulatorMessage)
+            }
+            if case .failure(let error) = await caInstall.simulatorReboot(device.id) {
+                throw RPCError.failed(error.message)
+            }
+            // The simulator's apps load the CA at boot, so a host they failed on before can work now.
+            for hosted in sessions.values where hosted.device.id == device.id { hosted.engine.caTrustChanged() }
         }
 
         private func context(for device: Device, adbURL: URL?) -> DeviceContext {
@@ -358,15 +568,20 @@ enum NetworkArea {
     }
 
     /// Installs the area and returns its captures, which `OverridesArea` seeds rules from.
+    /// Without a `controller`, the area makes one on the persisted mode.
     @MainActor
     @discardableResult
     static func install(on server: DaemonServer, captures: Captures? = nil,
+                        controller: NetworkModeController? = nil,
                         interceptServices: @escaping () -> InterceptServices? = { nil }) -> Captures {
         let orphan = DaemonDefaults.orphanTimeout
         let captures = captures ?? Captures(bus: server.bus, orphanTimeout: orphan)
         captures.interceptServices = interceptServices
+        let controller = controller ?? NetworkModeController(captures: captures, bus: server.bus)
         server.keep(captures)
-        server.addBusyCheck("network") { captures.isBusy }
+        server.keep(controller)
+        // A pending device teardown also counts: quitting then would strand a device proxy.
+        server.addBusyCheck("network") { captures.isBusy || !DeviceReleaseGate.shared.pendingSerials.isEmpty }
         server.keep(TaskBox(Task { @MainActor [weak captures] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(min(60, max(1, captures?.orphanTimeout ?? 60) / 4)))
@@ -382,19 +597,36 @@ enum NetworkArea {
                    returns: .object(["id": .uuid, "state": .networkCaptureState, "existed": .boolean])) { p, _ in
             try DaemonInput.device(p.device)
             try DaemonInput.package(p.package)
-            return await captures.open(p)
+            return await captures.openWhenIdle(p)
         }
         r.register("network.select", "Chooses a capture source (agent) and starts it.", params: SelectParams.self,
                    takes: .object(["id": .uuid, "sourceID": .string], optional: ["package": .string]), returns: .empty) { p, _ in
             try DaemonInput.package(p.package)
-            try await MainActor.run {
-                // Companion capture needs the CA and the gRPC links, which stay in the app.
-                if CaptureSourceRegistry.descriptor(id: p.sourceID)?.kind == .companion {
-                    throw RPCError.invalidParams("Companion capture runs in the app, not in jacad.")
-                }
-                try captures.select(p.id, sourceID: p.sourceID, package: p.package)
-            }
+            try await captures.selectWhenIdle(p.id, sourceID: p.sourceID, package: p.package)
             return RPCEmpty()
+        }
+        r.register("network.mode", "The network inspection mode: agent or mitm.",
+                   takes: .empty, returns: .networkMode) { (_: RPCEmpty, _) in
+            await controller.state
+        }
+        r.register("network.setMode", "Sets the network inspection mode, and stops the captures it no longer offers.",
+                   params: SetModeParams.self, takes: .object(["mode": .enumeration(["agent", "mitm"])]),
+                   returns: .empty) { p, _ in
+            let mode = try NetworkArea.mode(wireName: p.mode)
+            await controller.setMode(mode)
+            return RPCEmpty()
+        }
+        // COPY-PENDING: the approved summary does not name the iOS Simulator; proposed:
+        // "Installs Jaca's certificate on the capture's device: into the system store when the
+        // device is rooted, into the keychain of an iOS Simulator, otherwise into Download for a
+        // manual install."
+        r.register("network.installCA", "Installs Jaca's certificate on the capture's device: into the system store when the device is rooted, otherwise into Download for a manual install.",
+                   params: IDParams.self, takes: .sessionID, returns: .networkInstallCAResult) { p, _ in
+            try await captures.installCA(p.id)
+        }
+        r.register("network.rebootSimulator", "iOS Simulator: reboots it, so its apps trust a newly installed certificate.",   // COPY-PENDING
+                   params: IDParams.self, takes: .sessionID, returns: .empty) { p, _ in
+            try await captures.rebootSimulator(p.id); return RPCEmpty()
         }
         r.register("network.reopenChooser", "Stops and returns to source selection.", params: IDParams.self,
                    takes: .sessionID, returns: .empty) { p, _ in
@@ -459,6 +691,7 @@ enum NetworkArea {
         }
         r.describeTopic("net.txns.<id>", "Coalesced transaction upserts (~50ms), bodies omitted. Dropped for a slow client; resync with network.transactions. Data: [NetworkTransaction].")
         r.describeTopic("net.state.<id>", "The capture's state. Data: NetworkCaptureState.", retained: true)
+        r.describeTopic(NetworkModeController.topic, "The network inspection mode. Data: {mode, switching}.", retained: true)   // COPY-PENDING
         return captures
     }
 }
@@ -500,4 +733,22 @@ extension NetworkArea.Row {
         responseBytes = (try? c.decodeIfPresent(Int.self, forKey: .responseBytes)) ?? 0
         overriddenByRuleID = try? c.decodeIfPresent(UUID.self, forKey: .overriddenByRuleID)
     }
+}
+
+/// The installers `network.installCA` and `network.rebootSimulator` run. Tests pass fakes, so
+/// they never touch a device.
+struct NetworkCAInstall: Sendable {
+    /// (adb, serial, PEM file) -> the headless rooted install.
+    var androidRooted: @Sendable (URL, String, URL) async -> HeadlessCAOutcome
+    /// (adb, serial, PEM file) -> whether the copy to Download worked.
+    var androidPush: @Sendable (URL, String, URL) async -> Bool
+    /// (UDID, PEM text).
+    var simulatorInstall: @Sendable (String, String) async -> Result<Void, SimulatorCAError>
+    var simulatorReboot: @Sendable (String) async -> Result<Void, SimulatorCAError>
+
+    static let live = NetworkCAInstall(
+        androidRooted: { await AndroidCACertInstaller.installRootedHeadless(adbURL: $0, serial: $1, caPEM: $2) },
+        androidPush: { await AndroidCACertInstaller.pushForManualInstall(adbURL: $0, serial: $1, caPEM: $2) },
+        simulatorInstall: { await SimulatorCAInstaller().install(udid: $0, caPEM: $1) },
+        simulatorReboot: { await SimulatorCAInstaller().reboot(udid: $0) })
 }

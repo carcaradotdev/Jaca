@@ -148,6 +148,41 @@ type netState struct {
 	InterceptWired        bool        `json:"interceptWired"`
 	InterceptCapabilities int         `json:"interceptCapabilities"`
 	HasRunningSource      bool        `json:"hasRunningSource"`
+	BoundPort             int         `json:"boundPort"`
+	ProxyNeedsSetup       bool        `json:"proxyNeedsSetup"`
+	CAReady               bool        `json:"caReady"`
+	// The sources the chooser offers in the current mode. nil when jacad doesn't send them (a
+	// jacad from before the mode); an empty list when the device has none.
+	OfferedSourceIDs []string `json:"offeredSourceIDs"`
+}
+
+// The capture source ids that network.select takes (HTTPDebuggingSourceID).
+const (
+	sourceAgent     = "agent"
+	sourceMITM      = "mitm"
+	sourceBrowser   = "browser"
+	sourceCompanion = "companion"
+)
+
+// The network inspection modes, by their wire names (NetworkInspectionMode.wireName).
+const (
+	modeAgent = "agent"
+	modeMITM  = "mitm"
+)
+
+// netModeState mirrors NetworkModeController.State: the result of network.mode and the payload
+// of the network.mode topic.
+type netModeState struct {
+	Mode      string `json:"mode"`
+	Switching bool   `json:"switching"`
+}
+
+// installCAResult mirrors NetworkArea.InstallCAResult. Outcome is "installed", "needsUser" or
+// "failed". Message is set only for "failed", and RebootAdvised only after a simulator install.
+type installCAResult struct {
+	Outcome       string `json:"outcome"`
+	Message       string `json:"message"`
+	RebootAdvised bool   `json:"rebootAdvised"`
 }
 
 // formatNetSize is NetworkFormatting.size.

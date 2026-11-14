@@ -9,7 +9,7 @@ import Foundation
 ///   store, so we mount a tmpfs over `/system/etc/security/cacerts` and bind it
 ///   into each process's APEX namespace via `nsenter` (the technique validated
 ///   against the live emulator). This is non-persistent (cleared on reboot), so
-///   it's safe to re-run on each capture start.
+///   it's safe to re-run. Only a user action starts it, never capture start.
 /// - Not rooted → pushes the cert and opens the system CA-install dialog straight
 ///   to the confirm screen (via a `content://` VIEW intent), then waits for the
 ///   user to finish, auto-detecting completion in the background.
@@ -142,93 +142,29 @@ final class AndroidCACertInstaller {
     // MARK: - Rooted (system store)
 
     private func runRooted() async {
-        // 1. Root.
-        setState("root", .active)
-        guard await acquireRoot() else {
-            fail("root", "Couldn't get root on this device.")
-            return
+        let result = await Self.runRootedInstall(
+            adbURL: adbURL, serial: serial, caPEM: caPEM,
+            knownCapabilities: capabilities, environment: .live, checkCancellation: true
+        ) { [weak self] event in
+            guard let self else { return }
+            switch event {
+            case .began(let step): self.setState(step.rawValue, .active)
+            case .finished(let step): self.setState(step.rawValue, .done)
+            case .skipped(let step): self.setState(step.rawValue, .skipped)
+            case .rootViaSu(let viaSu): self.rootViaSu = viaSu
+            case .hash(let hash):
+                self.hashName = "\(hash).0"
+                self.detail(HeadlessCAStep.prepare.rawValue, "\(hash).0")
+            }
         }
-        setState("root", .done)
-        if Task.isCancelled { return }
-
-        // 2. Prepare: compute the Android subject-hash filename and push the cert.
-        setState("prepare", .active)
-        guard let hash = await Self.subjectHashOld(pem: caPEM) else {
-            fail("prepare", "Couldn't compute the certificate hash (openssl).")
-            return
+        // nil means the task was cancelled; `cancel()` already set the phase.
+        guard let result, !Task.isCancelled, phase != .cancelled else { return }
+        let active = steps.first { $0.state == .active }?.id ?? HeadlessCAStep.root.rawValue
+        switch result {
+        case .installed: phase = .succeeded
+        case .notRooted: fail(active, "Couldn't get root on this device.")
+        case .failed(let message): fail(active, message)
         }
-        hashName = "\(hash).0"
-        let devCert = "/data/local/tmp/\(hash).0"
-        guard await push(caPEM.path, to: devCert) else {
-            fail("prepare", "Couldn't copy the certificate to the device.")
-            return
-        }
-        detail("prepare", "\(hash).0")
-        setState("prepare", .done)
-        if Task.isCancelled { return }
-
-        // 3. Inject into the system / APEX store.
-        setState("install", .active)
-        guard await injectSystemStore(hash: hash, devCert: devCert) else {
-            fail("install", "Couldn't write to the system trust store.")
-            return
-        }
-        setState("install", .done)
-        if Task.isCancelled { return }
-
-        // 4. Verify the cert is visible in the live trust store.
-        setState("verify", .active)
-        if await verifySystemStore(hash: hash) {
-            setState("verify", .done)
-            phase = .succeeded
-        } else {
-            fail("verify", "The certificate didn't appear in the trust store.")
-        }
-    }
-
-    /// `adb root` (userdebug/emulator) or fall back to Magisk `su`. Returns whether
-    /// subsequent shell commands will run as root.
-    private func acquireRoot() async -> Bool {
-        let r = try? await CommandRunner.run(adbURL, ["-s", serial, "root"])
-        let out = ((r?.stdout ?? "") + (r?.stderr ?? "")).lowercased()
-        if !(out.contains("cannot run as root") || out.contains("production builds")) {
-            // "restarting adbd as root" / "already running as root" — wait for adbd,
-            // then confirm we actually have root.
-            _ = try? await CommandRunner.run(adbURL, ["-s", serial, "wait-for-device"])
-            let id = try? await CommandRunner.run(adbURL, ["-s", serial, "shell", "id"])
-            if id?.stdout.contains("uid=0") == true { rootViaSu = false; return true }
-        }
-        // adbd refused or isn't root — fall back to Magisk `su`.
-        if await suAvailable() { rootViaSu = true; return true }
-        return false
-    }
-
-    private func suAvailable() async -> Bool {
-        let r = try? await CommandRunner.run(adbURL, ["-s", serial, "shell", "su", "0", "id"])
-        return r?.stdout.contains("uid=0") ?? false
-    }
-
-    /// Runs the validated injection script as root.
-    private func injectSystemStore(hash: String, devCert: String) async -> Bool {
-        let script = Self.injectionScript(hash: hash, devCert: devCert, useApex: capabilities.usesApexCACerts)
-        let r = await runRootScript(script)
-        return r?.stdout.contains("JACA_INJECT_OK") ?? false
-    }
-
-    /// Verifies in an **app's** mount namespace (zygote), which is what newly
-    /// launched apps inherit — NOT adbd's namespace, where we deliberately don't
-    /// bind the APEX overlay. (Checking via a plain `adb shell` would always miss
-    /// it on API 34+.)
-    private func verifySystemStore(hash: String) async -> Bool {
-        let path = capabilities.usesApexCACerts
-            ? "/apex/com.android.conscrypt/cacerts/\(hash).0"
-            : "/system/etc/security/cacerts/\(hash).0"
-        let script = """
-        Z=$(pidof zygote64 zygote | tr ' ' '\\n' | head -n1)
-        [ -n "$Z" ] && nsenter --mount=/proc/$Z/ns/mnt -- ls \(path)
-        """
-        let r = await runRootScript(script)
-        return r?.stdout.contains("\(hash).0") ?? false
     }
 
     // MARK: - Non-rooted: manual (user installs, we guide on-device)
@@ -237,7 +173,7 @@ final class AndroidCACertInstaller {
         setState("push", .active)
         let devCert = "/storage/emulated/0/Download/JacaProxyCA.crt"
         hashName = "JacaProxyCA.crt"
-        guard await push(caPEM.path, to: devCert) else {
+        guard await Self.push(caPEM.path, to: devCert, adbURL: adbURL, serial: serial, environment: .live) else {
             fail("push", "Couldn't copy the certificate to the device.")
             return
         }
@@ -277,7 +213,7 @@ final class AndroidCACertInstaller {
         setState("push", .active)
         let devCert = "/storage/emulated/0/Download/JacaProxyCA.crt"
         hashName = "JacaProxyCA.crt"
-        guard await push(caPEM.path, to: devCert) else {
+        guard await Self.push(caPEM.path, to: devCert, adbURL: adbURL, serial: serial, environment: .live) else {
             fail("push", "Couldn't copy the certificate to the device.")
             return
         }
@@ -396,30 +332,9 @@ final class AndroidCACertInstaller {
 
     // MARK: - adb helpers
 
-    private func push(_ local: String, to remote: String) async -> Bool {
-        let r = try? await CommandRunner.run(adbURL, ["-s", serial, "push", local, remote])
-        return r?.exitCode == 0
-    }
-
-    /// Runs `script` as root by pushing it to the device and executing the **file**
-    /// — not `sh -c "<inline>"`, which adb's shell re-splits on spaces and mangles
-    /// (`$()`, pipes, `--` all break). Validated: only the file form runs reliably.
     @discardableResult
     private func runRootScript(_ script: String) async -> CommandRunner.Result? {
-        guard let url = writeTempScript(script, name: "script.sh") else { return nil }
-        defer { try? FileManager.default.removeItem(at: url) }
-        let dev = "/data/local/tmp/jaca-\(UUID().uuidString).sh"
-        guard await push(url.path, to: dev) else { return nil }
-        let invoke = rootViaSu ? ["shell", "su", "0", "sh", dev] : ["shell", "sh", dev]
-        let r = try? await CommandRunner.run(adbURL, ["-s", serial] + invoke)
-        _ = try? await CommandRunner.run(adbURL, ["-s", serial, "shell", "rm", "-f", dev])
-        return r
-    }
-
-    private func writeTempScript(_ contents: String, name: String) -> URL? {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString)-\(name)")
-        do { try contents.write(to: url, atomically: true, encoding: .utf8); return url }
-        catch { return nil }
+        await Self.runRootScript(script, adbURL: adbURL, serial: serial, viaSu: rootViaSu, environment: .live)
     }
 
     // MARK: - Progress mutation
@@ -435,6 +350,161 @@ final class AndroidCACertInstaller {
     private func fail(_ id: String, _ message: String) {
         setState(id, .failed)
         phase = .failed(message)
+    }
+
+    // MARK: - Static: headless install
+
+    /// Installs the CA into the system trust store with no UI and no step
+    /// progress. The TUI, the CLI and the GUI's rooted branch use this path.
+    /// It does nothing when the CA is already in the store. Only a user action
+    /// calls it; capture start never does.
+    nonisolated static func installRootedHeadless(
+        adbURL: URL, serial: String, caPEM: URL,
+        environment: AndroidCAInstallEnvironment = .live
+    ) async -> HeadlessCAOutcome {
+        let result = await runRootedInstall(
+            adbURL: adbURL, serial: serial, caPEM: caPEM, knownCapabilities: nil,
+            environment: environment, checkCancellation: false, progress: { _ in })
+        // `checkCancellation: false` never returns nil; treat nil as "no change made".
+        return result ?? .notRooted
+    }
+
+    /// Copies the CA to the device's Download folder so the user can install it
+    /// from Settings. Returns false when the push fails.
+    nonisolated static func pushForManualInstall(adbURL: URL, serial: String, caPEM: URL) async -> Bool {
+        await ProxyConfigurator.pushCACertToAndroid(adbURL: adbURL, serial: serial, caPEM: caPEM)
+    }
+
+    /// The rooted install, shared by the headless call and the step UI.
+    /// - `knownCapabilities`: skip the probe when the caller already has them.
+    /// - `checkCancellation`: return nil when the task is cancelled between steps.
+    /// - `progress`: step events for the UI.
+    /// The failure messages are the step UI's existing copy.
+    nonisolated static func runRootedInstall(
+        adbURL: URL, serial: String, caPEM: URL,
+        knownCapabilities: AndroidCapabilities?,
+        environment env: AndroidCAInstallEnvironment,
+        checkCancellation: Bool,
+        progress: @escaping @MainActor @Sendable (HeadlessCAEvent) -> Void
+    ) async -> HeadlessCAOutcome? {
+        func cancelled() -> Bool { checkCancellation && Task.isCancelled }
+
+        // 1. Root.
+        await progress(.began(.root))
+        var caps = knownCapabilities
+        if caps == nil { caps = await env.probe(adbURL, serial) }
+        guard let caps, caps.root == .rooted else { return .notRooted }
+        guard let viaSu = await acquireRoot(adbURL: adbURL, serial: serial, environment: env) else {
+            return .notRooted
+        }
+        await progress(.rootViaSu(viaSu))
+        await progress(.finished(.root))
+        if cancelled() { return nil }
+
+        // 2. Prepare: compute the Android subject-hash filename.
+        await progress(.began(.prepare))
+        guard let hash = await env.subjectHash(caPEM) else {
+            return .failed("Couldn't compute the certificate hash (openssl).")
+        }
+        await progress(.hash(hash))
+
+        // Already trusted: change nothing.
+        if await verifySystemStore(hash: hash, useApex: caps.usesApexCACerts,
+                                   adbURL: adbURL, serial: serial, viaSu: viaSu, environment: env) {
+            await progress(.finished(.prepare))
+            await progress(.skipped(.install))
+            await progress(.began(.verify))
+            await progress(.finished(.verify))
+            return .installed
+        }
+        if cancelled() { return nil }
+
+        let devCert = "/data/local/tmp/\(hash).0"
+        guard await push(caPEM.path, to: devCert, adbURL: adbURL, serial: serial, environment: env) else {
+            return .failed("Couldn't copy the certificate to the device.")
+        }
+        await progress(.finished(.prepare))
+        if cancelled() { return nil }
+
+        // 3. Inject into the system / APEX store.
+        await progress(.began(.install))
+        let script = injectionScript(hash: hash, devCert: devCert, useApex: caps.usesApexCACerts)
+        let injected = await runRootScript(script, adbURL: adbURL, serial: serial, viaSu: viaSu, environment: env)
+        guard injected?.stdout.contains("JACA_INJECT_OK") == true else {
+            return .failed("Couldn't write to the system trust store.")
+        }
+        await progress(.finished(.install))
+        if cancelled() { return nil }
+
+        // 4. Verify the cert is visible in the live trust store.
+        await progress(.began(.verify))
+        guard await verifySystemStore(hash: hash, useApex: caps.usesApexCACerts,
+                                      adbURL: adbURL, serial: serial, viaSu: viaSu, environment: env) else {
+            return .failed("The certificate didn't appear in the trust store.")
+        }
+        await progress(.finished(.verify))
+        return .installed
+    }
+
+    /// `adb root` (userdebug/emulator) or fall back to Magisk `su`. Returns nil
+    /// without root, otherwise whether root commands need the `su 0` wrapper.
+    nonisolated static func acquireRoot(adbURL: URL, serial: String,
+                                        environment env: AndroidCAInstallEnvironment) async -> Bool? {
+        let r = try? await env.run(adbURL, ["-s", serial, "root"])
+        let out = ((r?.stdout ?? "") + (r?.stderr ?? "")).lowercased()
+        if !(out.contains("cannot run as root") || out.contains("production builds")) {
+            // "restarting adbd as root" / "already running as root" — wait for adbd,
+            // then confirm we actually have root.
+            _ = try? await env.run(adbURL, ["-s", serial, "wait-for-device"])
+            let id = try? await env.run(adbURL, ["-s", serial, "shell", "id"])
+            if id?.stdout.contains("uid=0") == true { return false }
+        }
+        // adbd refused or isn't root — fall back to Magisk `su`.
+        let su = try? await env.run(adbURL, ["-s", serial, "shell", "su", "0", "id"])
+        return su?.stdout.contains("uid=0") == true ? true : nil
+    }
+
+    /// Verifies in an **app's** mount namespace (zygote), which is what newly
+    /// launched apps inherit — NOT adbd's namespace, where we deliberately don't
+    /// bind the APEX overlay. (Checking via a plain `adb shell` would always miss
+    /// it on API 34+.)
+    nonisolated static func verifySystemStore(hash: String, useApex: Bool, adbURL: URL, serial: String,
+                                              viaSu: Bool, environment env: AndroidCAInstallEnvironment) async -> Bool {
+        let r = await runRootScript(verifyScript(hash: hash, useApex: useApex),
+                                    adbURL: adbURL, serial: serial, viaSu: viaSu, environment: env)
+        return r?.stdout.contains("\(hash).0") ?? false
+    }
+
+    nonisolated static func verifyScript(hash: String, useApex: Bool) -> String {
+        let path = useApex
+            ? "/apex/com.android.conscrypt/cacerts/\(hash).0"
+            : "/system/etc/security/cacerts/\(hash).0"
+        return """
+        Z=$(pidof zygote64 zygote | tr ' ' '\\n' | head -n1)
+        [ -n "$Z" ] && nsenter --mount=/proc/$Z/ns/mnt -- ls \(path)
+        """
+    }
+
+    nonisolated static func push(_ local: String, to remote: String, adbURL: URL, serial: String,
+                                 environment env: AndroidCAInstallEnvironment) async -> Bool {
+        let r = try? await env.run(adbURL, ["-s", serial, "push", local, remote])
+        return r?.exitCode == 0
+    }
+
+    /// Runs `script` as root by pushing it to the device and executing the **file**
+    /// — not `sh -c "<inline>"`, which adb's shell re-splits on spaces and mangles
+    /// (`$()`, pipes, `--` all break). Validated: only the file form runs reliably.
+    nonisolated static func runRootScript(_ script: String, adbURL: URL, serial: String, viaSu: Bool,
+                                          environment env: AndroidCAInstallEnvironment) async -> CommandRunner.Result? {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString)-script.sh")
+        do { try script.write(to: url, atomically: true, encoding: .utf8) } catch { return nil }
+        defer { try? FileManager.default.removeItem(at: url) }
+        let dev = "/data/local/tmp/jaca-\(UUID().uuidString).sh"
+        guard await push(url.path, to: dev, adbURL: adbURL, serial: serial, environment: env) else { return nil }
+        let invoke = viaSu ? ["shell", "su", "0", "sh", dev] : ["shell", "sh", dev]
+        let r = try? await env.run(adbURL, ["-s", serial] + invoke)
+        _ = try? await env.run(adbURL, ["-s", serial, "shell", "rm", "-f", dev])
+        return r
     }
 
     // MARK: - Static: hash + scripts
@@ -500,4 +570,42 @@ final class AndroidCACertInstaller {
         echo JACA_UNINSTALL_OK
         """
     }
+}
+
+/// The result of a headless rooted CA install.
+enum HeadlessCAOutcome: Sendable, Equatable {
+    /// The CA is in the system trust store (newly, or it already was).
+    case installed
+    /// Jaca can't get root on this device; use the manual install instead.
+    case notRooted
+    /// Root worked but a step failed. The message is the step UI's copy.
+    case failed(String)
+}
+
+/// The steps of the rooted install. The raw values are the step UI's ids.
+enum HeadlessCAStep: String, Sendable {
+    case root, prepare, install, verify
+}
+
+/// Progress from `AndroidCACertInstaller.runRootedInstall`, for the step UI.
+enum HeadlessCAEvent: Sendable {
+    case began(HeadlessCAStep)
+    case finished(HeadlessCAStep)
+    case skipped(HeadlessCAStep)
+    case rootViaSu(Bool)
+    case hash(String)
+}
+
+/// The commands the rooted install runs. Tests swap these for fakes so they
+/// never touch a device or call openssl.
+struct AndroidCAInstallEnvironment: Sendable {
+    var run: @Sendable (URL, [String]) async throws -> CommandRunner.Result
+    var probe: @Sendable (URL, String) async -> AndroidCapabilities
+    var subjectHash: @Sendable (URL) async -> String?
+
+    static let live = AndroidCAInstallEnvironment(
+        run: { try await CommandRunner.run($0, $1) },
+        probe: { await AndroidCapabilityProbe.probe(adbURL: $0, serial: $1) },
+        subjectHash: { await AndroidCACertInstaller.subjectHashOld(pem: $0) }
+    )
 }

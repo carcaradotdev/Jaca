@@ -233,8 +233,6 @@ func (v *netViewer) overridesStatus() (text, style string) {
 		return "Overrides inactive  " + arming.Message, sgrRed
 	case arming.blockedMessage() != "":
 		return arming.blockedMessage(), sgrYellow
-	case !v.feature:
-		return "Turn on Agent HTTPS debugging in Settings to apply these rules.", sgrDim
 	case len(v.overrides.Rules) == 0:
 		return "", ""
 	}
@@ -1270,14 +1268,15 @@ func (v *netViewer) matchPreview(d *ruleDraft) (text string, caution bool) {
 		return "", false // nothing to say about a pattern the pane can't run
 	}
 	// Recomputed per 50 captured requests, as the app does, so a busy capture doesn't rescan each frame.
-	key := fmt.Sprintf("%s\x00%s\x00%s\x00%d", m.Pattern, m.Kind, strings.Join(m.Methods, ","), len(v.txns)/50)
+	key := fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%d", m.Pattern, m.Kind, strings.Join(m.Methods, ","),
+		strings.Join(d.rule.RoutedHosts, ","), len(v.txns)/50)
 	if key != d.previewKey {
 		probe := d.rule
 		probe.Matcher, probe.Enabled, probe.Scope = m, true, ruleScope{}
 		set := compileRules([]overrideRule{probe}, true)
 		count := 0
 		for _, t := range v.txns {
-			if _, ok := set.matchingRule(t.URL, t.Method); ok {
+			if _, ok := set.matchingRuleOn(t.URL, t.Method, v.transport(), v.device.ID); ok {
 				count++
 			}
 		}

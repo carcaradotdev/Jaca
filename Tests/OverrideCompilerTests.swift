@@ -112,6 +112,115 @@ final class OverrideCompilerTests: XCTestCase {
         XCTAssertEqual(set.routedHosts(deviceID: nil, appID: nil), ["api.example.com"])
     }
 
+    // MARK: - Routed hosts as a host filter under MITM
+
+    func test_mitm_wildcardRuleFiresOnlyOnItsRoutedHosts() {
+        let wildcard = rule("**/path", hosts: ["a.com"])
+        let set = OverrideCompiler.compile([wildcard], masterEnabled: true)
+        XCTAssertNotNil(set.firstMatch(facts: facts("https://a.com/path"), method: "GET",
+                                       deviceID: nil, appID: nil, transport: .mitmProxy))
+        XCTAssertNil(set.firstMatch(facts: facts("https://b.com/path"), method: "GET",
+                                    deviceID: nil, appID: nil, transport: .mitmProxy))
+    }
+
+    func test_agent_wildcardRuleStillFiresOnEveryHost() {
+        let wildcard = rule("**/path", hosts: ["a.com"])
+        let set = OverrideCompiler.compile([wildcard], masterEnabled: true)
+        let agent = InterceptTransportID.androidAgent(package: "com.example")
+        XCTAssertNotNil(set.firstMatch(facts: facts("https://a.com/path"), method: "GET",
+                                       deviceID: nil, appID: nil, transport: agent))
+        XCTAssertNotNil(set.firstMatch(facts: facts("https://b.com/path"), method: "GET",
+                                       deviceID: nil, appID: nil, transport: agent))
+    }
+
+    func test_mitm_ruleWithNoRoutedHostsMatchesEveryHost() {
+        let wildcard = rule("**/path", hosts: [])
+        let set = OverrideCompiler.compile([wildcard], masterEnabled: true)
+        for url in ["https://a.com/path", "https://b.com/path"] {
+            XCTAssertNotNil(set.firstMatch(facts: facts(url), method: "GET",
+                                           deviceID: nil, appID: nil, transport: .mitmProxy), url)
+        }
+    }
+
+    /// A rule filtered out by host must not hide a later rule that does apply.
+    func test_mitm_filteredRuleFallsThroughToTheNextRule() {
+        let first = rule("**/path", name: "first", hosts: ["a.com"])
+        let second = rule("**/path", name: "second", hosts: [])
+        let set = OverrideCompiler.compile([first, second], masterEnabled: true)
+        XCTAssertEqual(set.firstMatch(facts: facts("https://b.com/path"), method: "GET",
+                                      deviceID: nil, appID: nil, transport: .mitmProxy)?.rule.name,
+                       "second")
+    }
+
+    func test_mitm_hostCompareIgnoresCaseAndPort() {
+        let wildcard = rule("**/path", hosts: ["API.Example.com:8443"])
+        let set = OverrideCompiler.compile([wildcard], masterEnabled: true)
+        XCTAssertNotNil(set.firstMatch(facts: facts("https://api.example.com:8443/path"), method: "GET",
+                                       deviceID: nil, appID: nil, transport: .mitmProxy))
+    }
+
+    /// Generalize keeps the device's host as the routed host. In This Mac's Chrome capture,
+    /// which is also `.mitmProxy`, the rule must still answer the dev server's other host.
+    func test_mitm_browserCaptureIgnoresRoutedHosts() {
+        let generalized = rule("**/lending/v1/offers", hosts: ["private-api.teya.xyz"])
+        let set = OverrideCompiler.compile([generalized], masterEnabled: true)
+        let browser = facts("http://localhost:3000/private-api/lending/v1/offers")
+        XCTAssertNotNil(set.firstMatch(facts: browser, method: "GET", deviceID: Device.thisMac.id,
+                                       appID: nil, transport: .mitmProxy))
+        XCTAssertNil(set.firstMatch(facts: browser, method: "GET", deviceID: "emulator-5554",
+                                    appID: nil, transport: .mitmProxy),
+                     "a device proxy still limits the rule to its routed hosts")
+        XCTAssertNotNil(set.firstMatch(facts: facts("https://private-api.teya.xyz/lending/v1/offers"),
+                                       method: "GET", deviceID: "emulator-5554", appID: nil,
+                                       transport: .mitmProxy))
+    }
+
+    /// The row badge and the context menu match through this, so they agree with the runtime.
+    func test_uiHostFilterTransport_followsTheRuntime() {
+        XCTAssertEqual(OverridesModel.hostFilterTransport(.mitmProxy, deviceID: "emulator-5554"), .mitmProxy)
+        XCTAssertNil(OverridesModel.hostFilterTransport(.mitmProxy, deviceID: Device.thisMac.id))
+        XCTAssertNil(OverridesModel.hostFilterTransport(nil, deviceID: "emulator-5554"))
+        let filtered = rule("**/v1/users", hosts: ["api.prod.com"])
+        let set = OverrideCompiler.compile([filtered], masterEnabled: true)
+        XCTAssertNil(set.firstMatch(facts: facts("https://api.staging.com/v1/users"), method: "GET",
+                                    deviceID: nil, appID: nil,
+                                    transport: OverridesModel.hostFilterTransport(.mitmProxy, deviceID: "emulator-5554")))
+    }
+
+    func test_allMatches_appliesTheSameHostFilter() {
+        let filtered = rule("**/path", name: "filtered", hosts: ["a.com"])
+        let open = rule("**/path", name: "open", hosts: [])
+        let set = OverrideCompiler.compile([filtered, open], masterEnabled: true)
+        let names = set.allMatches(facts: facts("https://b.com/path"), method: "GET", deviceID: nil,
+                                   appID: nil, transport: .mitmProxy).map(\.rule.name)
+        XCTAssertEqual(names, ["open"])
+        XCTAssertEqual(set.allMatches(facts: facts("https://b.com/path"), method: "GET", deviceID: nil,
+                                      appID: nil).count, 2, "no transport, no filter")
+    }
+
+    func test_hostFilterNormalize() {
+        XCTAssertEqual(OverrideHostFilter.normalize("A.com:443"), "a.com")
+        XCTAssertEqual(OverrideHostFilter.normalize("[::1]:8080"), "::1")
+        XCTAssertEqual(OverrideHostFilter.normalize("::1"), "::1")
+        XCTAssertEqual(OverrideHostFilter.normalize("a.com"), "a.com")
+    }
+
+    func test_resolverAppliesTheHostFilterForMitmRequests() {
+        var r = rule("**/path", hosts: ["a.com"])
+        r.action = .respond(OverrideResponseSpec(statusCode: 418, body: .inline("")))
+        let resolver = OverrideResolver(ruleSet: OverrideCompiler.compile([r], masterEnabled: true))
+
+        let other = InterceptedRequest(method: "GET", url: "https://b.com/path", transport: .mitmProxy)
+        let (decision, skip) = resolver.resolve(other, capabilities: .desktopTerminated)
+        XCTAssertEqual(decision.action, .proceed)
+        XCTAssertEqual(skip, .noRuleMatched)
+
+        let routed = InterceptedRequest(method: "GET", url: "https://a.com/path", transport: .mitmProxy)
+        guard case .respond = resolver.resolve(routed, capabilities: .desktopTerminated).0.action else {
+            return XCTFail("expected .respond")
+        }
+    }
+
     // MARK: - Diagnostics
 
     func test_emptyPatternIsDiagnosedNotCompiled() {

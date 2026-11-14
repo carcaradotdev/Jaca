@@ -201,6 +201,23 @@ extension NetworkArea.Row: CLIRow {
     }
 }
 
+/// `jaca net mode`.
+struct CLINetworkMode: CLIRow, Equatable {
+    /// The wire name: "agent" or "mitm".
+    var mode: String
+
+    init(_ state: NetworkModeController.State) { mode = state.mode }
+
+    static let header = ["mode"]
+    var cells: [String] { [mode] }
+}
+
+/// `jaca net install-ca`: the `network.installCA` result as the daemon returns it.
+extension NetworkArea.InstallCAResult: CLIRow {
+    static let header = ["outcome", "rebootAdvised", "message"]
+    var cells: [String] { [outcome.rawValue, rebootAdvised.map { String($0) } ?? "", message ?? ""] }
+}
+
 /// One request in full, for `jaca net show`.
 struct CLIRequest: Encodable, Equatable {
     var id: UUID

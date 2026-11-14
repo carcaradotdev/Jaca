@@ -17,29 +17,41 @@ final class AppModel {
     /// Top-level area the app is showing: the device/session view or the worktrees area.
     var mode: WorkspaceMode = .devices
 
-    /// Agent HTTPS debugging (the default, with response overrides) or HTTPS debugging as a
-    /// man-in-the-middle via the companion app — one or the other; see
-    /// `FeatureFlags.networkInspectionMode`. Persisted across launches.
-    var networkInspectionMode: NetworkInspectionMode = FeatureFlags.networkInspectionMode {
-        didSet {
-            guard networkInspectionMode != oldValue else { return }
-            // Persisted first: both reconfigurations read the flags back.
-            FeatureFlags.networkInspectionMode = networkInspectionMode
-            if (oldValue == .mitmHTTPSDebugging) != httpsDecryptionEnabled {
-                reconfigureCompanion()
-                reconfigureNetworkRuntime()
-            }
-            if (oldValue == .agentHTTPSDebugging) != responseOverridesEnabled { reconfigureOverrides() }
-        }
+    /// Agent HTTPS debugging (the default, with response overrides) or MITM HTTPS debugging — one
+    /// or the other; see `FeatureFlags.networkInspectionMode`. Persisted across launches.
+    ///
+    /// With the `network` daemon area on, `jacad` owns the mode: this reads its mirror
+    /// (`RemoteNetworkMode`) and the setter asks the daemon to switch. With the area off, the app
+    /// owns it, and the setter runs the switch here (`switchModeInProcess`). Neither path starts
+    /// a capture; tabs whose source the new mode doesn't offer stop and show the chooser.
+    var networkInspectionMode: NetworkInspectionMode {
+        get { remoteMode?.mode ?? appliedMode }
+        set { requestMode(newValue) }
     }
 
-    /// Experimental HTTPS decryption + companion capture. When off, the companion subsystem is
-    /// never started and network inspection offers only Agent mode (per-app, in-process, no CA).
-    var httpsDecryptionEnabled: Bool { networkInspectionMode == .mitmHTTPSDebugging }
+    /// True while a mode switch stops captures and waits for their devices. Settings disables
+    /// the choice meanwhile.
+    var isSwitchingNetworkMode: Bool { (remoteMode?.switching ?? false) || isSwitchingLocally }
 
-    /// Response overrides (answer a matched request from a rule instead of the origin). Arming it
-    /// routes the rules' hosts through the Mac.
-    var responseOverridesEnabled: Bool { networkInspectionMode == .agentHTTPSDebugging }
+    /// The mode this process's own side runs: its in-process tabs, and the companion subsystem.
+    /// It follows the daemon's mode when the daemon owns it.
+    private(set) var appliedMode: NetworkInspectionMode = FeatureFlags.networkInspectionMode
+    private(set) var isSwitchingLocally = false
+    /// Why the last mode switch that the daemon ran failed. Settings shows it under the
+    /// options. nil after a switch that worked, and when a new switch starts.
+    private(set) var networkModeError: String?
+    /// The mirror of `jacad`'s mode. nil when the `network` daemon area is off.
+    private let remoteMode: RemoteNetworkMode?
+    /// Switches run one at a time, in the order asked.
+    @ObservationIgnored private var modeSwitchChain: Task<Void, Never>?
+    @ObservationIgnored private var modeObserver: NSObjectProtocol?
+
+    /// MITM HTTPS debugging, which includes companion capture. When off, the companion subsystem
+    /// is never started.
+    var httpsDecryptionEnabled: Bool { appliedMode == .mitmHTTPSDebugging }
+
+    /// Agent HTTPS debugging.
+    var responseOverridesEnabled: Bool { appliedMode == .agentHTTPSDebugging }
 
     /// The unified Projects area state: auto-detected Claude projects + user-added
     /// folders, their worktrees, and per-checkout cache cleanup.
@@ -115,6 +127,8 @@ final class AppModel {
         if !uiTestMode {
             pendingRestores = Self.loadPersistedTabs()
         }
+        remoteMode = (!uiTestMode && DaemonConnector.shared.isEnabled(.network))
+            ? RemoteNetworkMode(daemon: DaemonConnector.shared) : nil
         resolveADB()
         companions = CompanionRegistry(ca: { [weak self] in self?.ensureCA() },
                                        adbURL: { [weak self] in self?.adbURL },
@@ -139,6 +153,7 @@ final class AppModel {
         let store = history
         let cutoff = Date().addingTimeInterval(-retention)
         Task { await store?.prune(olderThan: cutoff) }
+        startModeOwnership()
     }
 
     /// adb for this process's own sessions (log streams, CA install). Discovery resolves its
@@ -216,44 +231,96 @@ final class AppModel {
         recomputeDevices()
     }
 
-    /// The inspection mode also decides where network capture runs (see
-    /// `DaemonConnector.networkRunsInDaemon`). When that changes, the override runtime moves, and
-    /// every network tab on the wrong side is replaced by one on the right side, in place, with its
-    /// chosen source restored but stopped — restarting it could relaunch the user's app.
-    private func reconfigureNetworkRuntime() {
-        let inDaemon = daemon.networkRunsInDaemon(httpsDecryption: httpsDecryptionEnabled)
-        overrides.setRuntime(inDaemon: inDaemon)
-        // Built as a new list: dropping a tab mid-walk would shift the indices of the rest.
-        var rebuilt: [any WorkspaceTab] = []
-        for tab in sessions {
-            // Companion-only devices always capture in-process (`makeNetworkSession`).
-            guard let old = tab as? NetworkSession, old.isRemote != (inDaemon && !old.device.isCompanion) else {
-                rebuilt.append(tab)
-                continue
-            }
-            let wasSelected = selectedSessionID == old.id
-            let kind = old.hasSelectedMode ? old.currentDescriptor?.kind : nil
-            let package = old.targetPackage
-            let rows = old.transactions, selectedRow = old.selectedID
-            old.close()
-            // Only fails without a CA, which a network tab already needed: the tab is dropped.
-            guard let fresh = makeNetworkSession(for: old.device, name: old.displayName) else { continue }
-            // Toggling HTTPS decryption changes what's offered (companion capture needs it): a
-            // mode the rebuilt tab doesn't offer returns it to the chooser.
-            if let kind, fresh.availableSources.contains(where: { $0.kind == kind }) {
-                fresh.restoreMode(kind, package: package)
-            }
-            // The capture itself stops (the other process can't take over a live attach), but its
-            // rows stay. Bodies evicted to the other process's cache don't come along: those rows
-            // keep their metadata and read as evicted.
-            fresh.adoptRows(rows, selectedID: selectedRow)
-            rebuilt.append(fresh)
-            if wasSelected { selectedSessionID = fresh.id }
+    // MARK: - Network inspection mode
+
+    /// Mirrors the daemon's mode, or follows a mode another process stored while the app owns it.
+    private func startModeOwnership() {
+        guard !uiTestMode else { return }
+        if let remoteMode {
+            remoteMode.onModeChange = { [weak self] mode in self?.followMode(mode) }
+            remoteMode.start()
+            return
         }
-        sessions = rebuilt
-        if let selected = selectedSessionID, !sessions.contains(where: { $0.id == selected }) {
-            selectedSessionID = sessions.last?.id
+        // The app owns the mode, but `jaca net mode` or Herdr can store another one through a
+        // `jacad` that runs without the app's network area. Follow it, reactively.
+        let ownPid = String(ProcessInfo.processInfo.processIdentifier)
+        modeObserver = DistributedNotificationCenter.default().addObserver(
+            forName: NetworkModeStore.changedNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard (note.object as? String) != ownPid else { return }
+            MainActor.assumeIsolated { self?.followMode(FeatureFlags.networkInspectionMode) }
         }
+    }
+
+    /// The setter of `networkInspectionMode`.
+    private func requestMode(_ target: NetworkInspectionMode) {
+        guard target != networkInspectionMode else { return }
+        networkModeError = nil
+        guard let remoteMode else {
+            enqueueModeSwitch(to: target, persist: true)
+            return
+        }
+        Task { [weak self] in
+            switch await remoteMode.set(target) {
+            case .reachedDaemon:
+                break
+            case .unreachable:
+                // No daemon answered: nothing else runs the switch, so do it here. The daemon
+                // reads the stored mode when it starts. The mirror forgot the daemon's old mode,
+                // so the setting now reads `appliedMode`.
+                self?.enqueueModeSwitch(to: target, persist: true)
+            case .failed(let message):
+                self?.networkModeError = message
+            }
+        }
+    }
+
+    /// Applies a mode that another owner already stored: the daemon's mirror, or a notification.
+    private func followMode(_ mode: NetworkInspectionMode) {
+        enqueueModeSwitch(to: mode, persist: false)
+    }
+
+    private func enqueueModeSwitch(to target: NetworkInspectionMode, persist: Bool) {
+        let previous = modeSwitchChain
+        modeSwitchChain = Task { [weak self] in
+            await previous?.value
+            await self?.switchModeInProcess(to: target, persist: persist)
+        }
+    }
+
+    /// The app's copy of `NetworkModeController`'s switch, over the tabs that capture in this
+    /// process. With the daemon owning the mode, those are only companion-only tabs; `jacad`
+    /// switches its own captures.
+    /// 1. Stop each in-process tab whose source the new mode doesn't offer, and show its chooser.
+    /// 2. Wait until every device teardown is done.
+    /// 3. Persist the mode and announce it (only when this process owns it).
+    /// 4. Refresh what each in-process tab offers, and start or stop the companion subsystem.
+    private func switchModeInProcess(to target: NetworkInspectionMode, persist: Bool) async {
+        guard target != appliedMode else { return }
+        JacaLog.info("network", "inspection mode: \(appliedMode.wireName) -> \(target.wireName)")
+        isSwitchingLocally = true
+        defer { isSwitchingLocally = false }
+        let strategy = HTTPDebuggingStrategies.strategy(for: target)
+        let local = sessions.compactMap { $0 as? NetworkSession }.filter { !$0.isRemote }
+        let plan = ModeSwitchPlan.make(
+            captures: local.map { ModeSwitchPlan.Capture(id: $0.id, device: $0.device,
+                                                         sourceID: $0.hasSelectedMode ? $0.selectedSourceID : nil) },
+            to: strategy)
+        for session in local where plan[session.id] == .stopAndReopenChooser {
+            session.reopenModeChooser()
+        }
+        await NetworkModeController.settleDevices()
+        if persist {
+            NetworkModeStore.live.write(target)
+            NetworkModeStore.live.announce()
+        }
+        let wasMITM = httpsDecryptionEnabled
+        appliedMode = target
+        // Read again: a tab opened while the devices settled must offer the new mode's sources too.
+        for case let session as NetworkSession in sessions where !session.isRemote {
+            session.localEngine?.refreshOffered(strategy: strategy)
+        }
+        if wasMITM != httpsDecryptionEnabled { reconfigureCompanion() }
         persistTabs()
     }
 
@@ -267,14 +334,6 @@ final class AppModel {
             companions.stop()
         }
         recomputeDevices()
-    }
-
-    /// Re-arm (or disarm) running captures when the flag toggles at runtime. A session wires its
-    /// intercept services once in `makeContext()`, so only a restart re-runs it.
-    private func reconfigureOverrides() {
-        for session in sessions.compactMap({ $0 as? NetworkSession }) where session.isRunning {
-            session.restartForInterceptChange()
-        }
     }
 
     /// Normalized device model, for matching a companion ("Jaca <MODEL>") to its adb device.
@@ -387,9 +446,11 @@ final class AppModel {
                                                   sessionID: descriptor.sessionID)
                 // Pre-configure the chosen mode so the tab restores ready-to-run:
                 // the user just presses play (no re-picking from the chooser).
+                // An id this build doesn't know, or none, opens the chooser.
                 let pkg = descriptor.packageLabel.isEmpty ? nil : descriptor.packageLabel
-                let kind = descriptor.captureMode.flatMap { CaptureSourceRegistry.descriptor(id: $0)?.kind } ?? .proxy
-                session?.restoreMode(kind, package: pkg)
+                if let kind = descriptor.captureMode.flatMap({ CaptureSourceRegistry.descriptor(id: $0)?.kind }) {
+                    session?.restoreMode(kind, package: pkg)
+                }
             case .cloud:
                 break   // Cloud Logging tabs have no device; restored eagerly in `restoreCloudTabs`.
             }
@@ -423,7 +484,8 @@ final class AppModel {
             return TabDescriptor(kind: .network, platform: net.device.platform, deviceID: net.device.id,
                                  displayName: net.displayName, minLevel: 0, query: "",
                                  isRegex: false, packageLabel: net.targetPackage ?? "",
-                                 captureMode: net.currentDescriptor?.id ?? "proxy", sessionID: net.id)
+                                 captureMode: net.hasSelectedMode ? net.currentDescriptor?.id : nil,
+                                 sessionID: net.id)
         }
         if let cloud = tab as? CloudLogSession {
             return TabDescriptor(kind: .cloud, platform: .android, deviceID: "",
@@ -602,10 +664,9 @@ final class AppModel {
         guard let authority = ensureCA() else { return nil }
         let id = sessionID ?? UUID()
         let session: NetworkSession
-        // Agent capture runs in jacad unless the inspection mode is HTTPS debugging (then everything
-        // network runs in-process: the companion links and the CA live in the app). A companion-only
-        // device has no agent path, so it always captures in-process.
-        if daemon.networkRunsInDaemon(httpsDecryption: httpsDecryptionEnabled), !device.isCompanion {
+        // Capture runs in jacad when the network daemon area is on, in either mode. A companion-only
+        // device always captures in-process: the companion links live in the app.
+        if daemon.networkRunsInDaemon(), !device.isCompanion {
             let feed = RemoteNetworkFeed(id: id, device: device, autoStart: false, daemon: daemon)
             session = NetworkSession(id: id, device: device, feed: feed, ca: authority, adbURL: adbURL,
                                      displayName: name, companions: companions, overrides: overrides,
@@ -617,12 +678,44 @@ final class AppModel {
         }
         session.deviceContext = context(for: device)
         session.onStateChanged = { [weak self] in self?.persistTabs() }
+        session.localEngine?.startGate = { [weak self] id, sourceID, package in
+            self?.admitLocalStart(id, device: device, sourceID: sourceID, package: package) ?? true
+        }
         // Companion-only devices have no proxy/agent path — pre-select companion so the
         // tab is ready to stream (the network inspection "just knows").
         if device.isCompanion { session.restoreMode(.companion, package: nil) }
         // This Mac has one way to capture: the Chrome window.
         if device.platform == .mac { session.restoreMode(.browser, package: nil) }
         return session
+    }
+
+    /// The start gate of each in-process capture: the app's copy of what `NetworkArea.select`
+    /// does in jacad.
+    /// - During a mode switch it refuses, so a tab can't start a source of the old mode while
+    ///   the switch waits for its devices. The tab stays as it is.
+    /// - Otherwise it stops each other in-process capture whose claim on the device collides
+    ///   with the new one (two device proxies on one phone, for example), including one that is
+    ///   still in its precheck. The newest capture wins.
+    private func admitLocalStart(_ id: UUID, device: Device, sourceID: String, package: String?) -> Bool {
+        guard !isSwitchingLocally else {
+            JacaLog.info("network", "refused a start of \(sourceID) on \(device.id) during a mode switch")
+            return false
+        }
+        let local = sessions.compactMap { $0 as? NetworkSession }.filter { !$0.isRemote && $0.id != id }
+        let running: [NetworkArea.RunningCapture] = local.compactMap { session in
+            guard let state = session.localEngine?.state, state.isRunning || state.isConnecting,
+                  let source = state.selectedSourceID else { return nil }
+            return NetworkArea.RunningCapture(id: session.id, device: session.device, sourceID: source,
+                                              package: state.targetPackage)
+        }
+        let stop = NetworkArea.capturesToStop(running: running, starting: id, on: device, sourceID: sourceID,
+                                              package: package,
+                                              strategy: HTTPDebuggingStrategies.strategy(for: appliedMode))
+        for session in local where stop.contains(session.id) {
+            JacaLog.info("network", "stopping capture \(session.id): \(id) starts \(sourceID) on \(device.id)")
+            session.stop()
+        }
+        return true
     }
 
     /// The result of a one-click companion update over USB.
@@ -640,22 +733,47 @@ final class AppModel {
 
     // MARK: - Stranded device proxy (cleanup backstop)
 
-    /// The device's current global HTTP proxy if it points at this Mac — a proxy left
-    /// behind by an older proxy-mode Jaca. Drives the sidebar "Revert" one-click fix.
-    /// (Companion capture never sets a device proxy, so this only cleans up legacy state.)
+    /// The device's current global HTTP proxy if Jaca left it behind: a LAN-IP proxy from an
+    /// older Jaca, or a `mitm` device proxy whose ledger entry no running capture holds. Drives
+    /// the sidebar "Revert" one-click fix. A proxy that a running capture holds is not stranded.
     func strandedProxy(for device: Device) async -> String? {
-        guard device.platform == .android, let adbURL else { return nil }
+        guard device.platform == .android, !device.isCompanion, let adbURL else { return nil }
         guard let current = await ProxyConfigurator.currentAndroidProxy(adbURL: adbURL, serial: device.id) else {
             return nil
         }
-        let ours = ProxyConfigurator.hostAddress(for: device)
-        return ProxyConfigurator.proxyHost(current) == ours ? current : nil
+        let split = ledgerSplit(serial: device.id)
+        if split.live.contains(current) { return nil }
+        let ours = StrandedProxyMatch.isOurs(current: current, hostAddress: ProxyConfigurator.hostAddress(for: device),
+                                             ledgerValues: split.stranded)
+        return ours ? current : nil
     }
 
-    /// Clears the device's global HTTP proxy — the sidebar "Revert" action.
+    /// Reverts the device's global HTTP proxy — the sidebar "Revert" action. A value from the
+    /// ledger gets back what the device had before Jaca; anything else is cleared.
     func revertDeviceProxy(_ device: Device) async {
         guard device.platform == .android, let adbURL else { return }
-        await ProxyConfigurator.clearAndroidProxy(adbURL: adbURL, serial: device.id)
+        let serial = device.id
+        let current = await ProxyConfigurator.currentAndroidProxy(adbURL: adbURL, serial: serial)
+        let entries = DeviceProxyLedger.entries(serial: serial)
+        if let current, let entry = entries.first(where: { $0.value == current }),
+           ledgerSplit(serial: serial).stranded.contains(current) {
+            let others = Set(entries.filter { $0.port != entry.port }.map(\.value))
+            let reverted = await DeviceProxyOps.revert(adbURL: adbURL, serial: serial, value: entry.value,
+                                                       previous: entry.previous, otherValues: others,
+                                                       environment: .live)
+            if reverted { DeviceProxyLedger.remove(serial: serial, port: entry.port) }
+            return
+        }
+        await ProxyConfigurator.clearAndroidProxy(adbURL: adbURL, serial: serial)
+    }
+
+    /// This device's ledger values, split by whether a running capture holds them.
+    private func ledgerSplit(serial: String) -> StrandedProxyMatch.LedgerSplit {
+        StrandedProxyMatch.split(
+            entries: DeviceProxyLedger.entries(serial: serial),
+            ownPid: ProcessInfo.processInfo.processIdentifier,
+            armedPorts: DeviceProxyCaptureSource.armedPorts[serial] ?? [],
+            pidAlive: DeviceProxyLedger.liveOwnerCheck, now: Date())
     }
 
     func closeSession(_ id: UUID) {

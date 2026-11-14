@@ -512,39 +512,37 @@ func TestRowGate(t *testing.T) {
 		arming    armingState
 		running   bool
 		available bool
-		feature   bool
 		url       string
 		httpStack string
 		want      string
 	}{
-		{"iOS row with a stack that isn't okhttp3", transportIOSSimulatorAgent, active, true, true, true, url, "urlsession", ""},
-		{"iOS row with no stack", transportIOSSimulatorAgent, active, true, true, true, url, "", ""},
-		{"iOS detached names the app", transportIOSSimulatorAgent, detached, true, true, true, url, "",
+		{"iOS row with a stack that isn't okhttp3", transportIOSSimulatorAgent, active, true, true, url, "urlsession", ""},
+		{"iOS row with no stack", transportIOSSimulatorAgent, active, true, true, url, "", ""},
+		{"iOS detached names the app", transportIOSSimulatorAgent, detached, true, true, url, "",
 			"com.example.App is running without the Jaca agent — relaunch it to resume."},
-		{"Android row with an unknown stack", transportAndroidAgent, active, true, true, true, url, "", ""},
-		{"Android okhttp3 row", transportAndroidAgent, active, true, true, true, url, "okhttp3", ""},
-		{"Android row from another stack", transportAndroidAgent, active, true, true, true, url, "urlconnection",
+		{"Android row with an unknown stack", transportAndroidAgent, active, true, true, url, "", ""},
+		{"Android okhttp3 row", transportAndroidAgent, active, true, true, url, "okhttp3", ""},
+		{"Android row from another stack", transportAndroidAgent, active, true, true, url, "urlconnection",
 			"This request came from HttpURLConnection, not okhttp3 — Jaca can't divert it."},
-		{"companion row", transportCompanionMetadata, active, true, true, true, url, "urlsession",
+		{"companion row", transportCompanionMetadata, active, true, true, url, "urlsession",
 			"Overrides apply to in-process agent capture. Companion capture will follow."},
-		{"proxy row, urlsession", transportMITMProxy, active, true, true, true, url, "urlsession", ""},
-		{"proxy row, urlconnection", transportMITMProxy, active, true, true, true, url, "urlconnection", ""},
-		{"overrides unavailable", transportMITMProxy, active, true, false, true, url, "", "Response overrides aren't available."},
-		{"feature off", transportMITMProxy, active, true, true, false, url, "", "Turn on Agent HTTPS debugging in Settings first."},
-		{"flow metadata row", transportCompanionMetadata, active, true, true, true, "api.example.com:443", "",
+		{"proxy row, urlsession", transportMITMProxy, active, true, true, url, "urlsession", ""},
+		{"proxy row, urlconnection", transportMITMProxy, active, true, true, url, "urlconnection", ""},
+		{"overrides unavailable", transportMITMProxy, active, true, false, url, "", "Response overrides aren't available."},
+		{"flow metadata row", transportCompanionMetadata, active, true, true, "api.example.com:443", "",
 			"This row is flow metadata, not an HTTP request."},
-		{"stopped capture has no arming reason", transportIOSSimulatorAgent, detached, false, true, true, url, "", ""},
-		{"stopped capture still blocks another stack", transportAndroidAgent, idleArming, false, true, true, url, "urlconnection",
+		{"stopped capture has no arming reason", transportIOSSimulatorAgent, detached, false, true, url, "", ""},
+		{"stopped capture still blocks another stack", transportAndroidAgent, idleArming, false, true, url, "urlconnection",
 			"This request came from HttpURLConnection, not okhttp3 — Jaca can't divert it."},
-		{"waiting for the app doesn't block authoring", transportIOSSimulatorAgent, armingState{State: "waitingForApp", AppID: "a"}, true, true, true, url, "", ""},
+		{"waiting for the app doesn't block authoring", transportIOSSimulatorAgent, armingState{State: "waitingForApp", AppID: "a"}, true, true, url, "", ""},
 	}
 	for _, c := range cases {
-		if got := rowGate(c.transport, c.arming, c.running, c.available, c.feature, c.url, c.httpStack); got != c.want {
+		if got := rowGate(c.transport, c.arming, c.running, c.available, c.url, c.httpStack); got != c.want {
 			t.Errorf("%s: %q, want %q", c.name, got, c.want)
 		}
 		if c.available {
 			txn := netTransaction{URL: c.url, HTTPStack: c.httpStack}
-			if got := rowGateReason(c.feature, c.transport, txn, c.running, c.arming); got != c.want {
+			if got := rowGateReason(c.transport, txn, c.running, c.arming); got != c.want {
 				t.Errorf("%s (rowGateReason): %q, want %q", c.name, got, c.want)
 			}
 		}
@@ -552,9 +550,9 @@ func TestRowGate(t *testing.T) {
 }
 
 func TestTransportCopy(t *testing.T) {
-	ios, android := transportFor("iosSimulator"), transportFor("android")
-	if ios != transportIOSSimulatorAgent || android != transportAndroidAgent || transportFor("iosDevice") != transportMITMProxy {
-		t.Errorf("transportFor: %q, %q, %q", ios, android, transportFor("iosDevice"))
+	ios, android := transportFor("iosSimulator", "agent"), transportFor("android", "agent")
+	if ios != transportIOSSimulatorAgent || android != transportAndroidAgent || transportFor("iosDevice", "") != transportMITMProxy {
+		t.Errorf("transportFor: %q, %q, %q", ios, android, transportFor("iosDevice", ""))
 	}
 	// On the Simulator the Mac is the app's network: no origin caution, no tunnel to name.
 	if ios.originExplainer() != "" || strings.Contains(strings.ToLower(ios.routingScopeHelp()), "tunnel") ||
@@ -833,7 +831,7 @@ const (
 
 	wireTransaction = `{"bodiesEvicted":true,"callStack":["com.example.api.UserRepo.load(UserRepo.kt:42)"],"finishedAt":"2026-10-06T12:00:01.480Z","host":"api.example.com","httpStack":"okhttp3","id":"6F1C2B1E-9A0D-4C55-8E2B-0C1D2E3F4A5B","method":"GET","overriddenByRuleID":"3D5E8A10-7B2C-4F6D-9E1A-2B3C4D5E6F70","requestBytes":0,"requestHeaders":[{"name":"Accept","value":"application/json"}],"responseBytes":17,"responseContentType":"application/json","responseHeaders":[{"name":"Content-Type","value":"application/json"},{"name":"X-Jaca-Override","value":"3D5E8A10-7B2C-4F6D-9E1A-2B3C4D5E6F70"}],"responseReceivedAt":"2026-10-06T12:00:01.470Z","scheme":"https","startedAt":"2026-10-06T12:00:01.250Z","statusCode":418,"url":"https://api.example.com/users/42?expand=1"}`
 
-	wireCaptureState = `{"attachState":{"state":"idle"},"boundPort":0,"caReady":false,"hasRunningSource":true,"hasSelectedMode":true,"interceptCapabilities":15,"interceptWired":true,"isConnecting":false,"isRunning":true,"proxyNeedsSetup":false,"selectedSourceID":"agent","statusMessage":"agent: waiting for com.example.app to start…","targetPackage":"com.example.app"}`
+	wireCaptureState = `{"attachState":{"state":"idle"},"boundPort":0,"caReady":false,"hasRunningSource":true,"hasSelectedMode":true,"interceptCapabilities":15,"interceptWired":true,"isConnecting":false,"isRunning":true,"offeredSourceIDs":["agent"],"proxyNeedsSetup":false,"selectedSourceID":"agent","statusMessage":"agent: waiting for com.example.app to start…","targetPackage":"com.example.app"}`
 )
 
 func TestRuleWire(t *testing.T) {
@@ -1070,7 +1068,7 @@ func TestTransactionWire(t *testing.T) {
 	if got := txn.requestContentType(); got != "" {
 		t.Errorf("request content type = %q", got)
 	}
-	if got := rowGateReason(true, transportAndroidAgent, txn, true, idleArming); got != "" {
+	if got := rowGateReason(transportAndroidAgent, txn, true, idleArming); got != "" {
 		t.Errorf("row gate = %q", got)
 	}
 
@@ -1114,7 +1112,7 @@ func TestCaptureStateWire(t *testing.T) {
 	}
 	want := netState{IsRunning: true, StatusMessage: "agent: waiting for com.example.app to start…", SelectedSourceID: "agent",
 		HasSelectedMode: true, TargetPackage: "com.example.app", AttachState: idleArming, InterceptWired: true,
-		InterceptCapabilities: capDesktopTerminated, HasRunningSource: true}
+		InterceptCapabilities: capDesktopTerminated, HasRunningSource: true, OfferedSourceIDs: []string{"agent"}}
 	if !reflect.DeepEqual(state, want) {
 		t.Errorf("state = %+v\nwant    %+v", state, want)
 	}
@@ -1323,5 +1321,77 @@ func TestRuleEffectiveEnabled(t *testing.T) {
 	v.setOverrides(state)
 	if _, ok := v.rules.matchingRule("https://a.com/x", "GET"); !ok {
 		t.Error("a rule in an enabled group didn't match")
+	}
+}
+
+// The transport follows the capture's source: the proxy for the device proxy and Chrome, flow
+// metadata for the companion app, and the platform's agent for the agent or no source yet.
+func TestTransportForSource(t *testing.T) {
+	cases := []struct {
+		platform, source string
+		want             transport
+	}{
+		{"android", "agent", transportAndroidAgent},
+		{"iosSimulator", "agent", transportIOSSimulatorAgent},
+		{"android", "mitm", transportMITMProxy},
+		{"iosSimulator", "mitm", transportMITMProxy},
+		{"mac", "browser", transportMITMProxy},
+		{"android", "companion", transportCompanionMetadata},
+		{"android", "", transportAndroidAgent},
+		{"iosSimulator", "", transportIOSSimulatorAgent},
+		{"iosDevice", "", transportMITMProxy},
+		{"mac", "", transportMITMProxy},
+	}
+	for _, c := range cases {
+		if got := transportFor(c.platform, c.source); got != c.want {
+			t.Errorf("transportFor(%q, %q) = %q, want %q", c.platform, c.source, got, c.want)
+		}
+	}
+}
+
+// The new state fields decode, and a jacad without them leaves the offered sources nil.
+func TestCaptureStateSetupWire(t *testing.T) {
+	var state netState
+	if err := json.Unmarshal([]byte(`{"boundPort":8899,"proxyNeedsSetup":true,"caReady":false,"offeredSourceIDs":["mitm"],"selectedSourceID":"mitm"}`), &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.BoundPort != 8899 || !state.ProxyNeedsSetup || state.CAReady || !reflect.DeepEqual(state.OfferedSourceIDs, []string{"mitm"}) {
+		t.Errorf("state = %+v", state)
+	}
+	state = netState{}
+	if err := json.Unmarshal([]byte(`{"isRunning":false}`), &state); err != nil || state.OfferedSourceIDs != nil {
+		t.Errorf("old state = %+v, %v", state, err)
+	}
+	state = netState{}
+	if err := json.Unmarshal([]byte(`{"offeredSourceIDs":[]}`), &state); err != nil || state.OfferedSourceIDs == nil || len(state.OfferedSourceIDs) != 0 {
+		t.Errorf("no offered sources = %#v, %v", state.OfferedSourceIDs, err)
+	}
+}
+
+// OverrideHostFilter parity: on a device's MITM proxy a rule with routed hosts fires only on
+// them; This Mac's Chrome capture and the agent transports apply no host filter.
+func TestMatchingRuleOnAppliesTheRoutedHostFilter(t *testing.T) {
+	set := compileRules([]overrideRule{
+		ovRule("**/v1/users", func(r *overrideRule) { r.Name, r.RoutedHosts = "prod", []string{"API.Prod.com:443"} }),
+	}, true)
+	cases := []struct {
+		name, url, device string
+		tr                transport
+		want              bool
+	}{
+		{"another host on the device proxy", "https://api.staging.com/v1/users", "emulator-5554", transportMITMProxy, false},
+		{"the routed host, any case and port", "https://api.prod.com:443/v1/users", "emulator-5554", transportMITMProxy, true},
+		{"This Mac's browser is not filtered", "http://localhost:3000/v1/users", "mac", transportMITMProxy, true},
+		{"the agent is not filtered", "https://api.staging.com/v1/users", "emulator-5554", transportAndroidAgent, true},
+	}
+	for _, c := range cases {
+		if _, got := set.matchingRuleOn(c.url, "GET", c.tr, c.device); got != c.want {
+			t.Errorf("%s: matched = %v, want %v", c.name, got, c.want)
+		}
+	}
+	for host, want := range map[string]string{"A.com:443": "a.com", "[::1]:8080": "::1", "::1": "::1", "a.com": "a.com"} {
+		if got := normalizeFilterHost(host); got != want {
+			t.Errorf("normalizeFilterHost(%q) = %q, want %q", host, got, want)
+		}
 	}
 }

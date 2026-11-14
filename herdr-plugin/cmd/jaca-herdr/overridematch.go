@@ -421,7 +421,7 @@ func fileExists(path string) bool {
 // device and app; an empty deviceID or appID is an unknown one. First match wins, in list
 // order. The master switch is not applied here: callers decide.
 func (s ruleSet) firstMatch(url, method, deviceID, appID string) (overrideRule, bool) {
-	if matches := s.matching(url, method, deviceID, appID, true); len(matches) > 0 {
+	if matches := s.matching(url, method, deviceID, appID, false, true); len(matches) > 0 {
 		return matches[0], true
 	}
 	return overrideRule{}, false
@@ -430,16 +430,21 @@ func (s ruleSet) firstMatch(url, method, deviceID, appID string) (overrideRule, 
 // allMatches is every enabled rule matching the request, in precedence order: the first is the
 // one that runs and the rest are shadowed by it.
 func (s ruleSet) allMatches(url, method, deviceID, appID string) []overrideRule {
-	return s.matching(url, method, deviceID, appID, false)
+	return s.matching(url, method, deviceID, appID, false, false)
 }
 
-func (s ruleSet) matching(url, method, deviceID, appID string, firstOnly bool) []overrideRule {
+// matching is the enabled rules that match, in order. hostFilter limits each rule with routed
+// hosts to those hosts (OverrideHostFilter).
+func (s ruleSet) matching(url, method, deviceID, appID string, hostFilter, firstOnly bool) []overrideRule {
 	facts, ok := urlFactsOf(url)
 	if !ok {
 		return nil
 	}
 	var out []overrideRule
 	for _, c := range s.rules {
+		if hostFilter && !hostFilterAllows(c.rule.RoutedHosts, facts.Host) {
+			continue
+		}
 		if c.rule.Scope.matches(deviceID, appID) && c.matches(facts, method) {
 			out = append(out, c.rule)
 			if firstOnly {
@@ -455,6 +460,51 @@ func (s ruleSet) matching(url, method, deviceID, appID string, firstOnly bool) [
 // does, so a rule scoped to particular devices or apps is not reported.
 func (s ruleSet) matchingRule(url, method string) (overrideRule, bool) {
 	return s.firstMatch(url, method, "", "")
+}
+
+// matchingRuleOn is matchingRule with the routed-host filter the runtime applies at transport
+// tr for deviceID, so a row never claims a rule the MITM proxy would skip.
+func (s ruleSet) matchingRuleOn(url, method string, tr transport, deviceID string) (overrideRule, bool) {
+	if matches := s.matching(url, method, "", "", hostFilterApplies(tr, deviceID), true); len(matches) > 0 {
+		return matches[0], true
+	}
+	return overrideRule{}, false
+}
+
+// hostFilterApplies is OverrideHostFilter.applies: the MITM proxy of a device filters by
+// routed host; This Mac's Chrome capture, also mitmProxy, does not.
+func hostFilterApplies(tr transport, deviceID string) bool {
+	return tr == transportMITMProxy && deviceID != "mac"
+}
+
+// hostFilterAllows is OverrideHostFilter.allows once the filter applies: a rule with no routed
+// hosts fires on every host.
+func hostFilterAllows(routed []string, host string) bool {
+	if len(routed) == 0 {
+		return true
+	}
+	want := normalizeFilterHost(host)
+	for _, h := range routed {
+		if normalizeFilterHost(h) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeFilterHost is OverrideHostFilter.normalize: lowercase, without a ":port". An IPv6
+// literal keeps its colons; only the bracketed form loses its port and brackets.
+func normalizeFilterHost(host string) string {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if strings.HasPrefix(h, "[") {
+		if end := strings.Index(h, "]"); end > 0 {
+			return h[1:end]
+		}
+	}
+	if strings.Count(h, ":") == 1 {
+		h = h[:strings.Index(h, ":")]
+	}
+	return h
 }
 
 // routedHosts is the hosts a device transport routes through the Mac for this device and app:
@@ -681,19 +731,16 @@ func skipReason(r overrideRule, t transport, capabilities int, masterEnabled boo
 
 // rowGateReason is OverrideRowGate.unavailableReason, "" when a row can be overridden. running
 // is whether a capture source is running, and arming what its transport last reported.
-func rowGateReason(featureEnabled bool, t transport, txn netTransaction, running bool, arming armingState) string {
-	return rowGate(t, arming, running, true, featureEnabled, txn.URL, txn.HTTPStack)
+func rowGateReason(t transport, txn netTransaction, running bool, arming armingState) string {
+	return rowGate(t, arming, running, true, txn.URL, txn.HTTPStack)
 }
 
 // rowGate answers whether a captured row can seed a rule, not whether the rule would fire now:
 // only reasons that make the row itself unusable belong here. httpStack is consulted for the
 // Android agent alone, and "" is an unknown stack, which never blocks.
-func rowGate(t transport, arming armingState, running, overridesAvailable, featureEnabled bool, url, httpStack string) string {
+func rowGate(t transport, arming armingState, running, overridesAvailable bool, url, httpStack string) string {
 	if !overridesAvailable {
 		return "Response overrides aren't available."
-	}
-	if !featureEnabled {
-		return "Turn on Agent HTTPS debugging in Settings first."
 	}
 	// Companion flow-metadata rows are "host:port": no method, path or body to override.
 	if _, ok := urlFactsOf(url); !ok {

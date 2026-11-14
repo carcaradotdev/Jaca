@@ -54,4 +54,24 @@ final class NetworkInspectionModeTests: XCTestCase {
         XCTAssertEqual(NetworkInspectionMode.mitmHTTPSDebugging.rawValue, "httpsDecryption")
         XCTAssertEqual(NetworkInspectionMode.agentHTTPSDebugging.rawValue, "responseOverrides")
     }
+
+    /// The RPC, the topic, Herdr and the CLI use these names. Changing one breaks every client.
+    func test_wireNamesAreStable() {
+        XCTAssertEqual(NetworkInspectionMode.agentHTTPSDebugging.wireName, "agent")
+        XCTAssertEqual(NetworkInspectionMode.mitmHTTPSDebugging.wireName, "mitm")
+    }
+
+    func test_wireNameRoundTrips() {
+        for mode in NetworkInspectionMode.allCases {
+            XCTAssertEqual(NetworkInspectionMode(wireName: mode.wireName), mode)
+        }
+    }
+
+    /// A raw value is the stored form, not a wire name.
+    func test_unknownWireNameIsNil() {
+        XCTAssertNil(NetworkInspectionMode(wireName: "bogus"))
+        XCTAssertNil(NetworkInspectionMode(wireName: ""))
+        XCTAssertNil(NetworkInspectionMode(wireName: "httpsDecryption"))
+        XCTAssertNil(NetworkInspectionMode(wireName: "MITM"))
+    }
 }

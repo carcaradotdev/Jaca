@@ -7,6 +7,20 @@ import NIOSSL
 /// Failures that must not be papered over by minting a replacement CA.
 enum CAError: Error { case keyPresentButUnreadable }
 
+/// How `CertificateAuthority` reaches the Keychain, so a test can check that a process without
+/// migration never reads it.
+struct CAKeychainAccess: Sendable {
+    /// Whether an item exists. Reads no secret data, so it shows no prompt.
+    var exists: @Sendable (_ account: String) -> Bool
+    /// The item's secret. It can show a Keychain prompt.
+    var read: @Sendable (_ account: String) -> String?
+
+    static let system = CAKeychainAccess(
+        exists: { KeychainStore.exists(account: $0) },
+        read: { KeychainStore.read(account: $0) }
+    )
+}
+
 /// Generates and persists a local root CA, and mints per-host leaf certificates
 /// signed by it so the MITM proxy can terminate TLS for any host. The user
 /// installs/ trusts the root CA on the device; leaves are cached per host.
@@ -24,25 +38,49 @@ final class CertificateAuthority: @unchecked Sendable {
     /// Loads the CA from `directory` (default: Application Support/Jaca/ca), generating and
     /// persisting a new one if absent. The private key is a 0600 file next to the cert. A key
     /// still in the Keychain from older builds is migrated to the file on first read (one last
-    /// prompt), then used from the file — which avoids the per-launch Keychain ACL prompt that
-    /// dogs locally-signed dev builds (the approach mitmproxy/Charles use for their CA key).
-    init(directory: URL? = nil) throws {
-        let dir = directory ?? FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Jaca/ca", isDirectory: true)
+    /// prompt), then used from the file. This avoids the per-launch Keychain ACL prompt of
+    /// locally signed dev builds (mitmproxy and Charles keep their CA key in a file too).
+    ///
+    /// Set `allowKeychainMigration` to false in a process that must never show a Keychain
+    /// prompt (jacad). If the key is still only in the Keychain, that process throws
+    /// `CAError.keyPresentButUnreadable` instead of minting a second CA; the app migrates it.
+    convenience init(directory: URL? = nil, allowKeychainMigration: Bool = true) throws {
+        try self.init(directory: directory, allowKeychainMigration: allowKeychainMigration,
+                      keychain: .system, usesLegacyKeychain: directory == nil)
+    }
+
+    /// The designated init. `usesLegacyKeychain` says whether this directory is the one older
+    /// builds paired with the Keychain key: only the real app location is. Tests pass a temp
+    /// directory with `usesLegacyKeychain: true` and a fake `keychain`.
+    init(directory: URL?, allowKeychainMigration: Bool, keychain: CAKeychainAccess,
+         usesLegacyKeychain: Bool) throws {
+        let dir = directory ?? Self.defaultDirectory
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         storageDirectory = dir
+
+        // Two processes (the app and jacad) can start at once. Without the lock both find no CA
+        // and each mints its own; the second write wins and the first process signs leaves with
+        // a CA nobody installed. The lock is advisory and released when the descriptor closes.
+        let lockFD = open(dir.appendingPathComponent(".lock").path, O_CREAT | O_RDWR, 0o600)
+        if lockFD >= 0 { flock(lockFD, LOCK_EX) }
+        defer {
+            if lockFD >= 0 {
+                flock(lockFD, LOCK_UN)
+                close(lockFD)
+            }
+        }
 
         let certURL = dir.appendingPathComponent("rootCA.pem")
         let keyURL = dir.appendingPathComponent("rootCA.key.pem")
         let keyAccount = "ca-private-key"
-        let migrateFromKeychain = (directory == nil)   // only the real app ever used the Keychain
+        let migrate = Self.migratesFromKeychain(usesLegacyKeychain: usesLegacyKeychain,
+                                                allowKeychainMigration: allowKeychainMigration)
 
         func loadKeyPEM() -> String? {
             if let fromFile = try? String(contentsOf: keyURL, encoding: .utf8) { return fromFile }
             // One-time migration: read an existing key still in the Keychain (a final prompt),
             // write it to the file, and use the file from then on.
-            if migrateFromKeychain, let stored = KeychainStore.read(account: keyAccount) {
+            if migrate, let stored = keychain.read(keyAccount) {
                 try? Self.writeKeyFile(stored, to: keyURL)
                 return stored
             }
@@ -57,11 +95,12 @@ final class CertificateAuthority: @unchecked Sendable {
             caCertificate = cert
             caKey = key
         } else {
-            // Don't silently replace an existing CA we just couldn't read (e.g. the migration
-            // prompt was dismissed) — that would invalidate every installed cert. Fail instead.
-            if migrateFromKeychain, keyPEM == nil,
+            // Don't silently replace an existing CA we couldn't read (the migration prompt was
+            // dismissed, or this process may not migrate). That would invalidate every installed
+            // cert. `exists` reads no secret data, so it shows no prompt.
+            if usesLegacyKeychain, keyPEM == nil,
                !FileManager.default.fileExists(atPath: keyURL.path),
-               KeychainStore.exists(account: keyAccount) {
+               keychain.exists(keyAccount) {
                 throw CAError.keyPresentButUnreadable
             }
             let (cert, key) = try Self.makeRootCA()
@@ -73,6 +112,19 @@ final class CertificateAuthority: @unchecked Sendable {
 
         rootCertificatePEM = try caCertificate.serializeAsPEM().pemString
         caNIOCertificate = try NIOSSLCertificate(bytes: Array(rootCertificatePEM.utf8), format: .pem)
+    }
+
+    /// Application Support/Jaca/ca.
+    static var defaultDirectory: URL {
+        FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Jaca/ca", isDirectory: true)
+    }
+
+    /// Whether init may read the key out of the Keychain. Only the real app location had a
+    /// Keychain key, and only a process that may show a prompt reads it.
+    static func migratesFromKeychain(usesLegacyKeychain: Bool, allowKeychainMigration: Bool) -> Bool {
+        usesLegacyKeychain && allowKeychainMigration
     }
 
     /// Write the CA private key to an owner-only (0600) file.
@@ -130,8 +182,8 @@ final class CertificateAuthority: @unchecked Sendable {
             serialNumber: Certificate.SerialNumber(),
             publicKey: Certificate.PublicKey(key.publicKey),
             notValidBefore: Date().addingTimeInterval(-86_400),
-            // Very long-lived (≈30y): the root is minted once per Mac, persisted (cert on
-            // disk + key in the Keychain) and reused across every device and every Jaca
+            // Very long-lived (≈30y): the root is minted once per Mac, persisted (cert and
+            // 0600 key file in the CA directory) and reused across every device and every Jaca
             // update, so a cert the user installs keeps working for the life of the machine.
             notValidAfter: Date().addingTimeInterval(30 * 365 * 86_400),
             issuer: name,
@@ -146,10 +198,35 @@ final class CertificateAuthority: @unchecked Sendable {
         return (cert, key)
     }
 
+    /// The SAN entry for a leaf: an IP address SAN when `host` is an IPv4 or IPv6 literal (a
+    /// client checks an IP against IP SANs only), otherwise a DNS name.
+    static func subjectAlternativeName(forHost host: String) -> GeneralName {
+        if let bytes = ipAddressBytes(host) {
+            return .ipAddress(ASN1OctetString(contentBytes: ArraySlice(bytes)))
+        }
+        return .dnsName(host)
+    }
+
+    /// The network-order bytes of an IPv4 (4 bytes) or IPv6 (16 bytes) literal; nil for a name.
+    /// Brackets around an IPv6 literal are allowed.
+    static func ipAddressBytes(_ host: String) -> [UInt8]? {
+        var literal = host
+        if literal.hasPrefix("["), literal.hasSuffix("]") { literal = String(literal.dropFirst().dropLast()) }
+        var v4 = in_addr()
+        if inet_pton(AF_INET, literal, &v4) == 1 {
+            return withUnsafeBytes(of: &v4) { Array($0) }
+        }
+        var v6 = in6_addr()
+        if inet_pton(AF_INET6, literal, &v6) == 1 {
+            return withUnsafeBytes(of: &v6) { Array($0) }
+        }
+        return nil
+    }
+
     private func makeLeaf(forHost host: String) throws -> (Certificate, P256.Signing.PrivateKey) {
         let leafKey = P256.Signing.PrivateKey()
         let subject = try DistinguishedName { CommonName(host) }
-        let san = try SubjectAlternativeNames([.dnsName(host)])
+        let san = SubjectAlternativeNames([Self.subjectAlternativeName(forHost: host)])
         let cert = try Certificate(
             version: .v3,
             serialNumber: Certificate.SerialNumber(),

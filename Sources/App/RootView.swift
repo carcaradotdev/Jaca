@@ -104,7 +104,7 @@ struct RootView: View {
         if let log = session as? LogSession {
             LogSessionView(session: log, isActive: isActive)
         } else if let net = session as? NetworkSession {
-            NetworkSessionView(session: net)
+            NetworkSessionView(session: net, inspectionMode: $model.networkInspectionMode)
         } else if let db = session as? DatabaseSession {
             DatabaseSessionView(session: db)
         } else if let cloud = session as? CloudLogSession {
